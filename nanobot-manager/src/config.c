@@ -21,6 +21,7 @@ static char* get_config_path(void) {
 int config_load(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 18790;
+    cfg->theme_mode = 0;
 
     char* path = get_config_path();
     if (!path) return -1;
@@ -56,6 +57,10 @@ int config_load(app_config* cfg) {
     if (jport && cJSON_IsNumber(jport) && jport->valueint > 0 && jport->valueint <= 65535)
         cfg->health_check_port = jport->valueint;
 
+    cJSON* jtm = cJSON_GetObjectItem(root, "theme_mode");
+    if (jtm && cJSON_IsNumber(jtm) && jtm->valueint >= 0 && jtm->valueint <= 2)
+        cfg->theme_mode = jtm->valueint;
+
     cJSON_Delete(root);
     return 0;
 }
@@ -71,6 +76,7 @@ int config_save(const app_config* cfg) {
         cJSON_AddNullToObject(root, "nanobot_path");
     cJSON_AddBoolToObject(root, "autostart_nanobot", cfg->autostart_nanobot);
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
+    cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
 
     char* json = cJSON_Print(root);
     cJSON_Delete(root);

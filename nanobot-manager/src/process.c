@@ -133,7 +133,7 @@ static int process_cmdline_contains(DWORD pid, const char* substr) {
     return found;
 }
 
-static int find_nanobot_python_pid(void) {
+int find_nanobot_python_pid(void) {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE) return 0;
 
@@ -200,29 +200,37 @@ int nanobot_start(const char* cmd, int* out_pid) {
     return 0;
 }
 
+static void kill_process_tree(DWORD pid) {
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32W pe;
+        pe.dwSize = sizeof(pe);
+        if (Process32FirstW(snap, &pe)) {
+            do {
+                if (pe.th32ParentProcessID == pid)
+                    kill_process_tree(pe.th32ProcessID);
+            } while (Process32NextW(snap, &pe));
+        }
+        CloseHandle(snap);
+    }
+
+    HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+    if (h) {
+        TerminateProcess(h, 0);
+        WaitForSingleObject(h, 3000);
+        CloseHandle(h);
+    }
+}
+
 int nanobot_stop(int pid, int port) {
     (void)port;
 
-    if (pid > 0) {
-        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
-        if (h) {
-            BOOL ok = TerminateProcess(h, 0);
-            if (ok) WaitForSingleObject(h, 5000);
-            CloseHandle(h);
-            return ok ? 0 : (int)GetLastError();
-        }
-    }
+    if (pid <= 0)
+        pid = find_nanobot_python_pid();
 
-    pid = find_nanobot_python_pid();
-    if (pid > 0) {
-        HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
-        if (h) {
-            BOOL ok = TerminateProcess(h, 0);
-            if (ok) WaitForSingleObject(h, 5000);
-            CloseHandle(h);
-            return ok ? 0 : (int)GetLastError();
-        }
-    }
+    if (pid <= 0)
+        return -1;
 
-    return -1;
+    kill_process_tree((DWORD)pid);
+    return 0;
 }

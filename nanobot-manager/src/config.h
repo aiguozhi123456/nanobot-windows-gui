@@ -9,6 +9,7 @@ typedef struct {
     char* nanobot_path;
     int autostart_nanobot;
     int health_check_port;
+    int theme_mode;
 } app_config;
 
 int  config_load(app_config* cfg);
