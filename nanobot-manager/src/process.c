@@ -1,4 +1,3 @@
-#define WIN32_LEAN_AND_MEAN
 #include "process.h"
 #include <windows.h>
 #include <winhttp.h>
@@ -10,6 +9,10 @@
 
 char* find_nanobot_cmd(void) {
     char found[MAX_PATH];
+
+    if (SearchPathA(NULL, "nanobot.exe", NULL, MAX_PATH, found, NULL))
+        return _strdup(found);
+
     const char* candidates[] = {"python.exe", "python3.exe"};
     for (int i = 0; i < 2; i++) {
         if (!SearchPathA(NULL, candidates[i], NULL, MAX_PATH, found, NULL))
@@ -140,6 +143,11 @@ static int find_nanobot_python_pid(void) {
 
     if (Process32FirstW(snap, &pe)) {
         do {
+            if (_wcsicmp(pe.szExeFile, L"nanobot.exe") == 0) {
+                pid = (int)pe.th32ProcessID;
+                break;
+            }
+
             if (_wcsicmp(pe.szExeFile, L"python.exe") != 0 &&
                 _wcsicmp(pe.szExeFile, L"python3.exe") != 0 &&
                 _wcsicmp(pe.szExeFile, L"pythonw.exe") != 0)
@@ -171,8 +179,15 @@ int nanobot_start(const char* cmd, int* out_pid) {
     if (!slash) slash = strrchr(workdir, '/');
     if (slash) *slash = '\0'; else workdir[0] = '\0';
 
+    const char* base = strrchr(cmd, '\\');
+    if (!base) base = strrchr(cmd, '/');
+    base = base ? base + 1 : cmd;
+
     char cmdline[MAX_PATH * 2];
-    snprintf(cmdline, sizeof(cmdline), "\"%s\" -m nanobot gateway", cmd);
+    if (_stricmp(base, "nanobot.exe") == 0)
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" gateway", cmd);
+    else
+        snprintf(cmdline, sizeof(cmdline), "\"%s\" -m nanobot gateway", cmd);
 
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
             CREATE_NO_WINDOW | DETACHED_PROCESS,
