@@ -11,6 +11,7 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 - Auto-detect `nanobot.exe` (pip console script) or fall back to Python + module
 - Boot auto-start via registry (`HKCU\...\Run`)
 - Silent auto-start mode (`--autostart`) for unattended launches
+- NSIS installer with cat emoji icon, bilingual (Chinese/English) setup wizard
 
 ## Requirements
 
@@ -28,6 +29,23 @@ scripts\build.bat
 Output: `nanobot-manager\build\Release\nanobot-manager.exe`
 
 > The build script uses CMake + MSVC. `core-ui` is included as a git submodule and built automatically.
+
+### Package Installer
+
+```bat
+cd nanobot-manager
+scripts\package.bat
+```
+
+Output: `nanobot-manager\dist\nanobot-manager-setup.exe`
+
+> This runs `build.bat` first, then calls NSIS to create a setup executable.
+
+## Installation
+
+Download the latest installer from [GitHub Releases](https://github.com/aiguozhi123456/nanobot-windows-gui/releases).
+
+Run `nanobot-manager-setup.exe` and follow the wizard to install.
 
 ## Usage
 
@@ -59,12 +77,17 @@ A `config.json` file is created next to the executable on first run:
 ```
 nanobot-manager/
 ├── CMakeLists.txt          # Build configuration
-├── scripts/build.bat       # One-click build script
+├── assets/app.ico          # Application icon (cat emoji)
+├── installer/installer.nsi # NSIS installer script
+├── scripts/
+│   ├── build.bat           # One-click build script
+│   └── package.bat         # Build + package installer
 ├── src/
 │   ├── main.cpp            # Entry point, UI callbacks, async workers
 │   ├── process.c/h         # Process management + health check
 │   ├── autostart.c/h       # Registry auto-start read/write
-│   └── config.c/h          # JSON config load/save
+│   ├── config.c/h          # JSON config load/save
+│   └── resources.rc        # Windows resource (app icon)
 └── ui/
     └── dashboard.uix       # Core UI layout
 ```
