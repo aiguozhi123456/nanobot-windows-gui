@@ -11,7 +11,6 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 - 自动检测 `nanobot.exe`（pip 入口点）或回退到 Python + 模块方式
 - 开机自启（注册表 `HKCU\...\Run`）
 - 静默自启模式（`--autostart`），用于无人值守启动
-- 便携式 — 配置文件位于 exe 同目录，不在系统留痕
 
 ## 依赖
 
