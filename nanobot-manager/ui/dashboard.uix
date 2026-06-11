@@ -1,0 +1,114 @@
+<window title="nanobot-manager" width="420" height="280" centered="true" theme="light" resizable="false"/>
+
+<script>
+export default {
+  data() {
+    return {
+      status: "connecting",
+      statusText: "Detecting...",
+      installed: false,
+      autostart: false,
+      errorMessage: ""
+    };
+  },
+  computed: {
+    isRunning() { return this.status === "running"; },
+    isStopped() { return this.status === "stopped"; },
+    isError() { return this.status === "error"; },
+    canStart() { return this.installed && (this.isStopped || this.isError); },
+    canStop() { return this.isRunning; },
+    dotClass() {
+      if (this.isRunning) return "dot dot-running";
+      if (this.status === "connecting") return "dot dot-connecting";
+      if (!this.installed) return "dot dot-error";
+      return "dot dot-stopped";
+    }
+  }
+}
+</script>
+
+<style>
+  .root {
+    padding: 24px 28px;
+    gap: 18px;
+    background: var(--bg);
+  }
+
+  .card {
+    padding: 20px;
+    gap: 10px;
+    background: var(--card-bg);
+    border-radius: 8px;
+  }
+
+  .status-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .dot { font-size: 16px; }
+  .dot-running { color: #107c10; }
+  .dot-connecting { color: #ca5010; }
+  .dot-stopped { color: #605e5c; }
+  .dot-error { color: #d13438; }
+
+  .status-text {
+    font-size: 15px;
+    color: var(--fg);
+    font-weight: 600;
+  }
+
+  .error-text {
+    font-size: 12px;
+    color: #d13438;
+  }
+
+  .actions {
+    flex-direction: row;
+    gap: 10px;
+  }
+
+  button {
+    padding: 8px 24px;
+    border-radius: 4px;
+    font-size: 14px;
+    cursor: pointer;
+  }
+  .btn-start { background: #107c10; color: #ffffff; }
+  .btn-stop { background: #d13438; color: #ffffff; }
+
+  .footer {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+  }
+  .footer-text {
+    font-size: 13px;
+    color: var(--fg-2);
+  }
+</style>
+
+<template>
+  <div class="root">
+    <div class="card">
+      <div class="status-row">
+        <label :class="dotClass">●</label>
+        <label class="status-text">{{ statusText }}</label>
+      </div>
+      <div v-if="errorMessage">
+        <label class="error-text">{{ errorMessage }}</label>
+      </div>
+    </div>
+
+    <div class="actions">
+      <button id="btn_start" class="btn-start" :enabled="canStart">Start</button>
+      <button id="btn_stop"  class="btn-stop"  :enabled="canStop">Stop</button>
+    </div>
+
+    <div class="footer">
+      <toggle id="toggle_autostart" v-model="autostart"/>
+      <label class="footer-text">Auto-start on boot</label>
+    </div>
+  </div>
+</template>
