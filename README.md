@@ -11,7 +11,6 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 - Auto-detect `nanobot.exe` (pip console script) or fall back to Python + module
 - Boot auto-start via registry (`HKCU\...\Run`)
 - Silent auto-start mode (`--autostart`) for unattended launches
-- Portable — config lives next to the executable, no system footprint
 
 ## Requirements
 
