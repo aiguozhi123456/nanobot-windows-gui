@@ -26,6 +26,7 @@ add_executable(nanobot-manager WIN32
     src/process.c
     src/autostart.c
     src/config.c
+    src/resources.rc
 )
 
 target_include_directories(nanobot-manager PRIVATE
