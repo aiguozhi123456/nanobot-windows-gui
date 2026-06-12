@@ -409,7 +409,7 @@ export default {
         </div>
       </div>
       <div class="footer-mid">
-        <label class="footer-ver">v1.0.0</label>
+        <label class="footer-ver" id="footer_version">v1.5.0</label>
       </div>
       <div class="footer-right">
         <div id="btn_webui" class="footer-link">

@@ -1,9 +1,23 @@
 cmake_minimum_required(VERSION 3.20)
 project(nanobot-manager C CXX)
 
+set(NANOBOT_MANAGER_VERSION "1.5.0" CACHE STRING "Project version" FORCE)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_C_STANDARD 11)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/version.h.in
+    ${CMAKE_BINARY_DIR}/generated/version.h
+    @ONLY
+)
+
+configure_file(
+    ${CMAKE_CURRENT_SOURCE_DIR}/installer/version.nsh.in
+    ${CMAKE_BINARY_DIR}/generated/version.nsh
+    @ONLY
+)
 
 set(UI_CORE_BUILD_STATIC_ARCHIVE OFF CACHE BOOL "" FORCE)
 
@@ -31,6 +45,7 @@ add_executable(nanobot-manager WIN32
 
 target_include_directories(nanobot-manager PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated
     ${cjson_SOURCE_DIR}
 )
 

@@ -1,6 +1,7 @@
 #include "config.h"
 #include "process.h"
 #include "autostart.h"
+#include "version.h"
 
 #include "ui_core.h"
 
@@ -491,6 +492,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     apply_theme(g_cfg.theme_mode);
+
+    {
+        wchar_t ver_w[32];
+        swprintf_s(ver_w, _countof(ver_w), L"v" NANOBOT_MANAGER_VERSION);
+        ui_page_set_text(g_page, "footer_version", ver_w);
+    }
 
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
