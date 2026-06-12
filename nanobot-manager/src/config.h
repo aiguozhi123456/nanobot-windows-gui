@@ -8,6 +8,7 @@ extern "C" {
 typedef struct {
     char* nanobot_path;
     int autostart_nanobot;
+    int stay_in_tray;
     int health_check_port;
     int theme_mode;
 } app_config;

@@ -22,14 +22,92 @@ static int       g_nanobot_pid = 0;
 static ULONGLONG g_start_tick = 0;
 static UINT_PTR  g_uptime_timer = 0;
 static int       g_theme_mode = 0;
+static int       g_tray_enabled_effective = 0;
+static int       g_allow_exit = 0;
+static int       g_tray_added = 0;
+static int       g_tray_icon_owned = 0;
+static HICON     g_tray_icon = NULL;
+static HWND      g_hwnd = NULL;
 
 #define WM_ASYNC_FIND_CMD   (WM_APP + 1)
 #define WM_ASYNC_STOP_DONE  (WM_APP + 2)
+#define WM_TRAY_ICON        (WM_APP + 3)
 #define TIMER_HEALTH_CHECK_AFTER_START 1001
 #define TIMER_HEALTH_CHECK_AFTER_STOP  1002
 #define TIMER_UPTIME 1003
+#define ID_TRAY_SHOW 40001
+#define ID_TRAY_QUIT 40002
 
 static void do_health_check(void);
+
+static void tray_remove(void);
+
+static void show_main_window(void) {
+    if (!g_win) return;
+    ui_window_show(g_win);
+    ShowWindow(g_hwnd, SW_SHOWNORMAL);
+    SetForegroundWindow(g_hwnd);
+}
+
+static void tray_show_menu(HWND hwnd) {
+    HMENU menu = CreatePopupMenu();
+    if (!menu) return;
+
+    AppendMenuW(menu, MF_STRING, ID_TRAY_SHOW, L"Show window");
+    AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(menu, MF_STRING, ID_TRAY_QUIT, L"Quit");
+
+    POINT pt;
+    GetCursorPos(&pt);
+    SetForegroundWindow(hwnd);
+    TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_BOTTOMALIGN | TPM_LEFTALIGN,
+        pt.x, pt.y, 0, hwnd, NULL);
+    DestroyMenu(menu);
+    PostMessageW(hwnd, WM_NULL, 0, 0);
+}
+
+static void tray_add(HWND hwnd) {
+    if (g_tray_added) return;
+
+    g_tray_icon = (HICON)LoadImageW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1),
+        IMAGE_ICON, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+        LR_DEFAULTCOLOR);
+    if (!g_tray_icon)
+        g_tray_icon = LoadIconW(NULL, IDI_APPLICATION);
+    else
+        g_tray_icon_owned = 1;
+
+    NOTIFYICONDATAW nid;
+    memset(&nid, 0, sizeof(nid));
+    nid.cbSize = sizeof(nid);
+    nid.hWnd = hwnd;
+    nid.uID = 1;
+    nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    nid.uCallbackMessage = WM_TRAY_ICON;
+    nid.hIcon = g_tray_icon;
+    wcscpy_s(nid.szTip, L"nanobot manager");
+
+    if (Shell_NotifyIconW(NIM_ADD, &nid))
+        g_tray_added = 1;
+}
+
+static void tray_remove(void) {
+    if (g_tray_added && g_win) {
+        NOTIFYICONDATAW nid;
+        memset(&nid, 0, sizeof(nid));
+        nid.cbSize = sizeof(nid);
+        nid.hWnd = g_hwnd;
+        nid.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &nid);
+        g_tray_added = 0;
+    }
+
+    if (g_tray_icon && g_tray_icon_owned) {
+        DestroyIcon(g_tray_icon);
+    }
+    g_tray_icon = NULL;
+    g_tray_icon_owned = 0;
+}
 
 static void page_set(const char* name, const char* utf8) {
     wchar_t w[1024];
@@ -175,6 +253,10 @@ static void handle_async_find_cmd(char* cmd) {
 static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR uid, DWORD_PTR ref) {
     (void)uid; (void)ref;
+    if (msg == WM_CLOSE && g_tray_enabled_effective && !g_allow_exit) {
+        ui_window_hide(g_win);
+        return 0;
+    }
     if (msg == WM_ASYNC_FIND_CMD) {
         char* cmd = (char*)lp;
         handle_async_find_cmd(cmd);
@@ -184,6 +266,27 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         HWND hwnd2 = (HWND)ui_window_hwnd(g_win);
         SetTimer(hwnd2, TIMER_HEALTH_CHECK_AFTER_STOP, 800, on_timer_health_check);
         return 0;
+    }
+    if (msg == WM_TRAY_ICON) {
+        if (lp == WM_LBUTTONDBLCLK || lp == WM_LBUTTONUP) {
+            show_main_window();
+            return 0;
+        }
+        if (lp == WM_RBUTTONUP || lp == WM_CONTEXTMENU) {
+            tray_show_menu(hwnd);
+            return 0;
+        }
+    }
+    if (msg == WM_COMMAND) {
+        switch (LOWORD(wp)) {
+        case ID_TRAY_SHOW:
+            show_main_window();
+            return 0;
+        case ID_TRAY_QUIT:
+            g_allow_exit = 1;
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
 }
@@ -351,6 +454,18 @@ static void on_theme_system_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_theme_system, NULL);
 }
 
+static void on_menu(UiWindow win, UiMenuItem item, void* ud) {
+    (void)ud;
+    const char* id = ui_menu_item_id(item);
+    if (!id || strcmp(id, "toggle_tray") != 0)
+        return;
+
+    g_cfg.stay_in_tray = !g_cfg.stay_in_tray;
+    config_save(&g_cfg);
+    ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
+    ui_toast(win, L"Restart required", 1600);
+}
+
 static int has_arg(LPCWSTR cmd, const wchar_t* arg) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmd, &argc);
@@ -437,6 +552,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hInst; (void)hPrev; (void)cmdLine; (void)nShow;
 
     config_load(&g_cfg);
+    g_tray_enabled_effective = g_cfg.stay_in_tray;
 
     LPCWSTR wcmd = GetCommandLineW();
     if (has_arg(wcmd, L"--autostart")) {
@@ -486,6 +602,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_set_bool(g_page, "canStart", g_installed ? 1 : 0);
     ui_page_set_bool(g_page, "canStop", 0);
     ui_page_set_bool(g_page, "autostart", autostart_is_enabled());
+    ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
 
     wchar_t port_w[16];
     swprintf_s(port_w, _countof(port_w), L"%d", g_cfg.health_check_port);
@@ -524,13 +641,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
+    g_hwnd = hwnd;
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
+    ui_window_on_menu(g_win, on_menu, NULL);
+    if (g_tray_enabled_effective)
+        tray_add(hwnd);
 
     do_health_check();
 
     int ret = ui_run();
 
     stop_uptime_timer();
+    tray_remove();
     RemoveWindowSubclass(hwnd, subclass_proc, 0);
     ui_page_destroy(g_page);
     config_free(&g_cfg);

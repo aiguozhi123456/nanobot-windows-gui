@@ -53,6 +53,10 @@ int config_load(app_config* cfg) {
     if (ja && cJSON_IsBool(ja))
         cfg->autostart_nanobot = ja->valueint;
 
+    cJSON* jt = cJSON_GetObjectItem(root, "stay_in_tray");
+    if (jt && cJSON_IsBool(jt))
+        cfg->stay_in_tray = jt->valueint;
+
     cJSON* jport = cJSON_GetObjectItem(root, "health_check_port");
     if (jport && cJSON_IsNumber(jport) && jport->valueint > 0 && jport->valueint <= 65535)
         cfg->health_check_port = jport->valueint;
@@ -75,6 +79,7 @@ int config_save(const app_config* cfg) {
     else
         cJSON_AddNullToObject(root, "nanobot_path");
     cJSON_AddBoolToObject(root, "autostart_nanobot", cfg->autostart_nanobot);
+    cJSON_AddBoolToObject(root, "stay_in_tray", cfg->stay_in_tray);
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
 
