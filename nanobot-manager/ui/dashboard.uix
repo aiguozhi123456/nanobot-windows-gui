@@ -1,4 +1,4 @@
-<window title="nanobot manager" width="380" height="410" centered="true" frameless="true" resizable="false"/>
+<window title="nanobot manager" width="380" height="450" centered="true" frameless="true" resizable="false"/>
 
 <script>
 export default {
