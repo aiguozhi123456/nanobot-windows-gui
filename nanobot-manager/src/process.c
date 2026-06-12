@@ -118,7 +118,7 @@ int nanobot_check_running(int port) {
     return running;
 }
 
-static int process_cmdline_contains(DWORD pid, const char* substr) {
+static int process_cmdline_contains(DWORD pid, const wchar_t* substr) {
     HANDLE h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
                            FALSE, pid);
     if (!h) return 0;
@@ -152,17 +152,17 @@ static int process_cmdline_contains(DWORD pid, const char* substr) {
         return 0;
     }
 
-    int bufsz = params.CommandLine.Length + 2;
-    char* cmdline = (char*)malloc(bufsz);
+    int wchar_count = params.CommandLine.Length / sizeof(wchar_t);
+    wchar_t* cmdline = (wchar_t*)malloc((wchar_count + 1) * sizeof(wchar_t));
     if (!cmdline) { CloseHandle(h); return 0; }
 
     BOOL ok = ReadProcessMemory(h, params.CommandLine.Buffer, cmdline,
-                                params.CommandLine.Length, &read);
+                                 params.CommandLine.Length, &read);
     CloseHandle(h);
     if (!ok) { free(cmdline); return 0; }
-    cmdline[params.CommandLine.Length] = '\0';
+    cmdline[wchar_count] = L'\0';
 
-    int found = (strstr(cmdline, substr) != NULL);
+    int found = (wcsstr(cmdline, substr) != NULL);
     free(cmdline);
     return found;
 }
@@ -187,7 +187,7 @@ int find_nanobot_python_pid(void) {
                 _wcsicmp(pe.szExeFile, L"pythonw.exe") != 0)
                 continue;
 
-            if (process_cmdline_contains(pe.th32ProcessID, "nanobot")) {
+            if (process_cmdline_contains(pe.th32ProcessID, L"nanobot")) {
                 pid = (int)pe.th32ProcessID;
                 break;
             }
@@ -196,6 +196,36 @@ int find_nanobot_python_pid(void) {
 
     CloseHandle(snap);
     return pid;
+}
+
+static unsigned long long filetime_to_ull(FILETIME ft) {
+    ULARGE_INTEGER value;
+    value.LowPart = ft.dwLowDateTime;
+    value.HighPart = ft.dwHighDateTime;
+    return value.QuadPart;
+}
+
+int nanobot_get_process_uptime_seconds(int pid, unsigned long long* out_seconds) {
+    if (pid <= 0 || !out_seconds)
+        return 0;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, (DWORD)pid);
+    if (!h)
+        h = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, (DWORD)pid);
+    if (!h)
+        return 0;
+
+    FILETIME create_time, exit_time, kernel_time, user_time, now_time;
+    BOOL ok = GetProcessTimes(h, &create_time, &exit_time, &kernel_time, &user_time);
+    CloseHandle(h);
+    if (!ok)
+        return 0;
+
+    GetSystemTimeAsFileTime(&now_time);
+    unsigned long long created = filetime_to_ull(create_time);
+    unsigned long long now = filetime_to_ull(now_time);
+    *out_seconds = now > created ? (now - created) / 10000000ULL : 0;
+    return 1;
 }
 
 static HANDLE g_nanobot_handle = NULL;

@@ -19,7 +19,7 @@ static UiWindow  g_win   = 0;
 static app_config g_cfg  = {0};
 static int       g_installed = 0;
 static int       g_nanobot_pid = 0;
-static DWORD     g_start_tick = 0;
+static ULONGLONG g_start_tick = 0;
 static UINT_PTR  g_uptime_timer = 0;
 static int       g_theme_mode = 0;
 
@@ -49,15 +49,15 @@ static void page_set_int(const char* name, int val) {
 
 static void update_uptime(void) {
     if (!g_start_tick) return;
-    DWORD elapsed = (GetTickCount() - g_start_tick) / 1000;
-    int s = (int)(elapsed % 60);
-    int m = (int)((elapsed / 60) % 60);
-    int h = (int)(elapsed / 3600);
+    ULONGLONG elapsed = (GetTickCount64() - g_start_tick) / 1000;
+    unsigned int s = (unsigned int)(elapsed % 60);
+    unsigned int m = (unsigned int)((elapsed / 60) % 60);
+    unsigned long long h = (unsigned long long)(elapsed / 3600);
     wchar_t w[16];
     if (h > 0)
-        swprintf_s(w, _countof(w), L"%d:%02d:%02d", h, m, s);
+        swprintf_s(w, _countof(w), L"%llu:%02u:%02u", h, m, s);
     else
-        swprintf_s(w, _countof(w), L"%02d:%02d", m, s);
+        swprintf_s(w, _countof(w), L"%02u:%02u", m, s);
     ui_page_set_text(g_page, "uptime", w);
 }
 
@@ -66,8 +66,14 @@ static VOID CALLBACK on_timer_uptime(HWND hwnd, UINT msg, UINT_PTR id, DWORD tic
     update_uptime();
 }
 
-static void start_uptime_timer(void) {
-    g_start_tick = GetTickCount();
+static void start_uptime_timer(int pid) {
+    ULONGLONG now = GetTickCount64();
+    unsigned long long process_uptime = 0;
+    if (nanobot_get_process_uptime_seconds(pid, &process_uptime))
+        g_start_tick = now - process_uptime * 1000ULL;
+    else
+        g_start_tick = now;
+
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_uptime_timer = SetTimer(hwnd, TIMER_UPTIME, 1000, on_timer_uptime);
     update_uptime();
@@ -118,11 +124,13 @@ static void do_health_check(void) {
     int running = nanobot_check_running(g_cfg.health_check_port);
     if (running) {
         int pid = find_nanobot_python_pid();
+        if (pid <= 0 && g_nanobot_pid > 0)
+            pid = g_nanobot_pid;
         g_nanobot_pid = pid;
         set_status("running", "Running", "nanobot gateway is active");
         page_set_int("pid", pid > 0 ? pid : 0);
         if (!g_start_tick)
-            start_uptime_timer();
+            start_uptime_timer(pid);
     } else {
         set_status("stopped", "Stopped", "nanobot is not running");
         stop_uptime_timer();
