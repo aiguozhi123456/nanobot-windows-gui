@@ -6,7 +6,7 @@ Unicode true
 SetCompressor /SOLID lzma
 
 !define PRODUCT_NAME "nanobot-manager"
-!define PRODUCT_VERSION "1.0.0"
+!define PRODUCT_VERSION "1.5.0"
 !define PRODUCT_PUBLISHER "nanobot"
 !define PRODUCT_UNINST_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT_NAME}"
 !define PRODUCT_AUTORUN_KEY "Software\Microsoft\Windows\CurrentVersion\Run"

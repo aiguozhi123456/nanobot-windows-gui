@@ -3,9 +3,43 @@
 #include <winhttp.h>
 #include <tlhelp32.h>
 #include <winternl.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static void process_log(const char* fmt, ...) {
+    wchar_t exe_dir[MAX_PATH];
+    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
+    wchar_t* slash = wcsrchr(exe_dir, L'\\');
+    if (slash) *slash = L'\0';
+
+    wchar_t log_path[MAX_PATH];
+    swprintf_s(log_path, _countof(log_path),
+        L"%s\\nanobot-manager-process.log", exe_dir);
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char prefix[64];
+    snprintf(prefix, sizeof(prefix), "[%04d-%02d-%02d %02d:%02d:%02d] ",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+
+    char body[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+
+    FILE* f = _wfopen(log_path, L"a");
+    if (f) {
+        fputs(prefix, f);
+        fputs(body, f);
+        fputc('\n', f);
+        fclose(f);
+    }
+}
 
 char* find_nanobot_cmd(void) {
     char found[MAX_PATH];
@@ -164,6 +198,26 @@ int find_nanobot_python_pid(void) {
     return pid;
 }
 
+static HANDLE g_nanobot_handle = NULL;
+
+void nanobot_set_handle(void* handle) {
+    if (g_nanobot_handle) {
+        CloseHandle(g_nanobot_handle);
+    }
+    g_nanobot_handle = (HANDLE)handle;
+}
+
+void* nanobot_get_handle(void) {
+    return (void*)g_nanobot_handle;
+}
+
+void nanobot_clear_handle(void) {
+    if (g_nanobot_handle) {
+        CloseHandle(g_nanobot_handle);
+        g_nanobot_handle = NULL;
+    }
+}
+
 int nanobot_start(const char* cmd, int* out_pid) {
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -190,13 +244,14 @@ int nanobot_start(const char* cmd, int* out_pid) {
         snprintf(cmdline, sizeof(cmdline), "\"%s\" -m nanobot gateway", cmd);
 
     if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
-            CREATE_NO_WINDOW | DETACHED_PROCESS,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
             NULL, workdir[0] ? workdir : NULL, &si, &pi))
         return (int)GetLastError();
 
     if (out_pid) *out_pid = (int)pi.dwProcessId;
-    CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    nanobot_set_handle(pi.hProcess);
+    process_log("nanobot started (pid=%d)", (int)pi.dwProcessId);
     return 0;
 }
 
@@ -228,9 +283,44 @@ int nanobot_stop(int pid, int port) {
     if (pid <= 0)
         pid = find_nanobot_python_pid();
 
-    if (pid <= 0)
+    if (pid <= 0) {
+        process_log("nanobot stop: pid not found");
         return -1;
+    }
 
-    kill_process_tree((DWORD)pid);
+    HANDLE handle = g_nanobot_handle;
+    if (handle) {
+        DWORD exit_code = 0;
+        if (GetExitCodeProcess(handle, &exit_code) && exit_code != STILL_ACTIVE) {
+            process_log("nanobot stop: already exited (pid=%d)", pid);
+            CloseHandle(handle);
+            g_nanobot_handle = NULL;
+            return 0;
+        }
+
+        process_log("nanobot stop: sending CTRL_BREAK_EVENT (pid=%d)", pid);
+        FreeConsole();
+        if (AttachConsole((DWORD)pid)) {
+            GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, (DWORD)pid);
+            FreeConsole();
+        } else {
+            process_log("nanobot stop: AttachConsole failed (err=%d), will wait", (int)GetLastError());
+            FreeConsole();
+        }
+
+        DWORD wait = WaitForSingleObject(handle, 5000);
+        if (wait == WAIT_TIMEOUT) {
+            process_log("nanobot stop: graceful shutdown timed out, force killing (pid=%d)", pid);
+            kill_process_tree((DWORD)pid);
+        } else {
+            process_log("nanobot stop: graceful shutdown succeeded (pid=%d)", pid);
+        }
+
+        CloseHandle(handle);
+        g_nanobot_handle = NULL;
+    } else {
+        process_log("nanobot stop: no handle, force killing (pid=%d)", pid);
+        kill_process_tree((DWORD)pid);
+    }
     return 0;
 }
