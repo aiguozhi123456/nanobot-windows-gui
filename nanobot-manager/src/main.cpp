@@ -1,9 +1,12 @@
 #include "config.h"
 #include "process.h"
 #include "autostart.h"
+#include "chat.h"
+#include "chat_ui.h"
 #include "version.h"
 
 #include "ui_core.h"
+#include "cJSON.h"
 
 #include <windows.h>
 #include <shellapi.h>
@@ -30,14 +33,16 @@ static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
 static int       g_autostart_silent = 0;
 
-#define WM_ASYNC_FIND_CMD   (WM_APP + 1)
-#define WM_ASYNC_STOP_DONE  (WM_APP + 2)
-#define WM_TRAY_ICON        (WM_APP + 3)
 #define TIMER_HEALTH_CHECK_AFTER_START 1001
 #define TIMER_HEALTH_CHECK_AFTER_STOP  1002
 #define TIMER_UPTIME 1003
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
+
+#define WM_ASYNC_FIND_CMD   (WM_APP + 1)
+#define WM_ASYNC_STOP_DONE  (WM_APP + 2)
+#define WM_TRAY_ICON        (WM_APP + 3)
+#define WM_CHAT_EVENT        (WM_APP + 10)
 
 static void do_health_check(void);
 
@@ -112,6 +117,11 @@ static void tray_remove(void) {
 
 static int is_zh(void) {
     return g_cfg.language[0] != '\0' && strcmp(g_cfg.language, "zh") == 0;
+}
+
+/* Adapter: chat_ui_set_gateway needs int(void), nanobot_check_running needs int port. */
+static int health_running_thunk(void) {
+    return nanobot_check_running(g_cfg.health_check_port);
 }
 
 static void page_set(const char* name, const char* utf8) {
@@ -224,12 +234,19 @@ static void do_health_check(void) {
         page_set_int("pid", pid > 0 ? pid : 0);
         if (!g_start_tick)
             start_uptime_timer(pid);
+        /* Auto-connect chat when gateway becomes healthy */
+        if (!chat_is_ready()) {
+            chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
+            chat_connect();
+        }
     } else {
         set_status_i18n("stopped",
             "\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2", "Stopped",
             "nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c", "nanobot is not running");
         stop_uptime_timer();
         g_nanobot_pid = 0;
+        chat_disconnect_async();
+        chat_ui_on_gateway_stopped();
     }
 }
 
@@ -288,6 +305,10 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (msg == WM_ASYNC_STOP_DONE) {
         HWND hwnd2 = (HWND)ui_window_hwnd(g_win);
         SetTimer(hwnd2, TIMER_HEALTH_CHECK_AFTER_STOP, 800, on_timer_health_check);
+        return 0;
+    }
+    if (msg == WM_CHAT_EVENT) {
+        chat_ui_on_event(wp, (char*)lp);
         return 0;
     }
     if (msg == WM_TRAY_ICON) {
@@ -399,9 +420,14 @@ static void on_change_path(UiWidget w, void* ud) {
 static void on_open_webui(UiWidget w, void* ud) {
     (void)w; (void)ud;
     wchar_t url[128];
-    int webui_port = g_cfg.health_check_port + 1;
+    int webui_port = g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765;
     swprintf_s(url, _countof(url), L"http://localhost:%d", webui_port);
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+static void on_btn_send_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    chat_ui_mount_send(p, w, NULL);
 }
 
 static void apply_theme(int mode) {
@@ -697,8 +723,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     {
         const char* zh =
             "app_title=nanobot \xe7\xae\xa1\xe7\x90\x86\xe5\x99\xa8\n"
-            "chat_coming_soon=\xe5\x8d\xb3\xe5\xb0\x86\xe6\x8e\xa8\xe5\x87\xba\n"
-            "chat_coming_soon_desc=\xe8\x81\x8a\xe5\xa4\xa9\xe5\x8a\x9f\xe8\x83\xbd\xe6\xad\xa3\xe5\x9c\xa8\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad\n"
+            "chat_empty=\xe5\xbc\x80\xe5\xa7\x8b\xe5\xaf\xb9\xe8\xaf\x9d\n"
+            "chat_placeholder=\xe8\xbe\x93\xe5\x85\xa5\xe6\xb6\x88\xe6\x81\xaf\xe2\x80\xa6\n"
+            "chat_send=\xe5\x8f\x91\xe9\x80\x81\n"
             "install_not_found=\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0 nanobot\n"
             "install_hint=\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xef\xbc\x9apip install nanobot-ai\n"
             "metric_port=\xe7\xab\xaf\xe5\x8f\xa3\n"
@@ -734,8 +761,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "auto_detect=\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b\n";
         const char* en =
             "app_title=nanobot manager\n"
-            "chat_coming_soon=Coming Soon\n"
-            "chat_coming_soon_desc=Chat feature is under development\n"
+            "chat_empty=Start a conversation\n"
+            "chat_placeholder=Type a message\xe2\x80\xa6\n"
+            "chat_send=Send\n"
             "install_not_found=nanobot not found\n"
             "install_hint=Please install: pip install nanobot-ai\n"
             "metric_port=Port\n"
@@ -808,12 +836,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         ui_page_set_text(g_page, "footer_version", ver_w);
     }
 
+    /* Chat initial state */
+    chat_ui_bind(g_page, is_zh);
+    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
+    chat_ui_reset_idle();
+
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
     ui_page_on_widget_mount(g_page, "toggle_autostart", on_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_send", on_btn_send_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_system", on_theme_system_mount, NULL);
@@ -825,6 +859,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     else
         g_win = ui_page_open_window(g_page, NULL);
     if (!g_win) {
+        chat_ui_shutdown();
         ui_page_destroy(g_page);
         config_free(&g_cfg);
         return 2;
@@ -836,13 +871,28 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_tray_enabled_effective)
         tray_add(hwnd);
 
+    chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
+    chat_init(hwnd, WM_CHAT_EVENT);
+
     do_health_check();
 
     int ret = ui_run();
 
+    /* Drop UI first so any late chat events free LPARAMs without touching g_page. */
+    chat_shutdown();
+
+    /* Drain leftover WM_CHAT_EVENT payloads (malloc'd LPARAM) after shutdown. */
+    {
+        MSG m;
+        while (PeekMessageW(&m, hwnd, WM_CHAT_EVENT, WM_CHAT_EVENT, PM_REMOVE)) {
+            free((void*)m.lParam);
+        }
+    }
+
     stop_uptime_timer();
     tray_remove();
     RemoveWindowSubclass(hwnd, subclass_proc, 0);
+    chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);
     return ret;

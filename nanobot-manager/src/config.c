@@ -22,6 +22,8 @@ int config_load(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 18790;
     cfg->theme_mode = 0;
+    cfg->webui_port = 8765;
+    cfg->webui_auth[0] = '\0';
     strcpy(cfg->language, "zh");
 
     char* path = get_config_path();
@@ -67,8 +69,20 @@ int config_load(app_config* cfg) {
         cfg->theme_mode = jtm->valueint;
 
     cJSON* jlang = cJSON_GetObjectItem(root, "language");
-    if (jlang && cJSON_IsString(jlang) && jlang->valuestring[0])
+    if (jlang && cJSON_IsString(jlang) && jlang->valuestring[0]) {
         strncpy(cfg->language, jlang->valuestring, sizeof(cfg->language) - 1);
+        cfg->language[sizeof(cfg->language) - 1] = '\0';
+    }
+
+    cJSON* jwp = cJSON_GetObjectItem(root, "webui_port");
+    if (jwp && cJSON_IsNumber(jwp) && jwp->valueint > 0 && jwp->valueint <= 65535)
+        cfg->webui_port = jwp->valueint;
+
+    cJSON* jwa = cJSON_GetObjectItem(root, "webui_auth");
+    if (jwa && cJSON_IsString(jwa) && jwa->valuestring) {
+        strncpy(cfg->webui_auth, jwa->valuestring, sizeof(cfg->webui_auth) - 1);
+        cfg->webui_auth[sizeof(cfg->webui_auth) - 1] = '\0';
+    }
 
     cJSON_Delete(root);
     return 0;
@@ -88,6 +102,8 @@ int config_save(const app_config* cfg) {
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
     cJSON_AddStringToObject(root, "language", cfg->language);
+    cJSON_AddNumberToObject(root, "webui_port", cfg->webui_port);
+    cJSON_AddStringToObject(root, "webui_auth", cfg->webui_auth);
 
     char* json = cJSON_Print(root);
     cJSON_Delete(root);

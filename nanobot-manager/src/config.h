@@ -12,6 +12,8 @@ typedef struct {
     int health_check_port;
     int theme_mode;
     char language[8];
+    int webui_port;           /* default 8765 */
+    char webui_auth[128];     /* optional tokenIssueSecret, default "" */
 } app_config;
 
 int  config_load(app_config* cfg);

@@ -18,7 +18,11 @@ export default {
       nanobotPath: "",
       theme: "system",
       installed: true,
-      lang: "zh"
+      lang: "zh",
+      messages: [],
+      draft: "",
+      canSend: true,
+      chatStatus: ""
     };
   },
   computed: {
@@ -234,26 +238,116 @@ export default {
 
   .chat-page {
     flex: 1;
+    flex-direction: column;
+    gap: 0;
+    padding: 0;
+  }
+
+  .chat-status-bar {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: var(--fg-3);
+    border-bottom: 1px solid var(--border-subtle);
+    min-height: 24px;
+    justify-content: center;
+  }
+
+  .chat-status-text {
+    font-size: 11px;
+    color: var(--fg-3);
+  }
+
+  .chat-scroll {
+    flex: 1;
+    padding: 10px 12px;
+  }
+
+  .chat-list {
+    gap: 0;
+    padding: 0;
+  }
+
+  .chat-empty {
+    flex: 1;
     justify-content: center;
     align-items: center;
     gap: 8px;
-    padding: 40px 20px;
+    padding: 32px 16px;
+    min-height: 160px;
   }
 
-  .chat-icon {
+  .chat-empty-icon {
     color: var(--fg-3);
-    opacity: 0.4;
+    opacity: 0.35;
   }
 
-  .chat-title {
-    font-size: 16px;
-    font-weight: 600;
-    color: var(--fg-2);
-  }
-
-  .chat-sub {
+  .chat-empty-text {
     font-size: 12px;
     color: var(--fg-3);
+    text-align: center;
+  }
+
+  .msg {
+    max-width: 85%;
+    padding: 8px 10px;
+    border-radius: 12px;
+    margin-bottom: 8px;
+  }
+
+  .msg.user {
+    align-self: flex-end;
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    border-bottom-right-radius: 4px;
+  }
+
+  .msg.bot {
+    align-self: flex-start;
+    background: var(--bg-2);
+    color: var(--fg-2);
+    border-bottom-left-radius: 4px;
+  }
+
+  .msg-text {
+    font-size: 13px;
+    color: inherit;
+  }
+
+  .composer {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-top: 1px solid var(--border-subtle);
+    background: var(--bg);
+  }
+
+  .chat-input {
+    flex: 1;
+    height: 32px;
+    font-size: 13px;
+  }
+
+  .btn-send {
+    height: 32px;
+    padding: 6px 12px;
+    border-radius: 8px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    cursor: pointer;
+  }
+
+  .btn-send:hover {
+    opacity: 0.92;
+  }
+
+  .btn-send-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-on-accent);
   }
 
   .settings-page {
@@ -425,11 +519,40 @@ export default {
       <div class="content">
 
         <div v-if="page=='chat'" class="chat-page">
-          <svg class="chat-icon" width="48" height="48" viewBox="0 0 24 24">
-            <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z"/>
-          </svg>
-          <label class="chat-title">{{ $t('chat_coming_soon') }}</label>
-          <label class="chat-sub">{{ $t('chat_coming_soon_desc') }}</label>
+          <div class="chat-status-bar">
+            <label class="chat-status-text">{{ chatStatus }}</label>
+          </div>
+
+          <ScrollView class="chat-scroll">
+            <div class="chat-list">
+              <div v-if="messages.length == 0" class="chat-empty">
+                <svg class="chat-empty-icon" width="36" height="36" viewBox="0 0 24 24">
+                  <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z"/>
+                </svg>
+                <label class="chat-empty-text">{{ $t('chat_empty') }}</label>
+              </div>
+
+              <div
+                v-for="m in messages"
+                :key="m.id"
+                :class="m.role == 'user' ? 'msg user' : 'msg bot'"
+              >
+                <label class="msg-text">{{ m.text }}</label>
+              </div>
+            </div>
+          </ScrollView>
+
+          <div class="composer">
+            <input
+              id="chat_input"
+              class="chat-input"
+              v-model="draft"
+              :placeholder="$t('chat_placeholder')"
+            />
+            <div id="btn_send" class="btn-send" :enabled="canSend">
+              <label class="btn-send-label">{{ $t('chat_send') }}</label>
+            </div>
+          </div>
         </div>
 
         <div v-if="page=='dashboard'" class="page-scroll">

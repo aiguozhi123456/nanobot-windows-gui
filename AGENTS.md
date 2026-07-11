@@ -6,14 +6,17 @@ Native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot). Prod
 
 | Path | Role |
 |------|------|
-| `nanobot-manager/src/main.cpp` | WinMain, UI mount callbacks, tray, theme/locale, health timers |
+| `nanobot-manager/src/main.cpp` | WinMain, UI mount callbacks, tray, theme/locale, health timers, chat UI wiring |
 | `nanobot-manager/src/process.c` | Find/start/stop nanobot, WinHTTP `/health` |
 | `nanobot-manager/src/config.c` | `config.json` next to the exe (cJSON) |
+| `nanobot-manager/src/chat.c` | WebUI bootstrap + WinHTTP WebSocket chat client (connect/send/stream) |
 | `nanobot-manager/src/autostart.c` | `HKCU\...\Run` value `nanobot-manager` → `"exe" --autostart` |
-| `nanobot-manager/ui/dashboard.uix` | Core UI SFC (layout + reactive state) |
+| `nanobot-manager/ui/dashboard.uix` | Core UI SFC (layout + reactive state, chat page) |
 | `nanobot-manager/installer/installer.nsi` | NSIS setup (needs prior Release build) |
 | `nanobot-manager/CMakeLists.txt` | App target; pulls `../core-ui` + FetchContent cJSON |
 | `core-ui/` | Submodule only — do not treat as primary app source |
+| `docs/solutions/` | Documented solutions to past problems (bugs, best practices, architecture patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas |
+| `CONCEPTS.md` | Shared domain vocabulary (entities, named processes, status concepts) — relevant when orienting to the codebase or discussing domain concepts |
 
 Generated at configure time: `build/generated/version.h`, `build/generated/version.nsh` from `NANOBOT_MANAGER_VERSION` in CMakeLists (`1.5.0` today).
 
@@ -47,11 +50,12 @@ No repo-level unit/integration test suite or CI for the manager. Verification = 
 
 - **Start command**: `nanobot.exe gateway`, else `python.exe -m nanobot gateway` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`).
 - **Health**: `GET http://localhost:{health_check_port}/health` via WinHTTP; HTTP 200 = running. Default port **18790**.
-- **WebUI open**: `http://localhost:{health_check_port + 1}` (hardcoded offset in `main.cpp`).
+- **WebUI open**: `http://localhost:{webui_port}` (default **8765**, independent of health port). Not `health_check_port + 1`.
+- **Chat**: native page talks to the same WebUI host via `GET /webui/bootstrap` then WebSocket (see `chat.c`). Optional `webui_auth` = gateway `tokenIssueSecret`.
 - **`--autostart`**: if `stay_in_tray` is false → start nanobot (if needed) and exit; if tray enabled → silent tray + optional start. Logs: `nanobot-manager-autostart.log` / `nanobot-manager-process.log` beside exe.
 - **config.json** (exe directory) fields in code (README table is incomplete):
 
-  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port`, `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`).
+  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port`, `webui_port` (default 8765), `webui_auth` (optional bootstrap secret), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`).
 
 - **i18n**: zh/en strings are **embedded** in `main.cpp` via `ui_page_load_language_string`, not external `.lang` files. UI copy changes often need both `.uix` (`$t('key')`) and those strings.
 - **UI wiring**: widget `id`s in `dashboard.uix` must match `ui_page_on_widget_mount(..., "id", ...)` in `main.cpp`. Native clicks/toggles are mounted from C++; reactive fields use `ui_page_set_*` / page `data()`.
