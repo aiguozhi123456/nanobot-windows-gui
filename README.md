@@ -9,14 +9,19 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 - Start/stop nanobot gateway (`nanobot gateway` or `python -m nanobot gateway`)
 - Real-time health check via WinHTTP (`GET /health`)
 - Auto-detect `nanobot.exe` (pip console script) or fall back to Python + module
+- Native WebSocket chat client with streaming UI (delta/message) connected to the gateway WebUI port
 - Boot auto-start via registry (`HKCU\...\Run`)
 - Silent auto-start mode (`--autostart`) for unattended launches
+- Minimize to system tray with settings toggle
+- Bilingual UI (Chinese / English) with runtime switching
+- Theme modes: system / dark / light
+- Configurable WebUI port and optional auth secret
 - NSIS installer with cat emoji icon, bilingual (Chinese/English) setup wizard
 
 ## Requirements
 
 - Windows 10 / 11 (64-bit)
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) with C++ CMake tools
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) or newer (VS 2026 supported), with C++ CMake tools
 - [Python 3.x](https://www.python.org/) + `nanobot-ai` (`pip install nanobot-ai`)
 
 ## Build
@@ -62,15 +67,25 @@ A `config.json` file is created next to the executable on first run:
 {
   "nanobot_path": null,
   "autostart_nanobot": false,
-  "health_check_port": 18790
+  "stay_in_tray": false,
+  "health_check_port": 18790,
+  "webui_port": 8765,
+  "webui_auth": "",
+  "theme_mode": 0,
+  "language": "zh"
 }
 ```
 
-| Field | Type | Description |
-|---|---|---|
-| `nanobot_path` | string \| null | Override auto-detected command path |
-| `autostart_nanobot` | bool | Launch nanobot when the manager starts |
-| `health_check_port` | int | Port for `/health` checks (default `18790`) |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `nanobot_path` | string \| null | null | Override auto-detected command path |
+| `autostart_nanobot` | bool | false | Launch nanobot when the manager starts |
+| `stay_in_tray` | bool | false | Minimize to system tray instead of exiting |
+| `health_check_port` | int | 18790 | Port for `/health` checks |
+| `webui_port` | int | 8765 | Gateway WebUI port (chat/WebSocket); independent of health port |
+| `webui_auth` | string | "" | Optional bootstrap auth secret (gateway `tokenIssueSecret`) |
+| `theme_mode` | int | 0 | 0 = follow system, 1 = dark, 2 = light |
+| `language` | string | "zh" | UI language: `zh` or `en` |
 
 ## Project Structure
 
@@ -83,14 +98,32 @@ nanobot-manager/
 │   ├── build.bat           # One-click build script
 │   └── package.bat         # Build + package installer
 ├── src/
-│   ├── main.cpp            # Entry point, UI callbacks, async workers
-│   ├── process.c/h         # Process management + health check
-│   ├── autostart.c/h       # Registry auto-start read/write
-│   ├── config.c/h          # JSON config load/save
-│   └── resources.rc        # Windows resource (app icon)
+│   ├── main.cpp            # Entry point, UI callbacks, tray, theme/locale, health timers, chat wiring
+│   ├── process.c/h         # Process management + WinHTTP health check
+│   ├── config.c/h          # JSON config (cJSON) load/save
+│   ├── autostart.c/h       # Registry auto-start (`HKCU\...\Run`)
+│   ├── chat.c/h            # WinHTTP WebSocket chat client (connect/send/stream)
+│   ├── chat_ui.c/h         # Chat UI state + message array management
+│   ├── resources.rc        # Windows resource (app icon)
+│   └── version.h.in        # Version template
 └── ui/
     └── dashboard.uix       # Core UI layout
 ```
+
+## Testing
+
+Unit tests use a self-contained C test framework and run under CTest. They cover the config JSON round-trip (load/save/validation) and the autostart registry logic.
+
+Build with tests (on by default):
+
+```bat
+cd nanobot-manager
+cmake -B build -S . -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_TESTING=ON
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+> `-DBUILD_TESTING=ON` controls whether tests are built (default on). Pass `-DBUILD_TESTING=OFF` to skip.
 
 ## License
 

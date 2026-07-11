@@ -9,14 +9,19 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 - 启动/停止 nanobot gateway（支持 `nanobot gateway` 和 `python -m nanobot gateway` 两种方式）
 - 实时健康检查（WinHTTP `GET /health`）
 - 自动检测 `nanobot.exe`（pip 入口点）或回退到 Python + 模块方式
+- 原生 WebSocket 聊天客户端，流式显示 delta/message，连接 gateway WebUI 端口
 - 开机自启（注册表 `HKCU\...\Run`）
 - 静默自启模式（`--autostart`），用于无人值守启动
+- 最小化到系统托盘（设置开关）
+- 中英双语界面，运行时切换
+- 主题：跟随系统 / 深色 / 浅色
+- 可配置 WebUI 端口与可选认证 secret
 - NSIS 安装包，猫表情图标，中英文双语安装向导
 
 ## 依赖
 
 - Windows 10/11（64 位）
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) + C++ CMake 工具集
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) 或更新版本（支持 VS 2026），含 C++ CMake 工具集
 - [Python 3.x](https://www.python.org/) + nanobot-ai（`pip install nanobot-ai`）
 
 ## 构建
@@ -62,15 +67,25 @@ nanobot-manager.exe --autostart  静默模式：启动 nanobot 后退出（用�
 {
   "nanobot_path": null,
   "autostart_nanobot": false,
-  "health_check_port": 18790
+  "stay_in_tray": false,
+  "health_check_port": 18790,
+  "webui_port": 8765,
+  "webui_auth": "",
+  "theme_mode": 0,
+  "language": "zh"
 }
 ```
 
-| 字段 | 类型 | 说明 |
-|---|---|---|
-| `nanobot_path` | string \| null | 覆盖自动检测的命令路径 |
-| `autostart_nanobot` | bool | 管理器启动时是否自动启动 nanobot |
-| `health_check_port` | int | `/health` 检查端口（默认 `18790`） |
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `nanobot_path` | string \| null | null | 覆盖自动检测的命令路径 |
+| `autostart_nanobot` | bool | false | 管理器启动时是否自动启动 nanobot |
+| `stay_in_tray` | bool | false | 最小化到系统托盘而非退出 |
+| `health_check_port` | int | 18790 | `/health` 检查端口 |
+| `webui_port` | int | 8765 | gateway WebUI 端口（聊天/WebSocket），与 health 端口相互独立 |
+| `webui_auth` | string | "" | 可选的引导认证 secret（gateway `tokenIssueSecret`） |
+| `theme_mode` | int | 0 | 0 = 跟随系统，1 = 深色，2 = 浅色 |
+| `language` | string | "zh" | 界面语言：`zh` 或 `en` |
 
 ## 项目结构
 
@@ -83,14 +98,32 @@ nanobot-manager/
 │   ├── build.bat           # 一键构建脚本
 │   └── package.bat         # 构建 + 打包安装程序
 ├── src/
-│   ├── main.cpp            # 入口、UI 回调、异步工作线程
-│   ├── process.c/h         # 进程管理 + 健康检查
-│   ├── autostart.c/h       # 注册表自启读写
-│   ├── config.c/h          # JSON 配置读写
-│   └── resources.rc        # Windows 资源文件（应用图标）
+│   ├── main.cpp            # 入口、UI 回调、托盘、主题/语言、健康定时器、聊天接线
+│   ├── process.c/h         # 进程管理 + WinHTTP 健康检查
+│   ├── config.c/h          # JSON 配置（cJSON）读写
+│   ├── autostart.c/h       # 注册表自启（`HKCU\...\Run`）
+│   ├── chat.c/h            # WinHTTP WebSocket 聊天客户端（连接/发送/流式接收）
+│   ├── chat_ui.c/h         # 聊天 UI 状态 + 消息数组管理
+│   ├── resources.rc        # Windows 资源文件（应用图标）
+│   └── version.h.in        # 版本模板
 └── ui/
     └── dashboard.uix       # Core UI 布局
 ```
+
+## 测试
+
+单元测试使用内置的 C 测试框架，通过 CTest 运行。覆盖 config JSON 的往返（加载/保存/校验）和开机自启注册表逻辑。
+
+带测试构建（默认开启）：
+
+```bat
+cd nanobot-manager
+cmake -B build -S . -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DBUILD_TESTING=ON
+cmake --build build --config Release
+ctest --test-dir build --build-config Release --output-on-failure
+```
+
+> `-DBUILD_TESTING=ON` 控制是否构建测试（默认开启）。传 `-DBUILD_TESTING=OFF` 可跳过。
 
 ## 许可证
 
