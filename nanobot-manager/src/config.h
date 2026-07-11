@@ -11,6 +11,7 @@ typedef struct {
     int stay_in_tray;
     int health_check_port;
     int theme_mode;
+    char language[8];
 } app_config;
 
 int  config_load(app_config* cfg);

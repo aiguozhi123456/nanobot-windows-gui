@@ -1,9 +1,10 @@
-<window title="nanobot manager" width="380" height="450" centered="true" frameless="true" resizable="false"/>
+<window title="nanobot manager" width="430" height="500" centered="true" frameless="true" resizable="false"/>
 
 <script>
 export default {
   data() {
     return {
+      page: "dashboard",
       status: "stopped",
       statusText: "Stopped",
       statusSub: "nanobot is not running",
@@ -16,7 +17,8 @@ export default {
       stayInTray: false,
       nanobotPath: "",
       theme: "system",
-      installed: true
+      installed: true,
+      lang: "zh"
     };
   },
   computed: {
@@ -25,6 +27,10 @@ export default {
       if (this.status === "starting") return "hero-status starting";
       return "hero-status stopped";
     }
+  },
+  methods: {
+    nav(p) { this.page = p; },
+    setLang(loc) { this.lang = loc; }
   }
 }
 </script>
@@ -42,10 +48,31 @@ export default {
     gap: 8px;
   }
 
-  .settings-btn {
-    width: 22px;
-    height: 22px;
-    border-radius: 6px;
+  .titlebar-title {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg-2);
+  }
+
+  .body {
+    flex-direction: row;
+    gap: 0;
+    flex: 1;
+  }
+
+  .sidebar {
+    width: 48px;
+    padding: 8px 4px;
+    gap: 2px;
+    align-items: center;
+    background: var(--sidebar-bg);
+    border-right: 1px solid var(--border-subtle);
+  }
+
+  .nav {
+    width: 40px;
+    height: 40px;
+    border-radius: 8px;
     cursor: pointer;
     justify-content: center;
     align-items: center;
@@ -53,24 +80,55 @@ export default {
     background: transparent;
   }
 
-  .settings-btn:hover {
+  .nav:hover {
+    background: var(--btn-hover);
+    color: var(--fg-2);
+  }
+
+  .nav.on {
     background: var(--btn-hover);
     color: var(--accent);
   }
 
-  .top-settings-row {
-    padding: 4px 20px 0;
-    align-items: flex-start;
+  .nav-spacer {
+    flex: 1;
   }
 
-  .titlebar-title {
+  .content {
+    flex: 1;
+    padding: 0;
+    gap: 0;
+    background: var(--bg);
+  }
+
+  .page-scroll {
+    flex: 1;
+    padding: 16px 20px;
+    gap: 0;
+  }
+
+  .install-hint {
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    background: var(--btn-hover);
+    border-radius: 10px;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .install-hint-title {
     font-size: 13px;
     font-weight: 600;
-    color: var(--fg-2);
+    color: var(--accent);
+  }
+
+  .install-hint-text {
+    font-size: 12px;
+    color: var(--accent);
   }
 
   .hero {
-    padding: 20px 20px 16px;
+    padding: 12px 0 16px;
     gap: 2px;
     flex-direction: column;
   }
@@ -102,7 +160,7 @@ export default {
     flex-direction: row;
     justify-content: center;
     gap: 28px;
-    padding: 0 20px 16px;
+    padding: 0 0 16px;
   }
 
   .metric {
@@ -124,12 +182,12 @@ export default {
   .divider {
     height: 1px;
     background: var(--border-subtle);
-    margin-left: 20px;
-    margin-right: 20px;
+    margin-left: 0;
+    margin-right: 0;
   }
 
   .actions {
-    padding: 16px 20px;
+    padding: 16px 0;
     flex-direction: row;
     gap: 8px;
   }
@@ -174,9 +232,41 @@ export default {
     font-weight: 600;
   }
 
-  .settings {
-    padding: 8px 20px 16px;
+  .chat-page {
+    flex: 1;
+    justify-content: center;
+    align-items: center;
+    gap: 8px;
+    padding: 40px 20px;
+  }
+
+  .chat-icon {
+    color: var(--fg-3);
+    opacity: 0.4;
+  }
+
+  .chat-title {
+    font-size: 16px;
+    font-weight: 600;
+    color: var(--fg-2);
+  }
+
+  .chat-sub {
+    font-size: 12px;
+    color: var(--fg-3);
+  }
+
+  .settings-page {
+    padding: 16px 20px 20px;
     gap: 0;
+  }
+
+  .settings-section-title {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--fg-3);
+    text-transform: uppercase;
+    padding: 8px 0 6px;
   }
 
   .setting-row {
@@ -229,31 +319,21 @@ export default {
     color: var(--accent);
   }
 
-  .footer {
-    padding: 10px 20px;
+  .theme-row {
     flex-direction: row;
-    align-items: center;
-    justify-content: space-between;
-    background: var(--bg-2);
-    border-top: 1px solid var(--border-subtle);
-    gap: 0;
-  }
-
-  .footer-left {
-    flex-direction: row;
-    align-items: center;
     gap: 4px;
+    padding: 8px 0;
   }
 
   .theme-btn {
-    width: 26px;
-    height: 26px;
-    border-radius: 6px;
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
     cursor: pointer;
     justify-content: center;
     align-items: center;
     color: var(--fg-3);
-    background: transparent;
+    background: var(--bg-2);
   }
 
   .theme-btn-active {
@@ -261,20 +341,41 @@ export default {
     color: var(--accent);
   }
 
-  .footer-mid {
-    flex: 1;
+  .lang-row {
+    flex-direction: row;
+    gap: 4px;
+    padding: 8px 0;
+  }
+
+  .lang-btn {
+    padding: 4px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--fg-3);
+    background: var(--bg-2);
+    font-weight: 500;
+  }
+
+  .lang-btn-active {
+    background: var(--btn-hover);
+    color: var(--accent);
+    font-weight: 600;
+  }
+
+  .settings-footer {
+    padding: 12px 0 0;
+    flex-direction: row;
     align-items: center;
-    justify-content: center;
+    justify-content: space-between;
+    border-top: 1px solid var(--border-subtle);
+    margin-top: 8px;
+    gap: 0;
   }
 
   .footer-ver {
     font-size: 10px;
     color: var(--fg-3);
-  }
-
-  .footer-right {
-    align-items: center;
-    justify-content: flex-end;
   }
 
   .footer-link {
@@ -285,28 +386,7 @@ export default {
   }
 
   .footer-link-text {
-    font-size: 10px;
-    color: var(--accent);
-  }
-
-  .install-hint {
-    padding: 10px 16px;
-    margin-left: 20px;
-    margin-right: 20px;
-    background: var(--btn-hover);
-    border-radius: 10px;
-    align-items: center;
-    gap: 2px;
-  }
-
-  .install-hint-title {
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--accent);
-  }
-
-  .install-hint-text {
-    font-size: 12px;
+    font-size: 11px;
     color: var(--accent);
   }
 </style>
@@ -315,131 +395,180 @@ export default {
   <div class="root">
     <TitleBar title="">
       <div class="titlebar-left">
-        <label class="titlebar-title">nanobot manager</label>
+        <label class="titlebar-title">{{ $t('app_title') }}</label>
       </div>
     </TitleBar>
 
-    <div class="top-settings-row">
-      <div class="settings-btn" id="btn_settings">
-        <svg width="14" height="14" viewBox="0 0 24 24">
-          <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.38-.31-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.488.488 0 0014 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.58-1.69.98l-2.49-1a.49.49 0 00-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65c-.19.15-.25.42-.12.64l2 3.46c.12.22.38.31.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.58 1.69-.98l2.49 1c.23.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1112 8a3.5 3.5 0 010 7.5z"/>
-        </svg>
-      </div>
-    </div>
-
-    <menu trigger="#btn_settings" event="click">
-      <menuitem id="toggle_tray">
-        <label>{{ stayInTray ? '✓ Minimize to tray' : 'Minimize to tray' }}</label>
-      </menuitem>
-      <separator/>
-      <menuitem id="tray_hint" disabled="true">
-        <label style="font-size: 11px; color: var(--fg-3)">Restart required</label>
-      </menuitem>
-    </menu>
-
-    <div v-if="!installed" class="install-hint">
-      <label class="install-hint-title">nanobot not found</label>
-      <label class="install-hint-text">Please install: pip install nanobot-ai</label>
-    </div>
-
-    <div class="hero">
-      <div class="hero-status-wrap" :class="statusClass" id="status_text">
-        <label>{{ statusText }}</label>
-      </div>
-      <div class="hero-sub-wrap" id="status_sub">
-        <label class="hero-sub">{{ statusSub }}</label>
-      </div>
-    </div>
-
-    <div class="metrics" id="metrics">
-      <div class="metric">
-        <label class="metric-val" id="m_port">{{ port }}</label>
-        <label class="metric-label">Port</label>
-      </div>
-      <div class="metric">
-        <label class="metric-val" id="m_pid">{{ pid }}</label>
-        <label class="metric-label">PID</label>
-      </div>
-      <div class="metric">
-        <label class="metric-val" id="m_uptime">{{ uptime }}</label>
-        <label class="metric-label">Uptime</label>
-      </div>
-    </div>
-
-    <div class="divider"></div>
-
-    <div class="actions">
-      <div id="btn_start" class="btn btn-start" :enabled="canStart">
-        <svg width="12" height="12" viewBox="0 0 24 24">
-          <path fill="currentColor" d="M8 5v14l11-7z"/>
-        </svg>
-        <label class="btn-label">Start</label>
-      </div>
-      <div id="btn_stop" class="btn btn-stop" :enabled="canStop">
-        <svg width="12" height="12" viewBox="0 0 24 24">
-          <path fill="currentColor" d="M6 6h12v12H6z"/>
-        </svg>
-        <label class="btn-label">Stop</label>
-      </div>
-    </div>
-
-    <div class="divider"></div>
-
-    <div class="settings">
-      <div class="setting-row">
-        <div class="setting-label-wrap">
-          <label class="setting-label">Auto-start on boot</label>
-          <label class="setting-sub">Launch when Windows starts</label>
-        </div>
-        <toggle id="toggle_autostart" v-model="autostart"/>
-      </div>
-      <div class="path-row">
-        <label class="setting-label">nanobot path</label>
-        <div class="path-display" id="btn_change_path">
-          <label class="path-text" id="path_text">{{ nanobotPath }}</label>
-          <label class="path-change">Change</label>
-        </div>
-      </div>
-    </div>
-
-    <div class="footer">
-      <div class="footer-left">
-        <div id="theme_light" :class="theme == 'light' ? 'theme-btn theme-btn-active' : 'theme-btn'">
-          <svg width="13" height="13" viewBox="0 0 24 24">
-            <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
-            <line x1="12" y1="2" x2="12" y2="5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="12" y1="19" x2="12" y2="22" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="2" y1="12" x2="5" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="19" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="4.93" y1="4.93" x2="7.05" y2="7.05" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="16.95" y1="16.95" x2="19.07" y2="19.07" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="4.93" y1="19.07" x2="7.05" y2="16.95" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="16.95" y1="7.05" x2="19.07" y2="4.93" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+    <div class="body">
+      <div class="sidebar">
+        <div class="nav" :class="page=='chat' ? 'on' : ''" @click="nav('chat')">
+          <svg width="20" height="20" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12zM7 9h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2z"/>
           </svg>
         </div>
-        <div id="theme_dark" :class="theme == 'dark' ? 'theme-btn theme-btn-active' : 'theme-btn'">
-          <svg width="13" height="13" viewBox="0 0 24 24">
-            <path fill="currentColor" d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
+
+        <div class="nav" :class="page=='dashboard' ? 'on' : ''" @click="nav('dashboard')">
+          <svg width="20" height="20" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14l-5-5 1.41-1.41L12 14.17l7.59-7.59L21 8l-9 9z"/>
           </svg>
         </div>
-        <div id="theme_system" :class="theme == 'system' ? 'theme-btn theme-btn-active' : 'theme-btn'">
-          <svg width="13" height="13" viewBox="0 0 24 24">
-            <rect x="3" y="4" width="18" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
-            <line x1="8" y1="21" x2="16" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
-            <line x1="12" y1="17" x2="12" y2="21" stroke="currentColor" stroke-width="2"/>
+
+        <div class="nav-spacer"/>
+
+        <div class="nav" :class="page=='settings' ? 'on' : ''" @click="nav('settings')">
+          <svg width="20" height="20" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.38-.31-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.488.488 0 0014 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.58-1.69.98l-2.49-1a.49.49 0 00-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65c-.19.15-.25.42-.12.64l2 3.46c.12.22.38.31.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.58 1.69-.98l2.49 1c.23.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1112 8a3.5 3.5 0 010 7.5z"/>
           </svg>
         </div>
       </div>
-      <div class="footer-mid">
-        <label class="footer-ver" id="footer_version">v1.5.0</label>
-      </div>
-      <div class="footer-right">
-        <div id="btn_webui" class="footer-link">
-          <label class="footer-link-text">Open WebUI</label>
-          <svg width="10" height="10" viewBox="0 0 24 24">
-            <path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7"/>
+
+      <div class="content">
+
+        <div v-if="page=='chat'" class="chat-page">
+          <svg class="chat-icon" width="48" height="48" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12z"/>
           </svg>
+          <label class="chat-title">{{ $t('chat_coming_soon') }}</label>
+          <label class="chat-sub">{{ $t('chat_coming_soon_desc') }}</label>
         </div>
+
+        <div v-if="page=='dashboard'" class="page-scroll">
+          <div v-if="!installed" class="install-hint">
+            <label class="install-hint-title">{{ $t('install_not_found') }}</label>
+            <label class="install-hint-text">{{ $t('install_hint') }}</label>
+          </div>
+
+          <div class="hero">
+            <div class="hero-status-wrap" :class="statusClass" id="status_text">
+              <label>{{ statusText }}</label>
+            </div>
+            <div class="hero-sub-wrap" id="status_sub">
+              <label class="hero-sub">{{ statusSub }}</label>
+            </div>
+          </div>
+
+          <div class="metrics" id="metrics">
+            <div class="metric">
+              <label class="metric-val" id="m_port">{{ port }}</label>
+              <label class="metric-label">{{ $t('metric_port') }}</label>
+            </div>
+            <div class="metric">
+              <label class="metric-val" id="m_pid">{{ pid }}</label>
+              <label class="metric-label">{{ $t('metric_pid') }}</label>
+            </div>
+            <div class="metric">
+              <label class="metric-val" id="m_uptime">{{ uptime }}</label>
+              <label class="metric-label">{{ $t('metric_uptime') }}</label>
+            </div>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="actions">
+            <div id="btn_start" class="btn btn-start" :enabled="canStart">
+              <svg width="12" height="12" viewBox="0 0 24 24">
+                <path fill="currentColor" d="M8 5v14l11-7z"/>
+              </svg>
+              <label class="btn-label">{{ $t('btn_start') }}</label>
+            </div>
+            <div id="btn_stop" class="btn btn-stop" :enabled="canStop">
+              <svg width="12" height="12" viewBox="0 0 24 24">
+                <path fill="currentColor" d="M6 6h12v12H6z"/>
+              </svg>
+              <label class="btn-label">{{ $t('btn_stop') }}</label>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="page=='settings'" class="page-scroll">
+          <label class="settings-section-title">{{ $t('settings_general') }}</label>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_autostart') }}</label>
+              <label class="setting-sub">{{ $t('setting_autostart_sub') }}</label>
+            </div>
+            <toggle id="toggle_autostart" v-model="autostart"/>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_tray') }}</label>
+              <label class="setting-sub">{{ $t('setting_tray_sub') }}</label>
+            </div>
+            <toggle id="toggle_tray" v-model="stayInTray"/>
+          </div>
+
+          <div class="path-row">
+            <label class="setting-label">{{ $t('setting_path') }}</label>
+            <div class="path-display" id="btn_change_path">
+              <label class="path-text" id="path_text">{{ nanobotPath }}</label>
+              <label class="path-change">{{ $t('setting_path_change') }}</label>
+            </div>
+          </div>
+
+          <div class="divider" style="margin-top: 8px"></div>
+
+          <label class="settings-section-title">{{ $t('settings_appearance') }}</label>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_theme') }}</label>
+            </div>
+            <div class="theme-row">
+              <div id="theme_light" :class="theme == 'light' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+                <svg width="14" height="14" viewBox="0 0 24 24">
+                  <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
+                  <line x1="12" y1="2" x2="12" y2="5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="12" y1="19" x2="12" y2="22" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="2" y1="12" x2="5" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="19" y1="12" x2="22" y2="12" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="4.93" y1="4.93" x2="7.05" y2="7.05" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="16.95" y1="16.95" x2="19.07" y2="19.07" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="4.93" y1="19.07" x2="7.05" y2="16.95" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="16.95" y1="7.05" x2="19.07" y2="4.93" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                </svg>
+              </div>
+              <div id="theme_dark" :class="theme == 'dark' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+                <svg width="14" height="14" viewBox="0 0 24 24">
+                  <path fill="currentColor" d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
+                </svg>
+              </div>
+              <div id="theme_system" :class="theme == 'system' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+                <svg width="14" height="14" viewBox="0 0 24 24">
+                  <rect x="3" y="4" width="18" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
+                  <line x1="8" y1="21" x2="16" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+                  <line x1="12" y1="17" x2="12" y2="21" stroke="currentColor" stroke-width="2"/>
+                </svg>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_language') }}</label>
+            </div>
+            <div class="lang-row">
+              <div id="lang_zh" :class="lang == 'zh' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>中文</label>
+              </div>
+              <div id="lang_en" :class="lang == 'en' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>EN</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="settings-footer">
+            <label class="footer-ver" id="footer_version">v1.5.0</label>
+            <div id="btn_webui" class="footer-link">
+              <label class="footer-link-text">{{ $t('open_webui') }}</label>
+              <svg width="10" height="10" viewBox="0 0 24 24">
+                <path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7"/>
+              </svg>
+            </div>
+          </div>
+        </div>
+
       </div>
     </div>
   </div>

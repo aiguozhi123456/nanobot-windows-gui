@@ -28,6 +28,7 @@ static int       g_tray_added = 0;
 static int       g_tray_icon_owned = 0;
 static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
+static int       g_autostart_silent = 0;
 
 #define WM_ASYNC_FIND_CMD   (WM_APP + 1)
 #define WM_ASYNC_STOP_DONE  (WM_APP + 2)
@@ -109,6 +110,10 @@ static void tray_remove(void) {
     g_tray_icon_owned = 0;
 }
 
+static int is_zh(void) {
+    return g_cfg.language[0] != '\0' && strcmp(g_cfg.language, "zh") == 0;
+}
+
 static void page_set(const char* name, const char* utf8) {
     wchar_t w[1024];
     int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
@@ -184,6 +189,12 @@ static void set_status(const char* status, const char* text, const char* sub) {
     }
 }
 
+static void set_status_i18n(const char* status,
+                            const char* text_zh, const char* text_en,
+                            const char* sub_zh,  const char* sub_en) {
+    set_status(status, is_zh() ? text_zh : text_en, is_zh() ? sub_zh : sub_en);
+}
+
 static void on_timer_health_check(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)tick;
     KillTimer(hwnd, id);
@@ -192,7 +203,9 @@ static void on_timer_health_check(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) 
 
 static void do_health_check(void) {
     if (!g_installed) {
-        set_status("stopped", "Not installed", "nanobot is not installed");
+        set_status_i18n("stopped",
+            "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "Not installed",
+            "nanobot \xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "nanobot is not installed");
         ui_page_set_bool(g_page, "installed", 0);
         return;
     }
@@ -205,12 +218,16 @@ static void do_health_check(void) {
         if (pid <= 0 && g_nanobot_pid > 0)
             pid = g_nanobot_pid;
         g_nanobot_pid = pid;
-        set_status("running", "Running", "nanobot gateway is active");
+        set_status_i18n("running",
+            "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad", "Running",
+            "nanobot \xe7\xbd\x91\xe5\x85\xb3\xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8", "nanobot gateway is active");
         page_set_int("pid", pid > 0 ? pid : 0);
         if (!g_start_tick)
             start_uptime_timer(pid);
     } else {
-        set_status("stopped", "Stopped", "nanobot is not running");
+        set_status_i18n("stopped",
+            "\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2", "Stopped",
+            "nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c", "nanobot is not running");
         stop_uptime_timer();
         g_nanobot_pid = 0;
     }
@@ -227,7 +244,9 @@ static DWORD WINAPI find_cmd_worker(LPVOID param) {
 
 static void handle_async_find_cmd(char* cmd) {
     if (!cmd) {
-        set_status("stopped", "Not found",
+        set_status_i18n("stopped",
+            "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0", "Not found",
+            "\xe6\x89\xbe\xe4\xb8\x8d\xe5\x88\xb0 nanobot\xef\xbc\x8c\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xe6\x88\x96\xe8\xae\xbe\xe7\xbd\xae\xe8\xb7\xaf\xe5\xbe\x84",
             "Cannot find nanobot. Please install or set path.");
         return;
     }
@@ -237,13 +256,17 @@ static void handle_async_find_cmd(char* cmd) {
     free(cmd);
 
     if (rc != 0) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "Start failed (error %d)", rc);
-        set_status("stopped", "Start failed", buf);
+        char buf_zh[256], buf_en[256];
+        snprintf(buf_zh, sizeof(buf_zh),
+            "\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5 (\xe9\x94\x99\xe8\xaf\xaf %d)", rc);
+        snprintf(buf_en, sizeof(buf_en), "Start failed (error %d)", rc);
+        set_status("stopped", is_zh() ? buf_zh : buf_en, "");
         return;
     }
 
-    set_status("starting", "Starting\u2026", "waiting for health check");
+    set_status_i18n("starting",
+        "\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6", "Starting\xe2\x80\xa6",
+        "\xe7\xad\x89\xe5\xbe\x85\xe5\x81\xa5\xe5\xba\xb7\xe6\xa3\x80\xe6\x9f\xa5", "Waiting for health check");
     page_set_int("pid", g_nanobot_pid);
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
@@ -295,12 +318,16 @@ static void on_start(UiWidget w, void* ud) {
     (void)w; (void)ud;
 
     if (!g_installed) {
-        set_status("stopped", "Not installed", "pip install nanobot-ai");
+        set_status_i18n("stopped",
+            "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "Not installed",
+            "pip install nanobot-ai", "pip install nanobot-ai");
         ui_page_set_bool(g_page, "installed", 0);
         return;
     }
 
-    set_status("starting", "Starting\u2026", "detecting nanobot\u2026");
+    set_status_i18n("starting",
+        "\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6", "Starting\xe2\x80\xa6",
+        "\xe6\xa3\x80\xe6\xb5\x8b\xe4\xb8\xad\xe2\x80\xa6", "Detecting nanobot\xe2\x80\xa6");
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     CreateThread(NULL, 0, find_cmd_worker, (LPVOID)hwnd, 0, NULL);
@@ -316,7 +343,9 @@ static DWORD WINAPI stop_worker(LPVOID param) {
 
 static void on_stop(UiWidget w, void* ud) {
     (void)w; (void)ud;
-    set_status("starting", "Stopping\u2026", "shutting down nanobot");
+    set_status_i18n("starting",
+        "\xe5\x81\x9c\xe6\xad\xa2\xe4\xb8\xad\xe2\x80\xa6", "Stopping\xe2\x80\xa6",
+        "\xe6\xad\xa3\xe5\x9c\xa8\xe5\x85\xb3\xe9\x97\xad nanobot", "Shutting down nanobot");
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     CreateThread(NULL, 0, stop_worker, (LPVOID)hwnd, 0, NULL);
@@ -454,16 +483,48 @@ static void on_theme_system_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_theme_system, NULL);
 }
 
-static void on_menu(UiWindow win, UiMenuItem item, void* ud) {
-    (void)ud;
-    const char* id = ui_menu_item_id(item);
-    if (!id || strcmp(id, "toggle_tray") != 0)
-        return;
-
-    g_cfg.stay_in_tray = !g_cfg.stay_in_tray;
+static void on_tray_toggle(UiWidget w, int val, void* ud) {
+    (void)w; (void)ud;
+    g_cfg.stay_in_tray = val;
     config_save(&g_cfg);
-    ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
-    ui_toast(win, L"Restart required", 1600);
+    ui_page_set_bool(g_page, "stayInTray", val);
+    g_tray_enabled_effective = val;
+    if (val && g_hwnd)
+        tray_add(g_hwnd);
+    else if (!val)
+        tray_remove();
+}
+
+static void on_tray_toggle_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_toggle_on_changed(w, on_tray_toggle, NULL);
+}
+
+static void apply_lang(const char* loc) {
+    strncpy(g_cfg.language, loc, sizeof(g_cfg.language) - 1);
+    config_save(&g_cfg);
+    ui_page_set_locale(g_page, loc);
+    page_set("lang", loc);
+}
+
+static void on_lang_zh(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    apply_lang("zh");
+}
+
+static void on_lang_en(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    apply_lang("en");
+}
+
+static void on_lang_zh_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_lang_zh, NULL);
+}
+
+static void on_lang_en_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_lang_en, NULL);
 }
 
 static int has_arg(LPCWSTR cmd, const wchar_t* arg) {
@@ -487,6 +548,21 @@ static void autostart_log(const char* msg) {
     wchar_t log_path[MAX_PATH];
     swprintf_s(log_path, _countof(log_path),
         L"%s\\nanobot-manager-autostart.log", exe_dir);
+
+    {
+        WIN32_FILE_ATTRIBUTE_DATA fad;
+        if (GetFileAttributesExW(log_path, GetFileExInfoStandard, &fad)) {
+            ULARGE_INTEGER sz;
+            sz.LowPart = fad.nFileSizeLow;
+            sz.HighPart = fad.nFileSizeHigh;
+            if (sz.QuadPart > 512 * 1024) {
+                wchar_t bak[MAX_PATH];
+                swprintf_s(bak, _countof(bak),
+                    L"%s\\nanobot-manager-autostart.bak", exe_dir);
+                MoveFileExW(log_path, bak, MOVEFILE_REPLACE_EXISTING);
+            }
+        }
+    }
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -556,12 +632,35 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     LPCWSTR wcmd = GetCommandLineW();
     if (has_arg(wcmd, L"--autostart")) {
-        int rc = run_autostart_mode();
-        config_free(&g_cfg);
-        return rc;
+        if (!g_cfg.stay_in_tray) {
+            int rc = run_autostart_mode();
+            config_free(&g_cfg);
+            return rc;
+        }
+        g_autostart_silent = 1;
+        g_installed = nanobot_detect_install();
+        if (g_installed && !nanobot_check_running(g_cfg.health_check_port)) {
+            char* cmd = find_nanobot_cmd();
+            if (!cmd && g_cfg.nanobot_path && g_cfg.nanobot_path[0])
+                cmd = _strdup(g_cfg.nanobot_path);
+            if (cmd) {
+                int pid = 0;
+                nanobot_start(cmd, &pid);
+                g_nanobot_pid = pid;
+                autostart_log("silent tray mode: nanobot process started");
+                free(cmd);
+            } else {
+                autostart_log("silent tray mode: nanobot command not found");
+            }
+        } else if (g_installed) {
+            autostart_log("silent tray mode: nanobot already running");
+        } else {
+            autostart_log("silent tray mode: nanobot not installed");
+        }
     }
 
-    g_installed = nanobot_detect_install();
+    if (!g_autostart_silent)
+        g_installed = nanobot_detect_install();
 
     int initial_theme = g_cfg.theme_mode;
     if (initial_theme == 0) {
@@ -595,9 +694,88 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         return 1;
     }
 
+    {
+        const char* zh =
+            "app_title=nanobot \xe7\xae\xa1\xe7\x90\x86\xe5\x99\xa8\n"
+            "chat_coming_soon=\xe5\x8d\xb3\xe5\xb0\x86\xe6\x8e\xa8\xe5\x87\xba\n"
+            "chat_coming_soon_desc=\xe8\x81\x8a\xe5\xa4\xa9\xe5\x8a\x9f\xe8\x83\xbd\xe6\xad\xa3\xe5\x9c\xa8\xe5\xbc\x80\xe5\x8f\x91\xe4\xb8\xad\n"
+            "install_not_found=\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0 nanobot\n"
+            "install_hint=\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xef\xbc\x9apip install nanobot-ai\n"
+            "metric_port=\xe7\xab\xaf\xe5\x8f\xa3\n"
+            "metric_pid=\xe8\xbf\x9b\xe7\xa8\x8b\n"
+            "metric_uptime=\xe8\xbf\x90\xe8\xa1\x8c\xe6\x97\xb6\xe9\x97\xb4\n"
+            "btn_start=\xe5\x90\xaf\xe5\x8a\xa8\n"
+            "btn_stop=\xe5\x81\x9c\xe6\xad\xa2\n"
+            "settings_general=\xe9\x80\x9a\xe7\x94\xa8\n"
+            "settings_appearance=\xe5\xa4\x96\xe8\xa7\x82\n"
+            "setting_autostart=\xe5\xbc\x80\xe6\x9c\xba\xe8\x87\xaa\xe5\x90\xaf\n"
+            "setting_autostart_sub=Windows \xe5\x90\xaf\xe5\x8a\xa8\xe6\x97\xb6\xe8\x87\xaa\xe5\x8a\xa8\xe8\xbf\x90\xe8\xa1\x8c\n"
+            "setting_tray=\xe6\x9c\x80\xe5\xb0\x8f\xe5\x8c\x96\xe5\x88\xb0\xe6\x89\x98\xe7\x9b\x98\n"
+            "setting_tray_sub=\xe5\x85\xb3\xe9\x97\xad\xe7\xaa\x97\xe5\x8f\xa3\xe6\x97\xb6\xe9\x9a\x90\xe8\x97\x8f\xe5\x88\xb0\xe7\xb3\xbb\xe7\xbb\x9f\xe6\x89\x98\xe7\x9b\x98\n"
+            "setting_path=nanobot \xe8\xb7\xaf\xe5\xbe\x84\n"
+            "setting_path_change=\xe6\x9b\xb4\xe6\x94\xb9\n"
+            "setting_theme=\xe4\xb8\xbb\xe9\xa2\x98\n"
+            "setting_language=\xe8\xaf\xad\xe8\xa8\x80\n"
+            "open_webui=\xe6\x89\x93\xe5\xbc\x80 WebUI\n"
+            "status_stopped=\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2\n"
+            "status_stopped_sub=nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c\n"
+            "status_running=\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad\n"
+            "status_running_sub=nanobot \xe7\xbd\x91\xe5\x85\xb3\xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\n"
+            "status_starting=\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6\n"
+            "status_starting_sub=\xe7\xad\x89\xe5\xbe\x85\xe5\x81\xa5\xe5\xba\xb7\xe6\xa3\x80\xe6\x9f\xa5\n"
+            "status_not_found=\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\n"
+            "status_not_found_sub=\xe6\x89\xbe\xe4\xb8\x8d\xe5\x88\xb0 nanobot\xef\xbc\x8c\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xe6\x88\x96\xe8\xae\xbe\xe7\xbd\xae\xe8\xb7\xaf\xe5\xbe\x84\n"
+            "status_start_fail=\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5\n"
+            "status_stopping=\xe5\x81\x9c\xe6\xad\xa2\xe4\xb8\xad\xe2\x80\xa6\n"
+            "status_stopping_sub=\xe6\xad\xa3\xe5\x9c\xa8\xe5\x85\xb3\xe9\x97\xad nanobot\n"
+            "status_detecting=\xe6\xa3\x80\xe6\xb5\x8b\xe4\xb8\xad\xe2\x80\xa6\n"
+            "status_not_installed=\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85\n"
+            "status_not_installed_sub=nanobot \xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85\n"
+            "auto_detect=\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b\n";
+        const char* en =
+            "app_title=nanobot manager\n"
+            "chat_coming_soon=Coming Soon\n"
+            "chat_coming_soon_desc=Chat feature is under development\n"
+            "install_not_found=nanobot not found\n"
+            "install_hint=Please install: pip install nanobot-ai\n"
+            "metric_port=Port\n"
+            "metric_pid=PID\n"
+            "metric_uptime=Uptime\n"
+            "btn_start=Start\n"
+            "btn_stop=Stop\n"
+            "settings_general=General\n"
+            "settings_appearance=Appearance\n"
+            "setting_autostart=Auto-start on boot\n"
+            "setting_autostart_sub=Launch when Windows starts\n"
+            "setting_tray=Minimize to tray\n"
+            "setting_tray_sub=Hide to system tray on close\n"
+            "setting_path=nanobot path\n"
+            "setting_path_change=Change\n"
+            "setting_theme=Theme\n"
+            "setting_language=Language\n"
+            "open_webui=Open WebUI\n"
+            "status_stopped=Stopped\n"
+            "status_stopped_sub=nanobot is not running\n"
+            "status_running=Running\n"
+            "status_running_sub=nanobot gateway is active\n"
+            "status_starting=Starting\xe2\x80\xa6\n"
+            "status_starting_sub=Waiting for health check\n"
+            "status_not_found=Not found\n"
+            "status_not_found_sub=Cannot find nanobot. Please install or set path.\n"
+            "status_start_fail=Start failed\n"
+            "status_stopping=Stopping\xe2\x80\xa6\n"
+            "status_stopping_sub=Shutting down nanobot\n"
+            "status_detecting=Detecting\xe2\x80\xa6\n"
+            "status_not_installed=Not installed\n"
+            "status_not_installed_sub=nanobot is not installed\n"
+            "auto_detect=Auto-detect\n";
+        ui_page_load_language_string(g_page, "zh", zh);
+        ui_page_load_language_string(g_page, "en", en);
+    }
+
     ui_page_set_text(g_page, "status", L"stopped");
-    page_set("statusText", "Stopped");
-    page_set("statusSub", "nanobot is not running");
+    page_set("statusText", is_zh() ? "\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2" : "Stopped");
+    page_set("statusSub", is_zh() ? "nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c" : "nanobot is not running");
     ui_page_set_bool(g_page, "installed", g_installed);
     ui_page_set_bool(g_page, "canStart", g_installed ? 1 : 0);
     ui_page_set_bool(g_page, "canStop", 0);
@@ -613,10 +791,16 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, wpath, MAX_PATH);
         ui_page_set_text(g_page, "nanobotPath", wpath);
     } else {
-        page_set("nanobotPath", "Auto-detect");
+        page_set("nanobotPath", is_zh() ? "\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b" : "Auto-detect");
     }
 
     apply_theme(g_cfg.theme_mode);
+
+    {
+        const char* loc = g_cfg.language[0] ? g_cfg.language : "zh";
+        ui_page_set_locale(g_page, loc);
+        page_set("lang", loc);
+    }
 
     {
         wchar_t ver_w[32];
@@ -627,13 +811,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
     ui_page_on_widget_mount(g_page, "toggle_autostart", on_toggle_mount, NULL);
+    ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_system", on_theme_system_mount, NULL);
+    ui_page_on_widget_mount(g_page, "lang_zh", on_lang_zh_mount, NULL);
+    ui_page_on_widget_mount(g_page, "lang_en", on_lang_en_mount, NULL);
 
-    g_win = ui_page_open_window(g_page, NULL);
+    if (g_autostart_silent)
+        g_win = ui_page_prepare_window(g_page, NULL);
+    else
+        g_win = ui_page_open_window(g_page, NULL);
     if (!g_win) {
         ui_page_destroy(g_page);
         config_free(&g_cfg);
@@ -643,7 +833,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_hwnd = hwnd;
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
-    ui_window_on_menu(g_win, on_menu, NULL);
     if (g_tray_enabled_effective)
         tray_add(hwnd);
 

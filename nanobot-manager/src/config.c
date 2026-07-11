@@ -22,6 +22,7 @@ int config_load(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 18790;
     cfg->theme_mode = 0;
+    strcpy(cfg->language, "zh");
 
     char* path = get_config_path();
     if (!path) return -1;
@@ -65,6 +66,10 @@ int config_load(app_config* cfg) {
     if (jtm && cJSON_IsNumber(jtm) && jtm->valueint >= 0 && jtm->valueint <= 2)
         cfg->theme_mode = jtm->valueint;
 
+    cJSON* jlang = cJSON_GetObjectItem(root, "language");
+    if (jlang && cJSON_IsString(jlang) && jlang->valuestring[0])
+        strncpy(cfg->language, jlang->valuestring, sizeof(cfg->language) - 1);
+
     cJSON_Delete(root);
     return 0;
 }
@@ -82,6 +87,7 @@ int config_save(const app_config* cfg) {
     cJSON_AddBoolToObject(root, "stay_in_tray", cfg->stay_in_tray);
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
+    cJSON_AddStringToObject(root, "language", cfg->language);
 
     char* json = cJSON_Print(root);
     cJSON_Delete(root);
