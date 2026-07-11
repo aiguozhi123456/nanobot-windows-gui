@@ -16,6 +16,8 @@ export default {
       autostart: false,
       stayInTray: false,
       nanobotPath: "",
+      webuiPort: "8765",
+      webuiAuth: "",
       theme: "system",
       installed: true,
       lang: "zh",
@@ -413,6 +415,52 @@ export default {
     color: var(--accent);
   }
 
+  .setting-col {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 6px;
+  }
+
+  .port-input {
+    height: 32px;
+    font-size: 13px;
+    padding: 0 8px;
+    background: var(--bg-2);
+    border-radius: 8px;
+  }
+
+  .auth-input {
+    height: 32px;
+    font-size: 13px;
+    padding: 0 8px;
+    background: var(--bg-2);
+    border-radius: 8px;
+  }
+
+  .apply-row {
+    flex-direction: row;
+    justify-content: flex-end;
+    padding: 6px 0 0;
+  }
+
+  .apply-btn {
+    padding: 6px 16px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    cursor: pointer;
+  }
+
+  .apply-btn:hover {
+    opacity: 0.92;
+  }
+
+  .apply-btn-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-on-accent);
+  }
+
   .theme-row {
     flex-direction: row;
     gap: 4px;
@@ -627,6 +675,32 @@ export default {
             <div class="path-display" id="btn_change_path">
               <label class="path-text" id="path_text">{{ nanobotPath }}</label>
               <label class="path-change">{{ $t('setting_path_change') }}</label>
+            </div>
+          </div>
+
+          <div class="divider" style="margin-top: 8px"></div>
+
+          <label class="settings-section-title">{{ $t('settings_network') }}</label>
+
+          <div class="setting-row setting-col">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_webui_port') }}</label>
+              <label class="setting-sub">{{ $t('setting_webui_port_sub') }}</label>
+            </div>
+            <input id="webui_port_input" v-model="webuiPort" type="number" min="1" max="65535" class="port-input" placeholder="8765"/>
+          </div>
+
+          <div class="setting-row setting-col">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_webui_auth') }}</label>
+              <label class="setting-sub">{{ $t('setting_webui_auth_sub') }}</label>
+            </div>
+            <input id="webui_auth_input" v-model="webuiAuth" class="auth-input" placeholder="(optional)"/>
+          </div>
+
+          <div class="apply-row">
+            <div id="btn_apply_network" class="apply-btn">
+              <label class="apply-btn-label">{{ $t('setting_apply') }}</label>
             </div>
           </div>
 

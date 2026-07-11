@@ -430,6 +430,56 @@ static void on_btn_send_mount(UiPage p, UiWidget w, void* ud) {
     chat_ui_mount_send(p, w, NULL);
 }
 
+/* Apply WebUI port + auth from the Network section of the settings page. */
+static void on_apply_network(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    /* Read webuiPort (number input may serialize as string or number) */
+    int new_port = 0;
+    char* raw_port = ui_page_get_json(g_page, "webuiPort");
+    if (raw_port) {
+        cJSON* jp = cJSON_Parse(raw_port);
+        if (jp && cJSON_IsString(jp))
+            new_port = atoi(jp->valuestring);
+        else if (jp && cJSON_IsNumber(jp))
+            new_port = jp->valueint;
+        cJSON_Delete(jp);
+        ui_page_free(raw_port);
+    }
+    if (new_port < 1 || new_port > 65535) {
+        /* Invalid: restore the current value and bail */
+        wchar_t wpw[16];
+        swprintf_s(wpw, _countof(wpw), L"%d",
+                   g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
+        ui_page_set_text(g_page, "webuiPort", wpw);
+        return;
+    }
+    /* Read webuiAuth (optional) */
+    char new_auth[128] = {0};
+    char* raw_auth = ui_page_get_json(g_page, "webuiAuth");
+    if (raw_auth) {
+        cJSON* ja = cJSON_Parse(raw_auth);
+        if (ja && cJSON_IsString(ja) && ja->valuestring) {
+            strncpy(new_auth, ja->valuestring, sizeof(new_auth) - 1);
+            new_auth[sizeof(new_auth) - 1] = '\0';
+        }
+        cJSON_Delete(ja);
+        ui_page_free(raw_auth);
+    }
+    g_cfg.webui_port = new_port;
+    strncpy(g_cfg.webui_auth, new_auth, sizeof(g_cfg.webui_auth) - 1);
+    g_cfg.webui_auth[sizeof(g_cfg.webui_auth) - 1] = '\0';
+    config_save(&g_cfg);
+    /* Sync into the chat subsystem and reconnect */
+    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
+    chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
+    chat_connect();
+}
+
+static void on_btn_apply_network_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_apply_network, NULL);
+}
+
 static void apply_theme(int mode) {
     g_theme_mode = mode;
     g_cfg.theme_mode = mode;
@@ -744,6 +794,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_theme=\xe4\xb8\xbb\xe9\xa2\x98\n"
             "setting_language=\xe8\xaf\xad\xe8\xa8\x80\n"
             "open_webui=\xe6\x89\x93\xe5\xbc\x80 WebUI\n"
+            "settings_network=\xe7\xbd\x91\xe7\xbb\x9c\n"
+            "setting_webui_port=WebUI \xe7\xab\xaf\xe5\x8f\xa3\n"
+            "setting_webui_port_sub=\xe6\x9c\xac\xe5\x9c\xb0 WebSocket \xe7\xbd\x91\xe5\x85\xb3\xe7\xab\xaf\xe5\x8f\xa3\n"
+            "setting_webui_auth=\xe8\xae\xa4\xe8\xaf\x81\xe5\xaf\x86\xe9\x92\xa5\n"
+            "setting_webui_auth_sub=\xe5\x8f\xaf\xe9\x80\x89\xef\xbc\x8c\xe7\x94\xa8\xe4\xba\x8e\xe5\xbc\x95\xe5\xaf\xbc\xe6\x8f\xa1\xe6\x89\x8b\xef\xbc\x88tokenIssueSecret\xef\xbc\x89\n"
+            "setting_apply=\xe5\xba\x94\xe7\x94\xa8\n"
             "status_stopped=\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2\n"
             "status_stopped_sub=nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c\n"
             "status_running=\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad\n"
@@ -782,6 +838,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_theme=Theme\n"
             "setting_language=Language\n"
             "open_webui=Open WebUI\n"
+            "settings_network=Network\n"
+            "setting_webui_port=WebUI Port\n"
+            "setting_webui_port_sub=Local WebSocket gateway port\n"
+            "setting_webui_auth=Auth Secret\n"
+            "setting_webui_auth_sub=Optional, bootstrap handshake secret (tokenIssueSecret)\n"
+            "setting_apply=Apply\n"
             "status_stopped=Stopped\n"
             "status_stopped_sub=nanobot is not running\n"
             "status_running=Running\n"
@@ -822,6 +884,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         page_set("nanobotPath", is_zh() ? "\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b" : "Auto-detect");
     }
 
+    /* WebUI port + auth initial values */
+    {
+        wchar_t wpw[16];
+        swprintf_s(wpw, _countof(wpw), L"%d",
+                   g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
+        ui_page_set_text(g_page, "webuiPort", wpw);
+        page_set("webuiAuth", g_cfg.webui_auth[0] ? g_cfg.webui_auth : "");
+    }
+
     apply_theme(g_cfg.theme_mode);
 
     {
@@ -847,6 +918,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_apply_network", on_btn_apply_network_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_send", on_btn_send_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
