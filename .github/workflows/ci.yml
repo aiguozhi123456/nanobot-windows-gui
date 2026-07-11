@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Windows MSVC build & test
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          # version.h is derived from NANOBOT_MANAGER_VERSION in CMakeLists,
+          # not from git describe, so a shallow clone is enough.
+          fetch-depth: 1
+
+      # FetchContent deps (cJSON + core-ui's QuickJS-NG) are the slow part of a
+      # cold configure; cache them keyed on CMakeLists so they survive re-runs.
+      - name: Cache FetchContent dependencies
+        uses: actions/cache@v4
+        with:
+          path: nanobot-manager/build/_deps
+          key: ${{ runner.os }}-deps-${{ hashFiles('**/CMakeLists.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-deps-
+
+      # scripts\build.bat is the canonical build entrypoint (AGENTS.md): it
+      # locates Visual Studio via vswhere, sets up vcvars, falls back to the
+      # CMake bundled with VS, picks the matching VS generator, and applies
+      # -DCMAKE_POLICY_VERSION_MINIMUM=3.5 for cJSON's old cmake_minimum_required.
+      - name: Configure & build
+        shell: cmd
+        run: nanobot-manager\scripts\build.bat
+
+      # BUILD_TESTING is ON by default, so the config/autostart unit tests are
+      # built into nanobot-manager\build\tests. CTest runs them in Release.
+      - name: Test (CTest, Release)
+        shell: cmd
+        run: ctest --test-dir nanobot-manager\build -C Release --output-on-failure --no-tests=error
+
+      - name: Upload test logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctest-logs
+          path: nanobot-manager/build/Testing/Temporary/
+          if-no-files-found: ignore
