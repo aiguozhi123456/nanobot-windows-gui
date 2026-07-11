@@ -18,39 +18,25 @@ static char* get_config_path(void) {
     return path;
 }
 
-int config_load(app_config* cfg) {
+void config_apply_defaults(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 18790;
     cfg->theme_mode = 0;
     cfg->webui_port = 8765;
     cfg->webui_auth[0] = '\0';
     strcpy(cfg->language, "zh");
+}
 
-    char* path = get_config_path();
-    if (!path) return -1;
-
-    FILE* f = fopen(path, "rb");
-    free(path);
-    if (!f) return 0;
-
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (len <= 0) { fclose(f); return 0; }
-
-    char* buf = (char*)malloc((size_t)len + 1);
-    if (!buf) { fclose(f); return -1; }
-    size_t nread = fread(buf, 1, (size_t)len, f);
-    buf[nread] = '\0';
-    fclose(f);
-
-    cJSON* root = cJSON_Parse(buf);
-    free(buf);
-    if (!root) return 0;
+int config_parse_json(app_config* cfg, const char* json) {
+    if (!cfg || !json) return -1;
+    cJSON* root = cJSON_Parse(json);
+    if (!root) return -1;
 
     cJSON* jp = cJSON_GetObjectItem(root, "nanobot_path");
-    if (jp && cJSON_IsString(jp) && jp->valuestring[0])
+    if (jp && cJSON_IsString(jp) && jp->valuestring[0]) {
+        free(cfg->nanobot_path);            /* avoid leak if parsed twice */
         cfg->nanobot_path = _strdup(jp->valuestring);
+    }
 
     cJSON* ja = cJSON_GetObjectItem(root, "autostart_nanobot");
     if (ja && cJSON_IsBool(ja))
@@ -88,10 +74,8 @@ int config_load(app_config* cfg) {
     return 0;
 }
 
-int config_save(const app_config* cfg) {
-    char* path = get_config_path();
-    if (!path) return -1;
-
+char* config_serialize_json(const app_config* cfg) {
+    if (!cfg) return NULL;
     cJSON* root = cJSON_CreateObject();
     if (cfg->nanobot_path)
         cJSON_AddStringToObject(root, "nanobot_path", cfg->nanobot_path);
@@ -107,6 +91,41 @@ int config_save(const app_config* cfg) {
 
     char* json = cJSON_Print(root);
     cJSON_Delete(root);
+    return json;
+}
+
+int config_load(app_config* cfg) {
+    config_apply_defaults(cfg);
+
+    char* path = get_config_path();
+    if (!path) return -1;
+
+    FILE* f = fopen(path, "rb");
+    free(path);
+    if (!f) return 0;
+
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (len <= 0) { fclose(f); return 0; }
+
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return -1; }
+    size_t nread = fread(buf, 1, (size_t)len, f);
+    buf[nread] = '\0';
+    fclose(f);
+
+    config_parse_json(cfg, buf);   /* invalid JSON tolerated: defaults preserved */
+    free(buf);
+    return 0;
+}
+
+int config_save(const app_config* cfg) {
+    char* path = get_config_path();
+    if (!path) return -1;
+
+    char* json = config_serialize_json(cfg);
+    if (!json) { free(path); return -1; }
 
     FILE* f = fopen(path, "wb");
     free(path);

@@ -72,6 +72,12 @@ target_compile_definitions(nanobot-manager PRIVATE
     _CRT_SECURE_NO_WARNINGS
 )
 
+option(BUILD_TESTING "Build nanobot-manager unit tests" ON)
+if(BUILD_TESTING)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
 add_custom_command(TARGET nanobot-manager POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         ${CMAKE_CURRENT_SOURCE_DIR}/ui
