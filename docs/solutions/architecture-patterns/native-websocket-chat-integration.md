@@ -1,6 +1,7 @@
 ---
 title: Native WebSocket Chat Integration in a Win32/C++ GUI Application
 date: 2026-07-11
+last_updated: 2026-07-13
 category: architecture-patterns
 module: nanobot-manager/chat
 problem_type: architecture_pattern
@@ -62,19 +63,19 @@ This lets `chat_ui.c` own the send flow entirely — reading the draft, validati
 
 ### Thunk Adapter for Function Signatures
 
-`nanobot_check_running` takes `int port`, but `chat_ui_set_gateway` expects `int(void)`. A small static thunk bridges this:
+`chat_ui_set_gateway` expects an `int(void)` function, while live HTTP probing is owned by the asynchronous gateway lifecycle worker. A small thunk exposes the **cached lifecycle state** to the chat UI without performing network I/O on the UI thread:
 
 ```c
 /* main.cpp */
 static int health_running_thunk(void) {
-    return nanobot_check_running(g_cfg.health_check_port);
+    return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
 }
 
 /* At init: */
 chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
 ```
 
-This is a zero-cost adapter that lets the UI state layer call health checks without knowing about config structure or port numbers.
+This is a zero-cost adapter that lets the UI state layer ask whether sending is currently allowed without knowing about lifecycle state, config structure, or port numbers. The worker-owned `nanobot_check_running` result is marshalled to the UI thread before this cached state changes.
 
 ### Event-Driven UI Updates via Window Messages
 
@@ -195,7 +196,7 @@ Without generation tracking, a race occurs: connection A's recv_thread is closin
 
 ### Why the thunk adapter matters
 
-Without the thunk, `chat_ui.c` would need to know about `app_config` structure and `nanobot_check_running`'s signature — leaking `config.h` and `process.h` dependencies into the UI layer. The thunk keeps `chat_ui.c` dependent only on `chat.h`, `ui_core.h`, and `cJSON`.
+Without the thunk, `chat_ui.c` would need to know about the gateway lifecycle state or process APIs, leaking `process.h` dependencies into the UI layer. The thunk keeps `chat_ui.c` dependent only on `chat.h`, `ui_core.h`, and `cJSON`.
 
 ## When to Apply
 
@@ -212,7 +213,7 @@ Without the thunk, `chat_ui.c` would need to know about `app_config` structure a
 ```c
 /* main.cpp */
 static int health_running_thunk(void) {
-    return nanobot_check_running(g_cfg.health_check_port);
+    return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
 }
 
 /* At init */
@@ -304,8 +305,9 @@ if (!secret_is_safe(g_bootstrap_secret)) {
 ### Health check integration (main.cpp)
 
 ```c
-static void do_health_check(void) {
-    int running = nanobot_check_running(g_cfg.health_check_port);
+/* health_worker performs the blocking HTTP request off the UI thread and
+ * posts WM_ASYNC_HEALTH_RESULT. This handler runs on the UI thread. */
+static void apply_health_result(int running) {
     if (running) {
         /* ... update status to running ... */
         if (!chat_is_ready()) {
@@ -320,8 +322,11 @@ static void do_health_check(void) {
 }
 ```
 
+The native gateway lifecycle also watches the real process handle for immediate exit events. HTTP health and process death remain separate signals: chat connection state follows the UI-thread lifecycle transition, never a synchronous health request from the send-click path.
+
 ## Related
 
 - `AGENTS.md` — project layout, build commands, runtime behavior (updated with chat.c, webui_port, webui_auth)
 - `core-ui/docs/uix-ai-guide.md` — core-ui SFC pattern reference (v-for, v-model, ScrollView)
+- [State-Driven Gateway Lifecycle Management on Windows](state-driven-gateway-lifecycle.md) — asynchronous health ownership, process-exit events, state transitions, and handle-close discipline
 - [nanobot gateway](https://github.com/HKUDS/nanobot) — upstream Python gateway with WebSocket chat endpoint

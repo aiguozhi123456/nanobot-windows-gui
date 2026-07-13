@@ -5,10 +5,25 @@ Shared domain vocabulary for this project — entities, named processes, and sta
 ## Gateway Management
 
 ### Nanobot Gateway
-The Python process (`nanobot gateway` or `python -m nanobot gateway`) that the manager starts, stops, and monitors. Exposes a health endpoint and a WebUI with a WebSocket chat interface. The manager's primary purpose is to keep this process running and provide a native UI for it.
+The independently managed nanobot service that exposes health and WebUI/chat interfaces and can outlive the native manager.
+
+The manager launches it through nanobot's background lifecycle, observes the real gateway instance recorded by the upstream runtime, and requests graceful stop through the gateway control plane rather than treating a launcher PID as the service.
 
 ### Health Check
-A WinHTTP GET to `http://localhost:{health_check_port}/health` (default port 18790) that returns HTTP 200 when the gateway is active. The manager polls this on a timer to detect start/stop transitions and auto-connect chat. Distinct from the WebUI port — the two are independent.
+A readiness observation that reports whether the Nanobot Gateway is serving its health endpoint; it is distinct from process identity and from the WebUI interface.
+
+Health is sampled asynchronously and may tolerate transient failures, while process-handle signaling provides immediate death detection.
+
+### Gateway State Record
+The upstream-owned rendezvous record that identifies one background Nanobot Gateway instance and preserves the information required to rediscover, validate, observe, and stop it across manager launches.
+
+### Gateway Process Identity
+The process-creation identity paired with a Gateway State Record's PID so stale state cannot target a different process after Windows reuses that PID.
+
+### Gateway Lifecycle State
+The manager's coordinated status for resolving, idle, startup, running, stopping, and terminal unavailability, used to assign ownership of asynchronous transitions and distinguish an invited stop from an unsolicited failure.
+
+Terminal unavailability can be reached by a process-exit event or sustained failed readiness; it does not by itself prove that the process has exited.
 
 ### WebUI Port
 The port the nanobot gateway serves its web interface on (default 8765). Independent of the health check port — not `health_check_port + 1`. The native chat client connects to this port for bootstrap and WebSocket upgrade.

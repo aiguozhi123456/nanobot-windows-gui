@@ -20,9 +20,6 @@
 static UiPage    g_page  = 0;
 static UiWindow  g_win   = 0;
 static app_config g_cfg  = {0};
-static int       g_installed = 0;
-static int       g_nanobot_pid = 0;
-static ULONGLONG g_start_tick = 0;
 static UINT_PTR  g_uptime_timer = 0;
 static int       g_theme_mode = 0;
 static int       g_tray_enabled_effective = 0;
@@ -33,18 +30,17 @@ static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
 static int       g_autostart_silent = 0;
 
-#define TIMER_HEALTH_CHECK_AFTER_START 1001
-#define TIMER_HEALTH_CHECK_AFTER_STOP  1002
 #define TIMER_UPTIME 1003
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
 
-#define WM_ASYNC_FIND_CMD   (WM_APP + 1)
-#define WM_ASYNC_STOP_DONE  (WM_APP + 2)
-#define WM_TRAY_ICON        (WM_APP + 3)
-#define WM_CHAT_EVENT        (WM_APP + 10)
-
-static void do_health_check(void);
+#define WM_ASYNC_STOP_DONE      (WM_APP + 2)
+#define WM_TRAY_ICON            (WM_APP + 3)
+#define WM_CHILD_EXITED         (WM_APP + 4)   /* P5a: posted by the thread-pool wait callback
+                                                * when g_state.handle becomes signaled       */
+#define WM_ASYNC_HEALTH_RESULT  (WM_APP + 5)   /* WPARAM = running(0/1)                                       */
+#define WM_ASYNC_RESOLVE_DONE   (WM_APP + 6)   /* WPARAM = start_intent(0/1), LPARAM = resolve_payload* (malloc'd; handler frees) */
+#define WM_CHAT_EVENT           (WM_APP + 10)
 
 static void tray_remove(void);
 
@@ -119,9 +115,11 @@ static int is_zh(void) {
     return g_cfg.language[0] != '\0' && strcmp(g_cfg.language, "zh") == 0;
 }
 
-/* Adapter: chat_ui_set_gateway needs int(void), nanobot_check_running needs int port. */
+/* Cached gateway-running predicate for the chat send path. Used to live-call
+ * nanobot_check_running (HTTP on the UI thread) -- now just reads the guarded
+ * state set by apply_health_result. Unblocks chat_ui.c:252 with no HTTP. */
 static int health_running_thunk(void) {
-    return nanobot_check_running(g_cfg.health_check_port);
+    return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
 }
 
 static void page_set(const char* name, const char* utf8) {
@@ -141,8 +139,9 @@ static void page_set_int(const char* name, int val) {
 }
 
 static void update_uptime(void) {
-    if (!g_start_tick) return;
-    ULONGLONG elapsed = (GetTickCount64() - g_start_tick) / 1000;
+    ULONGLONG start_tick = nm_state_get_start_tick();
+    if (!start_tick) return;
+    ULONGLONG elapsed = (GetTickCount64() - start_tick) / 1000;
     unsigned int s = (unsigned int)(elapsed % 60);
     unsigned int m = (unsigned int)((elapsed / 60) % 60);
     unsigned long long h = (unsigned long long)(elapsed / 3600);
@@ -163,9 +162,9 @@ static void start_uptime_timer(int pid) {
     ULONGLONG now = GetTickCount64();
     unsigned long long process_uptime = 0;
     if (nanobot_get_process_uptime_seconds(pid, &process_uptime))
-        g_start_tick = now - process_uptime * 1000ULL;
+        nm_state_set_start_tick(now - process_uptime * 1000ULL);
     else
-        g_start_tick = now;
+        nm_state_set_start_tick(now);
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_uptime_timer = SetTimer(hwnd, TIMER_UPTIME, 1000, on_timer_uptime);
@@ -177,7 +176,7 @@ static void stop_uptime_timer(void) {
         KillTimer((HWND)ui_window_hwnd(g_win), TIMER_UPTIME);
         g_uptime_timer = 0;
     }
-    g_start_tick = 0;
+    nm_state_set_start_tick(0);
     ui_page_set_text(g_page, "uptime", L"00:00");
     ui_page_set_text(g_page, "pid", L"-");
 }
@@ -190,7 +189,8 @@ static void set_status(const char* status, const char* text, const char* sub) {
     if (strcmp(status, "running") == 0) {
         ui_page_set_bool(g_page, "canStart", 0);
         ui_page_set_bool(g_page, "canStop", 1);
-    } else if (strcmp(status, "starting") == 0) {
+    } else if (strcmp(status, "starting") == 0 || strcmp(status, "stopping") == 0) {
+        /* M5: "stopping" disables both buttons -- same as "starting". */
         ui_page_set_bool(g_page, "canStart", 0);
         ui_page_set_bool(g_page, "canStop", 0);
     } else {
@@ -199,95 +199,343 @@ static void set_status(const char* status, const char* text, const char* sub) {
     }
 }
 
-static void set_status_i18n(const char* status,
-                            const char* text_zh, const char* text_en,
-                            const char* sub_zh,  const char* sub_en) {
-    set_status(status, is_zh() ? text_zh : text_en, is_zh() ? sub_zh : sub_en);
-}
+/* --- Status i18n (single-source keys) ---------------------------------------
+ * core-ui exposes ui_page_load_language_string / $t('key') for .uix templates
+ * but has no C++ key→string lookup API. Status text is pushed from C++ via
+ * page_set. g_status_i18n is the ONLY wording source for status_* keys:
+ *   - t_status() resolves keys for set_status_i18n
+ *   - append_status_i18n_lang() generates the status portion of the language
+ *     blob passed to ui_page_load_language_string (so $t and C++ cannot drift) */
+typedef struct { const char* key; const char* zh; const char* en; } status_i18n_entry;
 
-static void on_timer_health_check(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
-    (void)hwnd; (void)msg; (void)tick;
-    KillTimer(hwnd, id);
-    do_health_check();
-}
+static const status_i18n_entry g_status_i18n[] = {
+    { "status_running",              "运行中",                         "Running" },
+    { "status_running_sub",          "nanobot 网关已启动",              "nanobot gateway is active" },
+    { "status_stopped",              "已停止",                         "Stopped" },
+    { "status_stopped_sub",          "nanobot 未运行",                 "nanobot is not running" },
+    { "status_exited_sub",           "nanobot 网关已退出",             "nanobot gateway exited" },
+    { "status_starting",             "启动中…",                        "Starting…" },
+    { "status_starting_sub",         "等待健康检查",                   "Waiting for health check" },
+    { "status_stopping",             "停止中…",                        "Stopping…" },
+    { "status_stopping_sub",         "正在关闭 nanobot",               "Shutting down nanobot" },
+    { "status_detecting",            "检测中…",                        "Detecting…" },
+    { "status_detecting_nanobot",    "检测中…",                        "Detecting nanobot…" },
+    { "status_not_found",            "未找到",                         "Not found" },
+    { "status_not_found_sub",        "找不到 nanobot，请安装或设置路径",
+                                     "Cannot find nanobot. Please install or set path." },
+    { "status_start_fail",           "启动失败",                       "Start failed" },
+    { "status_not_installed",        "未安装",                         "Not installed" },
+    { "status_not_installed_sub",    "nanobot 未安装",                 "nanobot is not installed" },
+    { "status_fail_no_statefile_sub","后台启动器未写入状态文件",
+                                     "Background launcher did not write state file" },
+    { "status_fail_open_failed_sub", "OpenProcess 失败",               "OpenProcess failed" },
+    { "status_fail_stale_pid_sub",   "状态文件中的 PID 已失效",        "State file PID is stale" },
+};
 
-static void do_health_check(void) {
-    if (!g_installed) {
-        set_status_i18n("stopped",
-            "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "Not installed",
-            "nanobot \xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "nanobot is not installed");
-        ui_page_set_bool(g_page, "installed", 0);
-        return;
+static const char* t_status(const char* key) {
+    if (!key || !key[0]) return "";
+    for (int i = 0; i < (int)(sizeof(g_status_i18n) / sizeof(g_status_i18n[0])); i++) {
+        if (strcmp(g_status_i18n[i].key, key) == 0)
+            return is_zh() ? g_status_i18n[i].zh : g_status_i18n[i].en;
     }
+    return key;   /* missing key surfaces itself (same fallback as $t) */
+}
 
-    ui_page_set_bool(g_page, "installed", 1);
+/* status = UI state code ("running"/"stopped"/"starting"/"stopping");
+ * text_key / sub_key = entries in g_status_i18n (and the language table). */
+static void set_status_i18n(const char* status,
+                            const char* text_key, const char* sub_key) {
+    set_status(status, t_status(text_key), t_status(sub_key));
+}
 
-    int running = nanobot_check_running(g_cfg.health_check_port);
+/* Append "key=value\n" to a language blob buffer. Returns 0 on overflow. */
+static int append_lang(char* buf, size_t cap, size_t* used,
+                       const char* key, const char* val) {
+    if (!buf || !used || !key || !val || *used >= cap) return 0;
+    int n = snprintf(buf + *used, cap - *used, "%s=%s\n", key, val);
+    if (n < 0 || (size_t)n >= cap - *used) return 0;
+    *used += (size_t)n;
+    return 1;
+}
+
+/* Generate the status_* portion of a language blob from g_status_i18n. */
+static int append_status_i18n_lang(char* buf, size_t cap, size_t* used, int zh) {
+    for (int i = 0; i < (int)(sizeof(g_status_i18n) / sizeof(g_status_i18n[0])); i++) {
+        const char* val = zh ? g_status_i18n[i].zh : g_status_i18n[i].en;
+        if (!append_lang(buf, cap, used, g_status_i18n[i].key, val))
+            return 0;
+    }
+    return 1;
+}
+
+/* Apply an off-thread health probe result on the UI thread. The HTTP probe
+ * (nanobot_check_running) now runs ONLY in health_worker; this updates UI +
+ * guarded state. g_state.pid is authoritative from P3a's nanobot_start.
+ *
+ * P5a streak tolerance: a single failed probe while RUNNING is treated as a
+ * transient blip (network hiccup, slow /health). Two in a row => DEAD. This
+ * prevents a momentary 503/timeout from flipping a healthy gateway to Stopped.
+ * The streak is UI-thread-local (single thread -> no lock) and is reset on
+ * every successful probe and on every fresh start. */
+static int s_health_fail_streak = 0;
+
+static void apply_health_result(int running) {
     if (running) {
-        int pid = find_nanobot_python_pid();
-        if (pid <= 0 && g_nanobot_pid > 0)
-            pid = g_nanobot_pid;
-        g_nanobot_pid = pid;
-        set_status_i18n("running",
-            "\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad", "Running",
-            "nanobot \xe7\xbd\x91\xe5\x85\xb3\xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8", "nanobot gateway is active");
-        page_set_int("pid", pid > 0 ? pid : 0);
-        if (!g_start_tick)
-            start_uptime_timer(pid);
+        s_health_fail_streak = 0;
+        /* P5b: if we discovered a running gateway we didn't start (manager
+         * relaunch with the gateway still up, or an externally-started
+         * `nanobot gateway`), latch onto it via the state file so PID/handle
+         * are populated and instant handle-signal crash detection applies.
+         * Idempotent: skipped once attached. On failure the handle stays NULL
+         * and liveness falls back to the HTTP streak path (~30s detection). */
+        if (nm_state_get_handle() == NULL) {
+            if (nanobot_attach_running() == 0) {
+                HWND hwnd = (HWND)ui_window_hwnd(g_win);
+                nanobot_watch_handle(hwnd, WM_CHILD_EXITED);
+            }
+        }
+        /* Re-snapshot AFTER attach (it mutated g_state.{pid,handle,start_tick}
+         * under CS) so the UI work below shows the real pid/start_tick. */
+        nm_process_view v;
+        nm_state_snapshot(&v);
+        int was_running = (v.state == NM_STATE_RUNNING);
+        nm_state_set_state(NM_STATE_RUNNING);
+        set_status_i18n("running", "status_running", "status_running_sub");
+        if (v.start_tick == 0)
+            nm_state_set_start_tick(GetTickCount64());
+        if (!was_running)
+            start_uptime_timer((int)v.pid);
+        page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
         if (!chat_is_ready()) {
             chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
             chat_connect();
         }
-    } else {
-        set_status_i18n("stopped",
-            "\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2", "Stopped",
-            "nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c", "nanobot is not running");
-        stop_uptime_timer();
-        g_nanobot_pid = 0;
-        chat_disconnect_async();
-        chat_ui_on_gateway_stopped();
+        return;
     }
+
+    /* Not running. */
+    nm_state s = nm_state_get();
+    if (s == NM_STATE_STARTING) {
+        /* Cold-boot tolerance: a single failed probe during STARTING must not
+         * flip the UI to Stopped -- the boot-phase poll continues. */
+        return;
+    }
+
+    if (s == NM_STATE_RUNNING) {
+        /* Steady-state streak: tolerate one blip before declaring DEAD. */
+        s_health_fail_streak++;
+        if (s_health_fail_streak < 2) {
+            return;                        /* one blip tolerated, stay RUNNING               */
+        }
+        /* Two in a row => crash/DEAD. Fall through to the DEAD transition. */
+    }
+
+    /* DEAD transition: either we were RUNNING and the streak hit 2, or the
+     * state was already IDLE/DEAD/etc. (e.g. initial detect found not-running).
+     * In the latter case we settle on IDLE/Stopped (same UI as before P5a). */
+    if (s == NM_STATE_RUNNING) {
+        nm_state_set_state(NM_STATE_DEAD);
+        set_status_i18n("stopped", "status_stopped", "status_exited_sub");
+    } else {
+        nm_state_set_state(NM_STATE_IDLE);
+        set_status_i18n("stopped", "status_stopped", "status_stopped_sub");
+    }
+    s_health_fail_streak = 0;
+    stop_uptime_timer();
+    nm_state_set_pid(0);
+    chat_disconnect_async();
+    chat_ui_on_gateway_stopped();
 }
 
-static DWORD WINAPI find_cmd_worker(LPVOID param) {
+/* --- Health worker (boot-phase backoff -> steady) --------------------------
+ * SOLE caller of nanobot_check_running after P3b (besides run_autostart_mode's
+ * synchronous loop, which has no UI thread). Posts WM_ASYNC_HEALTH_RESULT; the
+ * UI thread never blocks on HTTP.
+ *
+ * Generation counter: each kick increments g_health_gen and the fresh worker
+ * captures its own gen. A newer kick stale-marks older workers, which exit on
+ * the next bail check without posting more results. */
+static volatile LONG g_health_gen = 0;
+
+static DWORD WINAPI health_worker(LPVOID param) {
     HWND hwnd = (HWND)param;
-    char* cmd = find_nanobot_cmd();
-    if (!cmd && g_cfg.nanobot_path && g_cfg.nanobot_path[0])
-        cmd = _strdup(g_cfg.nanobot_path);
-    PostMessageW(hwnd, WM_ASYNC_FIND_CMD, 0, (LPARAM)cmd);
+    LONG my_gen = InterlockedIncrement(&g_health_gen);
+    int  port   = g_cfg.health_check_port;
+
+    static const int cadence[] = {1000,1000,1500,2000,2000,3000,3000,5000,5000,5000};
+    const int boot_count = (int)(sizeof(cadence) / sizeof(cadence[0]));
+    int i = 0;
+
+    for (;;) {
+        int running = nanobot_check_running(port);
+
+        /* M7: bail BEFORE posting so a superseded worker does not inject a
+         * stale result after a newer kick. The stale blip was masked by streak
+         * tolerance, but the ordering should be correct. */
+        if (InterlockedCompareExchange(&g_health_gen, my_gen, my_gen) != my_gen)
+            return 0;
+        /* Stop/dead happened on the UI thread? RESOLVING is allowed so the
+         * detect-only startup path (M2 leaves RESOLVING until the first health
+         * result) can post; apply_health_result then settles to RUNNING/IDLE. */
+        nm_state s = nm_state_get();
+        if (s != NM_STATE_STARTING && s != NM_STATE_RUNNING && s != NM_STATE_RESOLVING)
+            return 0;
+
+        PostMessageW(hwnd, WM_ASYNC_HEALTH_RESULT, (WPARAM)(running ? 1 : 0), 0);
+
+        int delay = (i < boot_count) ? cadence[i] : 15000;
+        Sleep(delay);
+        if (i < boot_count) i++;
+    }
     return 0;
 }
 
-static void handle_async_find_cmd(char* cmd) {
-    if (!cmd) {
-        set_status_i18n("stopped",
-            "\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0", "Not found",
-            "\xe6\x89\xbe\xe4\xb8\x8d\xe5\x88\xb0 nanobot\xef\xbc\x8c\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xe6\x88\x96\xe8\xae\xbe\xe7\xbd\xae\xe8\xb7\xaf\xe5\xbe\x84",
-            "Cannot find nanobot. Please install or set path.");
+static void kick_health_worker(HWND hwnd) {
+    InterlockedIncrement(&g_health_gen);  /* stale-mark any running worker    */
+    CloseHandle(CreateThread(NULL, 0, health_worker, hwnd, 0, NULL));
+}
+
+/* --- Resolve worker -------------------------------------------------------- */
+/* Off-UI-thread resolve. Caller chooses detect-only (start_intent=0) vs start
+ * (start_intent=1); the intent rides in WPARAM on WM_ASYNC_RESOLVE_DONE so the
+ * UI-thread handler knows whether to start.
+ *
+ * I1: resolve_ctx carries an OWNED snapshot of g_cfg.nanobot_path taken on the
+ * UI thread at kick time. The worker builds a local cfg_snap from g_cfg's other
+ * fields and overrides nanobot_path with the snapshot, so it never dereferences
+ * g_cfg.nanobot_path off-thread (on_change_path on the UI thread can free+replace
+ * it under us). Snapshotting happens on the UI thread in kick_resolve_worker,
+ * which is serialized with on_change_path (also UI thread) -> no race. */
+
+typedef struct { HWND hwnd; int start_intent; char* nanobot_path_snap; } resolve_ctx;   /* heap; worker frees (incl. nanobot_path_snap) */
+
+typedef struct {
+    char*     exe;        /* NULL if !found; ownership moves in from nm_resolution */
+    int       is_python;
+    nm_source source;     /* diagnostic only */
+    int       found;
+} resolve_payload;        /* heap; handler frees exe + struct on every path */
+
+static DWORD WINAPI resolve_worker(LPVOID param) {
+    resolve_ctx* c = (resolve_ctx*)param;
+    HWND hwnd = c->hwnd;
+    int  start_intent = c->start_intent;
+    char* path_snap = c->nanobot_path_snap;   /* I1: ownership moves here; freed below */
+
+    /* I1: shallow-copy g_cfg's value fields, then override nanobot_path with the
+     * stable snapshot. nanobot_resolve only reads cfg->nanobot_path, so racy
+     * reads of the other fields (ints/ports) during the copy are benign. */
+    app_config cfg_snap = g_cfg;
+    cfg_snap.nanobot_path = path_snap;
+
+    free(c);                  /* frees the ctx struct (path_snap preserved in local) */
+
+    resolve_payload* p = (resolve_payload*)calloc(1, sizeof(resolve_payload));
+    nm_resolution res;
+    if (nanobot_resolve(&cfg_snap, &res, 0) && res.found) {
+        p->exe        = res.exe;            /* take ownership (no double-strdup) */
+        p->is_python  = res.is_python;
+        p->source     = res.source;
+        p->found      = 1;
+        res.exe = NULL;
+    }
+    nm_resolution_free(&res);
+    /* M3: if PostMessageW fails (window gone), free the payload to avoid a
+     * leak -- matches chat subsystem's post_event discipline. */
+    if (!PostMessageW(hwnd, WM_ASYNC_RESOLVE_DONE, (WPARAM)start_intent, (LPARAM)p)) {
+        free(p->exe);
+        free(p);
+    }
+    free(path_snap);
+    return 0;
+}
+
+static void kick_resolve_worker(HWND hwnd, int start_intent) {
+    resolve_ctx* c = (resolve_ctx*)calloc(1, sizeof(resolve_ctx));
+    if (!c) return;
+    c->hwnd = hwnd;
+    c->start_intent = start_intent;
+    /* I1: snapshot nanobot_path on the UI thread (serialized with on_change_path). */
+    c->nanobot_path_snap = _strdup(g_cfg.nanobot_path ? g_cfg.nanobot_path : "");
+    /* M2: reflect the resolving phase. Cleared in on_resolve_done (-> STARTING
+     * on start success, -> IDLE on terminal paths) and in apply_health_result
+     * (-> RUNNING / IDLE). */
+    nm_state_set_state(NM_STATE_RESOLVING);
+    CloseHandle(CreateThread(NULL, 0, resolve_worker, c, 0, NULL));
+}
+
+/* UI-thread handler for WM_ASYNC_RESOLVE_DONE. Frees payload (exe + struct)
+ * on every return path. */
+static void on_resolve_done(resolve_payload* p, int start_intent) {
+    if (!p) return;
+
+    nm_state_set_installed(p->found ? 1 : 0);
+    ui_page_set_bool(g_page, "installed", p->found ? 1 : 0);
+    ui_page_set_bool(g_page, "canStart",  p->found ? 1 : 0);
+
+    if (p->exe) {
+        wchar_t wpath[MAX_PATH];
+        MultiByteToWideChar(CP_UTF8, 0, p->exe, -1, wpath, MAX_PATH);
+        ui_page_set_text(g_page, "nanobotPath", wpath);
+    }
+
+    if (!p->found) {
+        /* M2: resolve failed -> settle to IDLE (clears RESOLVING). */
+        nm_state_set_state(NM_STATE_IDLE);
+        set_status_i18n("stopped", "status_not_found", "status_not_found_sub");
+        free(p->exe);
+        free(p);
         return;
     }
 
-    g_nanobot_pid = 0;
-    int rc = nanobot_start(cmd, &g_nanobot_pid);
-    free(cmd);
+    if (start_intent) {
+        int pid_local = 0;
+        int rc = nanobot_start(p->exe, p->is_python, &pid_local);
 
-    if (rc != 0) {
-        char buf_zh[256], buf_en[256];
-        snprintf(buf_zh, sizeof(buf_zh),
-            "\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5 (\xe9\x94\x99\xe8\xaf\xaf %d)", rc);
-        snprintf(buf_en, sizeof(buf_en), "Start failed (error %d)", rc);
-        set_status("stopped", is_zh() ? buf_zh : buf_en, "");
-        return;
+        if (rc == 0) {
+            nm_state_set_state(NM_STATE_STARTING);   /* M2: clears RESOLVING */
+            nm_state_set_pid((DWORD)pid_local);
+            set_status_i18n("starting", "status_starting", "status_starting_sub");
+            page_set_int("pid", pid_local);
+            HWND hwnd = (HWND)ui_window_hwnd(g_win);
+            /* P5a: fresh start -- reset the steady-state fail streak and arm
+             * the one-shot thread-pool wait on the gateway handle. nanobot_start
+             * populated g_state.handle (OpenProcess'd real gateway pid); the
+             * wait posts WM_CHILD_EXITED the instant that handle signals. */
+            s_health_fail_streak = 0;
+            nanobot_watch_handle(hwnd, WM_CHILD_EXITED);
+            kick_health_worker(hwnd);
+        } else {
+            /* Map P3a distinct failure codes to a key-based sub-text. Headline
+             * embeds the numeric rc (not a pure table key). */
+            const char* hint_key = "";
+            if (rc == NANOBOT_START_NO_STATEFILE)
+                hint_key = "status_fail_no_statefile_sub";
+            else if (rc == NANOBOT_START_OPEN_FAILED)
+                hint_key = "status_fail_open_failed_sub";
+            else if (rc == NANOBOT_START_STALE_PID)
+                hint_key = "status_fail_stale_pid_sub";
+            char buf[256];
+            if (is_zh())
+                snprintf(buf, sizeof(buf), "启动失败 (错误 %d)", rc);
+            else
+                snprintf(buf, sizeof(buf), "Start failed (error %d)", rc);
+            /* M2: start failed -> settle to IDLE (clears RESOLVING). */
+            nm_state_set_state(NM_STATE_IDLE);
+            set_status("stopped", buf, t_status(hint_key));
+        }
+    } else {
+        /* Detect-only (startup probe). Found + installed -- leave RESOLVING
+         * for the health worker: M2 must not drop to IDLE here or the worker's
+         * state bail (STARTING|RUNNING only) would exit before the first post.
+         * apply_health_result clears RESOLVING -> RUNNING / IDLE. */
+        HWND hwnd = (HWND)ui_window_hwnd(g_win);
+        kick_health_worker(hwnd);
     }
 
-    set_status_i18n("starting",
-        "\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6", "Starting\xe2\x80\xa6",
-        "\xe7\xad\x89\xe5\xbe\x85\xe5\x81\xa5\xe5\xba\xb7\xe6\xa3\x80\xe6\x9f\xa5", "Waiting for health check");
-    page_set_int("pid", g_nanobot_pid);
-
-    HWND hwnd = (HWND)ui_window_hwnd(g_win);
-    SetTimer(hwnd, TIMER_HEALTH_CHECK_AFTER_START, 2000, on_timer_health_check);
+    free(p->exe);
+    free(p);
 }
 
 static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
@@ -297,14 +545,57 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         ui_window_hide(g_win);
         return 0;
     }
-    if (msg == WM_ASYNC_FIND_CMD) {
-        char* cmd = (char*)lp;
-        handle_async_find_cmd(cmd);
+    if (msg == WM_ASYNC_RESOLVE_DONE) {
+        on_resolve_done((resolve_payload*)lp, (int)wp);
+        return 0;
+    }
+    if (msg == WM_ASYNC_HEALTH_RESULT) {
+        apply_health_result((int)wp);
         return 0;
     }
     if (msg == WM_ASYNC_STOP_DONE) {
-        HWND hwnd2 = (HWND)ui_window_hwnd(g_win);
-        SetTimer(hwnd2, TIMER_HEALTH_CHECK_AFTER_STOP, 800, on_timer_health_check);
+        /* Stop is authoritative -- the stop_worker already killed the gateway.
+         * No re-probe needed; just flip UI + guarded state. */
+        nm_state_set_state(NM_STATE_IDLE);
+        set_status_i18n("stopped", "status_stopped", "status_stopped_sub");
+        stop_uptime_timer();
+        nm_state_set_pid(0);
+        s_health_fail_streak = 0;
+        chat_disconnect_async();
+        chat_ui_on_gateway_stopped();
+        return 0;
+    }
+    if (msg == WM_CHILD_EXITED) {
+        /* P5a: the thread-pool wait on g_state.handle fired -- the gateway
+         * process has exited. Classify by state.
+         *
+         * STOPPING: expected death during a P4 invited stop. stop_worker owns
+         *           the lifecycle during an invited stop -- return immediately
+         *           WITHOUT unwatch/close; its own cleanup will drain the fired
+         *           wait + close via nm_state_close_handle. The WM_ASYNC_STOP_DONE
+         *           handler owns the UI flip (STOPPING->IDLE).
+         * else    : unsolicited death while RUNNING/STARTING = crash. Close the
+         *           handle via the centralized helper and tear down chat/uptime.
+         *
+         * C1a/C1b: the state check is FIRST so the crash branch and stop_worker
+         * can never close the same handle. The wait already fired under
+         * WT_EXECUTEONLYONCE (single-fire), so leaving the registration for
+         * stop_worker's nm_state_close_handle to drain is correct. */
+        nm_state s = nm_state_get();
+        if (s == NM_STATE_STOPPING) {
+            /* expected -- stop_worker owns cleanup + the UI flip */
+            return 0;
+        }
+        /* RUNNING or STARTING (or any non-STOPPING) -> crash. Drain any
+         * in-flight callback + close the now-signaled handle via the
+         * centralized helper. pid/start_tick are left frozen for display. */
+        nm_state_close_handle();
+        nm_state_set_state(NM_STATE_DEAD);
+        s_health_fail_streak = 0;
+        set_status_i18n("stopped", "status_stopped", "status_exited_sub");
+        stop_uptime_timer();
+        chat_disconnect_async();
+        chat_ui_on_gateway_stopped();
         return 0;
     }
     if (msg == WM_CHAT_EVENT) {
@@ -338,35 +629,32 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
 static void on_start(UiWidget w, void* ud) {
     (void)w; (void)ud;
 
-    if (!g_installed) {
-        set_status_i18n("stopped",
-            "\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85", "Not installed",
-            "pip install nanobot-ai", "pip install nanobot-ai");
-        ui_page_set_bool(g_page, "installed", 0);
-        return;
-    }
-
-    set_status_i18n("starting",
-        "\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6", "Starting\xe2\x80\xa6",
-        "\xe6\xa3\x80\xe6\xb5\x8b\xe4\xb8\xad\xe2\x80\xa6", "Detecting nanobot\xe2\x80\xa6");
+    /* Always route through the resolve worker (intent=1). The handler starts
+     * when found, or shows the install hint when not -- so the old
+     * `!installed` early-return is gone. */
+    set_status_i18n("starting", "status_starting", "status_detecting_nanobot");
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
-    CreateThread(NULL, 0, find_cmd_worker, (LPVOID)hwnd, 0, NULL);
+    kick_resolve_worker(hwnd, 1);
 }
 
 static DWORD WINAPI stop_worker(LPVOID param) {
     HWND hwnd = (HWND)param;
-    nanobot_stop(g_nanobot_pid, g_cfg.health_check_port);
-    g_nanobot_pid = 0;
+    nanobot_stop();
+    nm_state_set_pid(0);
     PostMessageW(hwnd, WM_ASYNC_STOP_DONE, 0, 0);
     return 0;
 }
 
 static void on_stop(UiWidget w, void* ud) {
     (void)w; (void)ud;
-    set_status_i18n("starting",
-        "\xe5\x81\x9c\xe6\xad\xa2\xe4\xb8\xad\xe2\x80\xa6", "Stopping\xe2\x80\xa6",
-        "\xe6\xad\xa3\xe5\x9c\xa8\xe5\x85\xb3\xe9\x97\xad nanobot", "Shutting down nanobot");
+    /* M5: use the "stopping" status code (set_status now has a dedicated branch
+     * that disables both buttons) instead of borrowing "starting". */
+    set_status_i18n("stopping", "status_stopping", "status_stopping_sub");
+
+    /* Mark STOPPING so the (P5) WM_CHILD_EXITED handler will later classify
+     * death during a stop as expected. Forward-compatible: harmless now. */
+    nm_state_set_state(NM_STATE_STOPPING);
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     CreateThread(NULL, 0, stop_worker, (LPVOID)hwnd, 0, NULL);
@@ -658,50 +946,61 @@ static void autostart_log(const char* msg) {
 static int run_autostart_mode(void) {
     if (!g_cfg.autostart_nanobot)
         return 0;
-    g_installed = nanobot_detect_install();
-    if (!g_installed) {
+
+    /* No UI / no message loop in this path -- synchronous is fine (nothing to
+     * freeze). This is the documented exception to "no resolve/health on the
+     * UI thread". */
+    nm_resolution res;
+    if (!nanobot_resolve(&g_cfg, &res, 0) || !res.found) {
+        nm_resolution_free(&res);
+        nm_state_set_installed(0);
         autostart_log("nanobot not installed, skipping");
         return 0;
     }
+    nm_state_set_installed(1);
 
     if (nanobot_check_running(g_cfg.health_check_port)) {
+        nm_resolution_free(&res);
         autostart_log("nanobot already running");
         return 0;
     }
 
-    char* cmd = find_nanobot_cmd();
-    if (!cmd && g_cfg.nanobot_path && g_cfg.nanobot_path[0])
-        cmd = _strdup(g_cfg.nanobot_path);
-    if (cmd) {
-        int pid = 0;
-        int rc = nanobot_start(cmd, &pid);
-        free(cmd);
-        if (rc == 0) {
-            int healthy = 0;
-            for (int i = 0; i < 10; i++) {
-                Sleep(1000);
-                if (nanobot_check_running(g_cfg.health_check_port)) {
-                    healthy = 1;
-                    break;
-                }
-            }
-            if (healthy)
-                autostart_log("nanobot started and health check passed");
-            else
-                autostart_log("nanobot process created but health check failed after 10s");
-        } else {
-            char buf[128];
-            snprintf(buf, sizeof(buf), "nanobot start failed (error %d)", rc);
-            autostart_log(buf);
-        }
-    } else {
-        autostart_log("nanobot command not found");
+    int pid = 0;
+    int rc = nanobot_start(res.exe, res.is_python, &pid);
+    nm_resolution_free(&res);
+    if (rc != 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "nanobot start failed (error %d)", rc);
+        autostart_log(buf);
+        return 0;
     }
+
+    /* Synchronous boot poll -- same cadence as health_worker, but blocking.
+     * On 200 -> "started"; on exhaustion (~30s) -> "timed out". */
+    static const int cadence[] = {1000,1000,1500,2000,2000,3000,3000,5000,5000,5000};
+    const int boot_count = (int)(sizeof(cadence) / sizeof(cadence[0]));
+    for (int i = 0; i < boot_count; i++) {
+        Sleep(cadence[i]);
+        if (nanobot_check_running(g_cfg.health_check_port)) {
+            autostart_log("nanobot started and health check passed");
+            /* M6: release the OpenProcess handle the manager won't track further
+             * in this no-tray path (no watch was armed). OS would reclaim it on
+             * exit, but this is disciplined and keeps the log clean. */
+            nm_state_clear();
+            return 0;
+        }
+    }
+    autostart_log("nanobot health check timed out");
+    /* M6: same -- release the handle before the process exits. */
+    nm_state_clear();
     return 0;
 }
 
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hInst; (void)hPrev; (void)cmdLine; (void)nShow;
+
+    /* Initialize guarded process state before any worker thread or read/write. */
+    nm_state_init();
 
     config_load(&g_cfg);
     g_tray_enabled_effective = g_cfg.stay_in_tray;
@@ -714,29 +1013,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             return rc;
         }
         g_autostart_silent = 1;
-        g_installed = nanobot_detect_install();
-        if (g_installed && !nanobot_check_running(g_cfg.health_check_port)) {
-            char* cmd = find_nanobot_cmd();
-            if (!cmd && g_cfg.nanobot_path && g_cfg.nanobot_path[0])
-                cmd = _strdup(g_cfg.nanobot_path);
-            if (cmd) {
-                int pid = 0;
-                nanobot_start(cmd, &pid);
-                g_nanobot_pid = pid;
-                autostart_log("silent tray mode: nanobot process started");
-                free(cmd);
-            } else {
-                autostart_log("silent tray mode: nanobot command not found");
-            }
-        } else if (g_installed) {
-            autostart_log("silent tray mode: nanobot already running");
-        } else {
-            autostart_log("silent tray mode: nanobot not installed");
-        }
+        /* Silent-tray resolve+start is routed through the resolve worker
+         * (intent=1) after the hidden window + subclass are in place. No
+         * UI-thread resolve/check_running here. */
     }
 
-    if (!g_autostart_silent)
-        g_installed = nanobot_detect_install();
+    /* Both normal startup (intent=0 detect) and silent-tray (intent=1 start)
+     * kick the resolve worker after the window is created and subclassed -- the
+     * worker posts to that HWND, which the message loop then dispatches. */
 
     int initial_theme = g_cfg.theme_mode;
     if (initial_theme == 0) {
@@ -771,54 +1055,42 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     {
-        const char* zh =
-            "app_title=nanobot \xe7\xae\xa1\xe7\x90\x86\xe5\x99\xa8\n"
-            "chat_empty=\xe5\xbc\x80\xe5\xa7\x8b\xe5\xaf\xb9\xe8\xaf\x9d\n"
-            "chat_placeholder=\xe8\xbe\x93\xe5\x85\xa5\xe6\xb6\x88\xe6\x81\xaf\xe2\x80\xa6\n"
-            "chat_send=\xe5\x8f\x91\xe9\x80\x81\n"
-            "install_not_found=\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0 nanobot\n"
-            "install_hint=\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xef\xbc\x9apip install nanobot-ai\n"
-            "metric_port=\xe7\xab\xaf\xe5\x8f\xa3\n"
-            "metric_pid=\xe8\xbf\x9b\xe7\xa8\x8b\n"
-            "metric_uptime=\xe8\xbf\x90\xe8\xa1\x8c\xe6\x97\xb6\xe9\x97\xb4\n"
-            "btn_start=\xe5\x90\xaf\xe5\x8a\xa8\n"
-            "btn_stop=\xe5\x81\x9c\xe6\xad\xa2\n"
-            "settings_general=\xe9\x80\x9a\xe7\x94\xa8\n"
-            "settings_appearance=\xe5\xa4\x96\xe8\xa7\x82\n"
-            "setting_autostart=\xe5\xbc\x80\xe6\x9c\xba\xe8\x87\xaa\xe5\x90\xaf\n"
-            "setting_autostart_sub=Windows \xe5\x90\xaf\xe5\x8a\xa8\xe6\x97\xb6\xe8\x87\xaa\xe5\x8a\xa8\xe8\xbf\x90\xe8\xa1\x8c\n"
-            "setting_tray=\xe6\x9c\x80\xe5\xb0\x8f\xe5\x8c\x96\xe5\x88\xb0\xe6\x89\x98\xe7\x9b\x98\n"
-            "setting_tray_sub=\xe5\x85\xb3\xe9\x97\xad\xe7\xaa\x97\xe5\x8f\xa3\xe6\x97\xb6\xe9\x9a\x90\xe8\x97\x8f\xe5\x88\xb0\xe7\xb3\xbb\xe7\xbb\x9f\xe6\x89\x98\xe7\x9b\x98\n"
-            "setting_path=nanobot \xe8\xb7\xaf\xe5\xbe\x84\n"
-            "setting_path_change=\xe6\x9b\xb4\xe6\x94\xb9\n"
-            "setting_theme=\xe4\xb8\xbb\xe9\xa2\x98\n"
-            "setting_language=\xe8\xaf\xad\xe8\xa8\x80\n"
-            "open_webui=\xe6\x89\x93\xe5\xbc\x80 WebUI\n"
-            "settings_network=\xe7\xbd\x91\xe7\xbb\x9c\n"
-            "setting_webui_port=WebUI \xe7\xab\xaf\xe5\x8f\xa3\n"
-            "setting_webui_port_sub=\xe6\x9c\xac\xe5\x9c\xb0 WebSocket \xe7\xbd\x91\xe5\x85\xb3\xe7\xab\xaf\xe5\x8f\xa3\n"
-            "setting_webui_auth=\xe8\xae\xa4\xe8\xaf\x81\xe5\xaf\x86\xe9\x92\xa5\n"
-            "setting_webui_auth_sub=\xe5\x8f\xaf\xe9\x80\x89\xef\xbc\x8c\xe7\x94\xa8\xe4\xba\x8e\xe5\xbc\x95\xe5\xaf\xbc\xe6\x8f\xa1\xe6\x89\x8b\xef\xbc\x88tokenIssueSecret\xef\xbc\x89\n"
-            "setting_apply=\xe5\xba\x94\xe7\x94\xa8\n"
-            "status_stopped=\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2\n"
-            "status_stopped_sub=nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c\n"
-            "status_running=\xe8\xbf\x90\xe8\xa1\x8c\xe4\xb8\xad\n"
-            "status_running_sub=nanobot \xe7\xbd\x91\xe5\x85\xb3\xe5\xb7\xb2\xe5\x90\xaf\xe5\x8a\xa8\n"
-            "status_starting=\xe5\x90\xaf\xe5\x8a\xa8\xe4\xb8\xad\xe2\x80\xa6\n"
-            "status_starting_sub=\xe7\xad\x89\xe5\xbe\x85\xe5\x81\xa5\xe5\xba\xb7\xe6\xa3\x80\xe6\x9f\xa5\n"
-            "status_not_found=\xe6\x9c\xaa\xe6\x89\xbe\xe5\x88\xb0\n"
-            "status_not_found_sub=\xe6\x89\xbe\xe4\xb8\x8d\xe5\x88\xb0 nanobot\xef\xbc\x8c\xe8\xaf\xb7\xe5\xae\x89\xe8\xa3\x85\xe6\x88\x96\xe8\xae\xbe\xe7\xbd\xae\xe8\xb7\xaf\xe5\xbe\x84\n"
-            "status_start_fail=\xe5\x90\xaf\xe5\x8a\xa8\xe5\xa4\xb1\xe8\xb4\xa5\n"
-            "status_stopping=\xe5\x81\x9c\xe6\xad\xa2\xe4\xb8\xad\xe2\x80\xa6\n"
-            "status_stopping_sub=\xe6\xad\xa3\xe5\x9c\xa8\xe5\x85\xb3\xe9\x97\xad nanobot\n"
-            "status_detecting=\xe6\xa3\x80\xe6\xb5\x8b\xe4\xb8\xad\xe2\x80\xa6\n"
-            "status_not_installed=\xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85\n"
-            "status_not_installed_sub=nanobot \xe6\x9c\xaa\xe5\xae\x89\xe8\xa3\x85\n"
-            "auto_detect=\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b\n";
-        const char* en =
+        /* Non-status keys only. status_* wording is generated from g_status_i18n
+         * so C++ push and $t() cannot drift (single source). */
+        const char* zh_prefix =
+            "app_title=nanobot 管理器\n"
+            "chat_empty=开始对话\n"
+            "chat_placeholder=输入消息…\n"
+            "chat_send=发送\n"
+            "install_not_found=未找到 nanobot\n"
+            "install_hint=请安装：pip install nanobot-ai\n"
+            "metric_port=端口\n"
+            "metric_pid=进程\n"
+            "metric_uptime=运行时间\n"
+            "btn_start=启动\n"
+            "btn_stop=停止\n"
+            "settings_general=通用\n"
+            "settings_appearance=外观\n"
+            "setting_autostart=开机自启\n"
+            "setting_autostart_sub=Windows 启动时自动运行\n"
+            "setting_tray=最小化到托盘\n"
+            "setting_tray_sub=关闭窗口时隐藏到系统托盘\n"
+            "setting_path=nanobot 路径\n"
+            "setting_path_change=更改\n"
+            "setting_theme=主题\n"
+            "setting_language=语言\n"
+            "open_webui=打开 WebUI\n"
+            "settings_network=网络\n"
+            "setting_webui_port=WebUI 端口\n"
+            "setting_webui_port_sub=本地 WebSocket 网关端口\n"
+            "setting_webui_auth=认证密钥\n"
+            "setting_webui_auth_sub=可选，用于引导握手（tokenIssueSecret）\n"
+            "setting_apply=应用\n"
+            "auto_detect=自动检测\n";
+        const char* en_prefix =
             "app_title=nanobot manager\n"
             "chat_empty=Start a conversation\n"
-            "chat_placeholder=Type a message\xe2\x80\xa6\n"
+            "chat_placeholder=Type a message…\n"
             "chat_send=Send\n"
             "install_not_found=nanobot not found\n"
             "install_hint=Please install: pip install nanobot-ai\n"
@@ -844,31 +1116,46 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_webui_auth=Auth Secret\n"
             "setting_webui_auth_sub=Optional, bootstrap handshake secret (tokenIssueSecret)\n"
             "setting_apply=Apply\n"
-            "status_stopped=Stopped\n"
-            "status_stopped_sub=nanobot is not running\n"
-            "status_running=Running\n"
-            "status_running_sub=nanobot gateway is active\n"
-            "status_starting=Starting\xe2\x80\xa6\n"
-            "status_starting_sub=Waiting for health check\n"
-            "status_not_found=Not found\n"
-            "status_not_found_sub=Cannot find nanobot. Please install or set path.\n"
-            "status_start_fail=Start failed\n"
-            "status_stopping=Stopping\xe2\x80\xa6\n"
-            "status_stopping_sub=Shutting down nanobot\n"
-            "status_detecting=Detecting\xe2\x80\xa6\n"
-            "status_not_installed=Not installed\n"
-            "status_not_installed_sub=nanobot is not installed\n"
             "auto_detect=Auto-detect\n";
-        ui_page_load_language_string(g_page, "zh", zh);
-        ui_page_load_language_string(g_page, "en", en);
+
+        char zh_blob[8192];
+        char en_blob[8192];
+        size_t zh_used = 0, en_used = 0;
+        zh_blob[0] = '\0';
+        en_blob[0] = '\0';
+
+        /* Copy prefix, then append status_* lines from g_status_i18n. */
+        int ok = 1;
+        {
+            size_t n = strlen(zh_prefix);
+            if (n + 1 > sizeof(zh_blob)) ok = 0;
+            else { memcpy(zh_blob, zh_prefix, n + 1); zh_used = n; }
+        }
+        {
+            size_t n = strlen(en_prefix);
+            if (n + 1 > sizeof(en_blob)) ok = 0;
+            else { memcpy(en_blob, en_prefix, n + 1); en_used = n; }
+        }
+        if (ok) ok = append_status_i18n_lang(zh_blob, sizeof(zh_blob), &zh_used, 1);
+        if (ok) ok = append_status_i18n_lang(en_blob, sizeof(en_blob), &en_used, 0);
+
+        if (ok) {
+            ui_page_load_language_string(g_page, "zh", zh_blob);
+            ui_page_load_language_string(g_page, "en", en_blob);
+        } else {
+            /* Overflow should never happen with current key set; fall back to
+             * prefix alone so the UI still boots (status keys fall back to key). */
+            ui_page_load_language_string(g_page, "zh", zh_prefix);
+            ui_page_load_language_string(g_page, "en", en_prefix);
+        }
     }
 
-    ui_page_set_text(g_page, "status", L"stopped");
-    page_set("statusText", is_zh() ? "\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2" : "Stopped");
-    page_set("statusSub", is_zh() ? "nanobot \xe6\x9c\xaa\xe8\xbf\x90\xe8\xa1\x8c" : "nanobot is not running");
-    ui_page_set_bool(g_page, "installed", g_installed);
-    ui_page_set_bool(g_page, "canStart", g_installed ? 1 : 0);
-    ui_page_set_bool(g_page, "canStop", 0);
+    /* Initial UI: "Detecting...". The resolve worker (kicked below once the
+     * window exists) flips installed/canStart and drives running/stopped via
+     * WM_ASYNC_RESOLVE_DONE + WM_ASYNC_HEALTH_RESULT. */
+    set_status_i18n("starting", "status_detecting", "status_detecting");
+    ui_page_set_bool(g_page, "installed", 0);
+    /* canStart/canStop are set by set_status_i18n("starting",...) above to 0/0 */
     ui_page_set_bool(g_page, "autostart", autostart_is_enabled());
     ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
 
@@ -881,7 +1168,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, wpath, MAX_PATH);
         ui_page_set_text(g_page, "nanobotPath", wpath);
     } else {
-        page_set("nanobotPath", is_zh() ? "\xe8\x87\xaa\xe5\x8a\xa8\xe6\xa3\x80\xe6\xb5\x8b" : "Auto-detect");
+        page_set("nanobotPath", is_zh() ? "自动检测" : "Auto-detect");
     }
 
     /* WebUI port + auth initial values */
@@ -946,12 +1233,19 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
     chat_init(hwnd, WM_CHAT_EVENT);
 
-    do_health_check();
+    /* Initial detect (or start, for silent-tray) off the UI thread. UI shows
+     * "Detecting..." until the first WM_ASYNC_RESOLVE_DONE arrives. */
+    kick_resolve_worker(hwnd, g_autostart_silent ? 1 : 0);
 
     int ret = ui_run();
 
     /* Drop UI first so any late chat events free LPARAMs without touching g_page. */
     chat_shutdown();
+
+    /* P5a: unwatch + close our OpenProcess handle on shutdown. The stop_on_exit
+     * decision is "leave running", so we do NOT call nanobot_stop() -- closing
+     * an OpenProcess handle does NOT kill the process; the gateway keeps running. */
+    nm_state_clear();
 
     /* Drain leftover WM_CHAT_EVENT payloads (malloc'd LPARAM) after shutdown. */
     {

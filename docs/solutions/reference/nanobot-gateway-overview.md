@@ -1,6 +1,7 @@
 ---
 title: "nanobot Gateway Overview — 上游被托管网关的整体画像"
 date: 2026-07-11
+last_updated: 2026-07-13
 category: reference
 module: upstream/nanobot
 problem_type: reference_overview
@@ -38,11 +39,11 @@ pip 包名为 **`nanobot-ai`**（注意不是 `nanobot`），可执行命令为 
 ### 启动方式
 
 ```bash
-# manager 主用（优先 nanobot.exe）
-nanobot.exe gateway
+# manager 主用（优先 nanobot.exe；后台模式写入 gateway 状态记录）
+nanobot.exe gateway --background
 
 # 回退到 Python 模块
-python.exe -m nanobot gateway
+python.exe -m nanobot gateway --background
 
 # 后台模式：fork 子进程跑前台
 nanobot gateway --background
@@ -214,10 +215,15 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 
 | manager 侧 | 职责 | 对接的 nanobot 资源 |
 |------------|------|---------------------|
-| `process.c` | 启动 / 停止 | `nanobot.exe gateway` / `python -m nanobot gateway`，`CREATE_NO_WINDOW \| CREATE_NEW_PROCESS_GROUP` |
-| `process.c` | 健康检查 | WinHTTP `GET /health` on **18790**，HTTP 200 = running |
+| `process.c` | 命令解析 | 配置路径 → `nanobot.exe` → `py.exe` / Python 候选；Python 层执行 `-m nanobot --version` 探测 |
+| `process.c` | 启动 | `nanobot.exe gateway --background` / `python -m nanobot gateway --background`；丢弃短生命周期 launcher 句柄 |
+| `process.c` | 状态记录 / PID | 读取 `%USERPROFILE%\.nanobot\run\gateway.json`，用真实 gateway PID `OpenProcess`；启动路径优先校验十进制 FILETIME `identity` |
+| `process.c` | 停止 | 优先 `gateway stop --timeout 20`；失败后才走句柄终止 / process-tree fallback |
+| `process.c` + `main.cpp` | 活跃性 | worker 异步 WinHTTP `GET /health`；`RegisterWaitForSingleObject` 监听进程退出；结果经 `PostMessageW` 回 UI 线程 |
 | `chat.c` | 聊天连接 | `GET /webui/bootstrap`（`X-Nanobot-Auth`）→ WS 升级 → 帧解析 |
 | `config.c` | 端口 / 密钥配置 | `webui_port`（8765）/ `health_check_port`（18790）/ `webui_auth` 与 nanobot 默认端口一致 |
+
+> manager 退出时只释放自己的观察句柄，不停止后台 gateway；下次启动在健康检查成功后可根据状态记录重新 attach。当前 attach 路径仅确认记录 PID 存活，完整的 `identity` 比对仍是加固项；详见 [State-Driven Gateway Lifecycle Management on Windows](../architecture-patterns/state-driven-gateway-lifecycle.md)。
 
 ## Risks / Future Adaptation
 
@@ -225,7 +231,7 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 
 ### 🟢 已对齐（低风险）
 
-- health / bootstrap / 基础帧 / 启动命令 / 默认端口 —— 全部与 v0.2.2 兼容。
+- health / bootstrap / 基础帧 / `gateway --background` + `gateway stop` / 默认端口 —— 全部与当前 manager 生命周期兼容。
 - 端口默认值已是 config 驱动，manager 读自己的 `config.json` 即可。
 
 ### 🟡 中等风险（可增强，非破坏性）
@@ -251,7 +257,7 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 
 ### 📌 总结
 
-manager 集成层与 v0.2.2 **完全兼容，无紧急破坏**。适配债主要集中在**功能增强层**（turn_end / reasoning / 工具事件 / 历史会话）。结构性风险靠"config 读端口 + 容错解析 bootstrap + 监听多完成帧"三重对冲。
+manager 集成层与 v0.2.2 **完全兼容，无紧急破坏**。聊天适配债主要集中在**功能增强层**（turn_end / reasoning / 工具事件 / 历史会话）。进程生命周期已采用后台状态记录、异步健康检查和句柄退出事件；剩余结构性加固点是让 attach 与 process-tree fallback 复用启动路径的完整 PID identity 校验。
 
 ## Reference Index
 
@@ -261,6 +267,7 @@ manager 集成层与 v0.2.2 **完全兼容，无紧急破坏**。适配债主要
 |------|------|
 | [`nanobot/cli/gateway.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/cli/gateway.py) | gateway 子命令 Typer 入口 |
 | [`nanobot/gateway/runtime.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/gateway/runtime.py) | gateway 运行时 |
+| [`nanobot/process_runtime.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/process_runtime.py) | 后台进程状态记录、Windows identity、启动/停止通用语义 |
 | [`nanobot/config/schema.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/config/schema.py) | 配置 schema（含 WebSocketConfig） |
 | [`nanobot/webui/ws_http.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/webui/ws_http.py) | WebUI HTTP + WS 服务 |
 | [`nanobot/channels/websocket.py`](https://github.com/HKUDS/nanobot/blob/main/nanobot/channels/websocket.py) | WebSocket channel 实现 |
