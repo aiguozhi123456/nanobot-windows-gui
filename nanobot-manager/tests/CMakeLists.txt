@@ -43,3 +43,10 @@ target_link_libraries(test_process PRIVATE cjson winhttp shell32 ole32 advapi32)
 nm_add_test(test_autostart ${CMAKE_SOURCE_DIR}/src/autostart.c)
 target_include_directories(test_autostart PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_autostart PRIVATE advapi32)
+
+nm_add_test(test_chat_history ${CMAKE_SOURCE_DIR}/src/chat_history.c)
+target_include_directories(test_chat_history PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${cjson_SOURCE_DIR}
+)
+target_link_libraries(test_chat_history PRIVATE cjson)

@@ -12,6 +12,7 @@ void chat_ui_bind(UiPage page, int (*is_zh_fn)(void));
 
 /* health_fn returns 1 if gateway is running; used by send button. */
 void chat_ui_set_gateway(int (*health_fn)(void), int webui_port);
+void chat_ui_configure_history(const wchar_t* config_path);
 
 void chat_ui_reset_idle(void);
 void chat_ui_shutdown(void);

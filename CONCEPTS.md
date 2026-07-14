@@ -46,9 +46,21 @@ A user-scoped secret that authorizes Bootstrap, distinct from the short-lived co
 The manager keeps it outside ordinary configuration and reactive UI state. Migration removes a legacy plaintext source only after the credential can be read back, and conflicting sources require explicit resolution rather than silent overwrite.
 
 ### Chat Session
-A WebSocket connection to the gateway's chat endpoint, established after Bootstrap, that streams readiness, partial response, complete response, completion, and error events.
+A WebSocket attachment to the gateway's chat interface, established after Bootstrap, that carries one or more Chat Turns and may outlive any individual turn.
 
-The native client serializes disconnects and joins its connection and receive workers before releasing shared transport state.
+Connection lifecycle and Chat Turn lifecycle are separate: a connected session may be idle, processing a turn, or carrying a delayed event from an earlier turn.
+
+### Chat Turn
+The client-visible lifecycle of one accepted chat input, from transport acceptance through the evidence that permits the manager to accept another input.
+
+Normal response turns require response activity before a terminal event can complete them, while inline commands may define a distinct acknowledgement. A terminal event without the required current-turn evidence is treated as stale rather than as proof of completion.
+
+### Chat History
+The manager-owned local sequence of user and assistant messages restored across manager launches, distinct from the gateway's server-side conversation context.
+
+An unreadable existing history is never treated as permission to overwrite it. A destructive command keeps a process-local compensation copy until acknowledgement, but that copy neither reverses server-side effects nor survives a process crash.
 
 ### Message Bubble
-A single entry in the chat UI's message array, rendered as a bubble via core-ui's `v-for` in a ScrollView. Each has a role (`user` or `assistant`), text content, and a unique id. Assistant bubbles are built incrementally — `delta` events append to the last assistant bubble's text, `message` replaces it with the complete text.
+A display item representing one user or assistant message in Chat History.
+
+An assistant bubble may be built from partial response events and then normalized by a complete response; transient rendering identity is not part of durable Chat History.

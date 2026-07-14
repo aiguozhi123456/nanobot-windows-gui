@@ -1636,6 +1636,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     chat_ui_bind(g_page, is_zh);
     chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
     chat_ui_reset_idle();
+    chat_ui_configure_history(config_get_active_path());
 
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);

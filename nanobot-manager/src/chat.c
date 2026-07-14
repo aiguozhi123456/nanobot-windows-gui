@@ -357,7 +357,14 @@ static void handle_json_frame(const char* json, size_t len) {
         if (text && cJSON_IsString(text) && text->valuestring)
             post_event(CHAT_EVT_MESSAGE, chat_strdup(text->valuestring));
     } else if (strcmp(event, "stream_end") == 0 || strcmp(event, "done") == 0) {
-        post_event(CHAT_EVT_STREAM_END, NULL);
+        cJSON* text = cJSON_GetObjectItem(root, "text");
+        if (!text) text = cJSON_GetObjectItem(root, "content");
+        post_event(CHAT_EVT_STREAM_END,
+            text && cJSON_IsString(text) && text->valuestring ? chat_strdup(text->valuestring) : NULL);
+        if (strcmp(event, "done") == 0)
+            post_event(CHAT_EVT_TURN_END, NULL);
+    } else if (strcmp(event, "turn_end") == 0) {
+        post_event(CHAT_EVT_TURN_END, NULL);
     } else if (strcmp(event, "error") == 0) {
         cJSON* detail = cJSON_GetObjectItem(root, "detail");
         if (!detail) detail = cJSON_GetObjectItem(root, "message");
@@ -766,11 +773,17 @@ int chat_send(const char* utf8_text) {
     }
 
     if (chat_id[0]) {
-        cJSON_AddStringToObject(root, "type", "message");
-        cJSON_AddStringToObject(root, "chat_id", chat_id);
-        cJSON_AddStringToObject(root, "content", utf8_text);
-    } else {
-        cJSON_AddStringToObject(root, "content", utf8_text);
+        if (!cJSON_AddStringToObject(root, "type", "message") ||
+            !cJSON_AddStringToObject(root, "chat_id", chat_id) ||
+            !cJSON_AddStringToObject(root, "content", utf8_text)) {
+            cJSON_Delete(root);
+            LeaveCriticalSection(&g_cs);
+            return -1;
+        }
+    } else if (!cJSON_AddStringToObject(root, "content", utf8_text)) {
+        cJSON_Delete(root);
+        LeaveCriticalSection(&g_cs);
+        return -1;
     }
 
     char* payload = cJSON_PrintUnformatted(root);

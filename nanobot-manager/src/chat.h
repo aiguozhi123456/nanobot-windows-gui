@@ -16,7 +16,8 @@ enum {
     CHAT_EVT_STREAM_END = 5,
     CHAT_EVT_ERROR = 6,       /* LPARAM: malloc'd error detail (caller frees) */
     CHAT_EVT_READY = 7,       /* server ready; chat_id available */
-    CHAT_EVT_DISCONNECT_DONE = 8 /* async disconnect finished */
+    CHAT_EVT_DISCONNECT_DONE = 8, /* async disconnect finished */
+    CHAT_EVT_TURN_END = 9
 };
 
 /* Initialize module (call once). hwnd receives WM_CHAT_EVENT. */

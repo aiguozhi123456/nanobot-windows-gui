@@ -1,7 +1,7 @@
 ---
 title: Native WebSocket Chat Integration in a Win32/C++ GUI Application
 date: 2026-07-11
-last_updated: 2026-07-13
+last_updated: 2026-07-14
 category: architecture-patterns
 module: nanobot-manager/chat
 problem_type: architecture_pattern
@@ -9,324 +9,211 @@ component: tooling
 severity: medium
 applies_when:
   - Integrating a streaming WebSocket client into a native Win32/C++ GUI
-  - Separating transport logic from UI state management in a reactive UI framework
-  - Running multi-agent code review on a new native feature with thread safety concerns
-tags: [websocket, win32, winhttp, chat, core-ui, thread-safety, multi-agent-review, cpp17]
+  - Persisting native chat history without mixing it into application settings
+  - Handling inline slash commands whose completion contract differs from normal turns
+  - Preventing delayed terminal events from completing the wrong request
+tags: [websocket, win32, winhttp, chat, state-machine, persistence, atomic-write, core-ui]
 ---
 
 # Native WebSocket Chat Integration in a Win32/C++ GUI Application
 
 ## Context
 
-The nanobot Windows GUI manager (`nanobot-manager/`) is a native Win32 C/C++ application built on the `core-ui` submodule framework. It manages a local Python LLM gateway (nanobot) — starting/stopping the process, health-checking via WinHTTP, and providing a dashboard UI.
+The nanobot Windows manager provides a native chat page over the gateway's WebUI WebSocket. The integration must keep blocking WinHTTP work off the UI thread, marshal streaming events into reactive UI state, preserve messages across manager restarts, and remain correct when terminal events arrive late or are omitted for inline commands.
 
-The gateway exposes a WebSocket chat endpoint on its WebUI port (default 8765), but the manager had no way to chat from within the native UI. The challenge was integrating a streaming WebSocket client into a reactive UI framework (core-ui SFC pattern with `v-for`, `v-model`, ScrollView) while maintaining thread safety, clean separation of concerns, and a responsive UI during connect/disconnect operations.
+The difficult case was `/new`. It is a slash command sent as ordinary message content, not the WebSocket `type: "new_chat"` control envelope. Without an active pending queue, upstream sends `message: "New session started."` and then `turn_end`; with an active queue, the inline-command path sends the same acknowledgement but does not publish its own `turn_end`. Treating both operations as a normal generated turn left sending permanently disabled after a successful inline reset. Conversely, unlocking immediately and blindly ignoring the next `turn_end` allowed a delayed terminal event from the cancelled turn to complete the next user request.
 
-No existing WebSocket, threading, or reactive-state patterns existed in the codebase to reference. The implementation was built from scratch, reviewed by a 9-agent multi-agent review panel, and hardened through two rounds of fixes.
+The durable design therefore separates transport, UI turn state, local history storage, and application wiring. It also treats completion events as valid only in states where they can answer the active operation.
 
 ## Guidance
 
-### Three-Layer Architecture
+### Keep Four Boundaries Explicit
 
-The key architectural decision was separating the chat feature into three layers, each with a clear boundary:
+| Boundary | Files | Responsibility |
+|----------|-------|----------------|
+| Transport | `chat.c` / `chat.h` | Bootstrap, WinHTTP WebSocket connect/send/receive, lifecycle threads, JSON frame parsing, window-message delivery |
+| UI state | `chat_ui.c` / `chat_ui.h` | Draft and message state, turn state machine, `/new` prepare/commit/compensation, reactive UI updates |
+| History storage | `chat_history.c` / `chat_history.h` | Versioned schema, bounded normalization, load/save status, invalid-file quarantine, atomic replacement |
+| App wiring | `main.cpp` | Page/window setup, widget mounts, config-derived history location, gateway health and shutdown ordering |
 
-| Layer | File | Responsibility |
-|-------|------|----------------|
-| **Transport** | `chat.c` / `chat.h` | WinHTTP WebSocket connect/send/receive, thread lifecycle, JSON frame parsing |
-| **UI State** | `chat_ui.c` / `chat_ui.h` | Message array management, UI field updates, event dispatch, send orchestration |
-| **App Wiring** | `main.cpp` | Window setup, widget mount callbacks, health check integration, i18n, lifecycle |
+The transport never touches widgets or history files. The storage module never depends on Core UI or WinHTTP. The UI state layer owns the policy for when a message becomes durable and which protocol event may complete the current operation.
 
-This separation prevents the transport layer from knowing about UI widgets, and prevents the UI state layer from knowing about WinHTTP handles. `main.cpp` wires them together via function pointers and event messages.
+### Marshal Network Events to the UI Thread
 
-### Gateway Context Pattern
-
-The UI state layer needs gateway context (health check function, port, auth secret) to validate send operations, but the click handler receives no parameters beyond `(widget, userdata)`. The solution is a **gateway context registration** pattern:
-
-```c
-/* chat_ui.h */
-void chat_ui_set_gateway(int (*health_fn)(void), int webui_port, const char* webui_auth);
-
-/* chat_ui.c — internal globals */
-static int (*g_health_fn)(void) = NULL;
-static int g_webui_port = 8765;
-static char g_webui_auth[128] = {0};
-
-/* The click handler reads stored context */
-static void on_send_click(UiWidget w, void* ud) {
-    (void)w; (void)ud;
-    int running = g_health_fn ? g_health_fn() : 0;
-    chat_ui_on_send(running, g_webui_port, g_webui_auth);
-}
-```
-
-This lets `chat_ui.c` own the send flow entirely — reading the draft, validating health, connecting if needed, appending the user message, and calling `chat_send` — without `main.cpp` involvement in the click path.
-
-### Thunk Adapter for Function Signatures
-
-`chat_ui_set_gateway` expects an `int(void)` function, while live HTTP probing is owned by the asynchronous gateway lifecycle worker. A small thunk exposes the **cached lifecycle state** to the chat UI without performing network I/O on the UI thread:
+The receive thread parses complete WebSocket frames and posts a custom window message. Any optional UTF-8 detail is heap-owned by the event and freed by `chat_ui_on_event` after processing:
 
 ```c
-/* main.cpp */
-static int health_running_thunk(void) {
-    return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
+static void post_event(WPARAM kind, char* detail) {
+    /* Snapshot the UI target under the transport lock. */
+    if (!PostMessageW(hwnd, msg_id, kind, (LPARAM)detail))
+        free(detail);
 }
 
-/* At init: */
-chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
-```
-
-This is a zero-cost adapter that lets the UI state layer ask whether sending is currently allowed without knowing about lifecycle state, config structure, or port numbers. The worker-owned `nanobot_check_running` result is marshalled to the UI thread before this cached state changes.
-
-### Event-Driven UI Updates via Window Messages
-
-The transport layer communicates with the UI via `PostMessageW` with a custom window message (`WM_CHAT_EVENT`). The transport allocates detail strings with `malloc`, posts them as `LPARAM`, and the UI layer frees them:
-
-```c
-/* chat.c — transport posts events */
-static void post_event(WPARAM kind, char* detail_or_null) {
-    HWND hwnd;
-    UINT msg;
-    EnterCriticalSection(&g_cs);
-    hwnd = g_hwnd;
-    msg = g_msg_id;
-    LeaveCriticalSection(&g_cs);
-    if (!hwnd || !msg) {
-        free(detail_or_null);
-        return;
-    }
-    if (!PostMessageW(hwnd, msg, kind, (LPARAM)detail_or_null))
-        free(detail_or_null);
-}
-
-/* main.cpp — single handler delegates to chat_ui */
+/* Window subclass, on the UI thread. */
 if (msg == WM_CHAT_EVENT) {
-    chat_ui_on_event(wp, (char*)lp);
+    chat_ui_on_event(wparam, (char*)lparam);
     return 0;
 }
-
-/* chat_ui.c — processes all event types, frees detail */
-void chat_ui_on_event(WPARAM kind, char* detail) {
-    switch ((int)kind) {
-    case CHAT_EVT_DELTA:
-        if (detail) append_delta(detail);
-        break;
-    case CHAT_EVT_MESSAGE:
-        if (detail) set_last_assistant(detail);
-        break;
-    /* ... CONNECTED, READY, DISCONNECTED, STREAM_END, ERROR ... */
-    }
-    free(detail);
-}
 ```
 
-### Async Disconnect for UI Responsiveness
+This keeps all cJSON message-array mutations and Core UI calls on the window thread. Connect, receive, disconnect, and reconnect remain transport concerns.
 
-Synchronous disconnect joins threads (up to 10s), which would freeze the UI. The `chat_disconnect_async` pattern runs disconnect on a worker thread and posts a `DISCONNECT_DONE` event when finished:
+### Persist a Normalized Local History
 
-```c
-/* chat.c */
-void chat_disconnect_async(void) {
-    /* CreateThread -> disconnect_worker -> chat_disconnect -> post DISCONNECT_DONE */
-}
+Chat history lives beside the active `config.json` as a separate `chat-history.json`; it is not another settings field and contains no credential or WebSocket token. The version-1 schema stores only durable message meaning:
 
-/* main.cpp — health check stopped path */
-chat_disconnect_async();
-chat_ui_on_gateway_stopped();
+```json
+{"version":1,"messages":[{"role":"user","text":"hello"},{"role":"assistant","text":"hi"}]}
 ```
 
-### Generation-Safe Thread Lifecycle
+UI-only identifiers are regenerated after load. The reader validates the exact root/message shape, version, roles, text types, message count, per-message size, total text size, physical or escaped NULs, and file size. The writer normalizes the current UI array and retains the newest bounded suffix when a long-running conversation exceeds the persistence limits.
 
-The receive thread must not close handles that belong to a newer connection. A generation counter prevents use-after-free:
+Use an atomic replacement sequence:
 
-```c
-/* chat.c — recv_thread only closes if generation matches */
-static volatile LONG g_generation = 0;
+1. Serialize the normalized snapshot.
+2. Create a unique temporary file in the target directory.
+3. Handle short writes until the entire payload is written.
+4. Call `FlushFileBuffers`, then close successfully.
+5. Replace the target with `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`.
 
-/* In recv_thread: */
-LONG my_gen = g_generation;
-/* ... receive loop ... */
-EnterCriticalSection(&g_cs);
-if (g_generation == my_gen && g_websocket) {
-    WinHttpWebSocketClose(g_websocket, 1000, NULL, 0);
-}
-LeaveCriticalSection(&g_cs);
+An invalid history file is moved to a unique `.invalid.*` backup before a clean history may replace it. A true I/O read error instead closes a write gate: sending retries the read, and no subsequent save may overwrite an unreadable source until it is recovered, confirmed absent, or successfully quarantined.
+
+Streaming deltas update memory and mark the snapshot dirty, but do not write on every chunk. Stable boundaries such as a sent user message, complete response, stream end, turn end, compensation, disconnect, and shutdown call `save_if_dirty`. A failed save leaves the revision dirty so a later boundary can retry.
+
+### Treat `/new` as a Process-Local Compensating Transition
+
+Match the command using the same normalization contract as the upstream router: trim Python Unicode whitespace at both ends, compare ASCII command letters case-insensitively, and allow one optional bot suffix containing only ASCII letters, digits, or underscores. Thus `/new`, `/NEW`, a whitespace-wrapped `/new`, and `/new@bot` are equivalent. Inputs with parameters, internal whitespace, invalid or repeated suffixes, full-width lookalikes, malformed UTF-8, or ordinary substrings are not `/new`.
+
+The send flow follows prepare, provisional apply, commit, and process-local compensation:
+
+```text
+prepare:           deep-copy current messages
+send:              send ordinary message content "/new"
+provisional apply: install the backup, clear UI/history, persist an empty snapshot
+commit:            exact "New session started." acknowledgement -> discard backup
+ignore old tails:  non-ACK content or terminal events while waiting
+compensate:        error, disconnect, stop, or graceful shutdown
 ```
 
-### Shutdown Ordering
+If `chat_send` fails synchronously, the draft and history remain untouched. If transport send succeeds, the empty local history is visible immediately while an in-memory backup remains available until acknowledgement. The acknowledgement is a control response and is not rendered as a new assistant bubble. Other content and terminal events are ignored while waiting because an active queue may still be draining the turn that `/new` cancelled; transport and lifecycle failures use the compensation copy.
 
-The shutdown sequence prevents use-after-free on the UI page:
+This compensation is deliberately local and process-bound. It can restore the manager's view after a reported error, disconnect, gateway stop, or orderly shutdown, but it cannot undo a server-side session clear that already happened. Because the backup is not written as a separate recovery record, a process crash or power loss after the provisional empty snapshot is saved can also lose the old local history. Stronger crash consistency would require a durable pending-command journal or postponing the disk clear until acknowledgement.
 
-```c
-/* main.cpp — exit path */
-chat_shutdown();              /* 1. Null g_hwnd first, disconnect, free CS */
+### Model Turn Completion with Explicit States
 
-/* 2. Drain leftover WM_CHAT_EVENT payloads */
-{
-    MSG m;
-    while (PeekMessageW(&m, hwnd, WM_CHAT_EVENT, WM_CHAT_EVENT, PM_REMOVE)) {
-        free((void*)m.lParam);
-    }
-}
+Event order alone does not establish event ownership. Use states whose names describe what evidence has been observed:
 
-stop_uptime_timer();
-tray_remove();
-RemoveWindowSubclass(hwnd, subclass_proc, 0);
-chat_ui_shutdown();          /* 3. Free g_messages, null UI pointers */
-ui_page_destroy(g_page);     /* 4. Destroy UI page last */
+```text
+IDLE
+  send /new success  -> NEW_WAIT_ACK
+  send normal success -> NORMAL_WAIT_ACTIVITY
+
+NEW_WAIT_ACK
+  exact ACK -> commit clear, hide ACK, IDLE
+  DELTA / other MESSAGE / STREAM_END / TURN_END -> ignore
+  ERROR / disconnect / stop / close -> restore backup, IDLE
+
+NORMAL_WAIT_ACTIVITY
+  MESSAGE -> render complete reply, IDLE            # non-stream / inline
+  DELTA / STREAM_END -> NORMAL_ACTIVE               # streaming response
+  TURN_END -> ignore                                # stale terminal event
+
+NORMAL_ACTIVE
+  DELTA / MESSAGE / STREAM_END -> remain active
+  TURN_END -> IDLE
 ```
 
-`chat_shutdown` nulls `g_hwnd` before disconnecting, so any in-flight `post_event` calls see a null hwnd and free their detail instead of posting to a dead window.
+`NEW_WAIT_ACK` ignores content and terminal events other than the exact acknowledgement because an active queue may still deliver events from the turn that `/new` cancelled. `IDLE` likewise ignores unsolicited content and terminal events, preventing tails that arrive after acknowledgement from repopulating the cleared history.
+
+A normal request distinguishes a complete first `message` from a streaming response. A first `message` is sufficient to finish a non-stream or inline command, including commands whose inline path does not publish `turn_end`. A first `delta` or `stream_end` establishes streaming activity and advances to `NORMAL_ACTIVE`; only then may `turn_end` complete the turn. This prevents a delayed old terminal event from re-enabling send during the next streamed turn.
+
+Current upstream behavior gives `/new` the exact acknowledgement on both dispatch paths. The ordinary path then emits `turn_end`; the active-queue inline path does not emit a command-specific terminal event. The state machine therefore commits `/new` only on its acknowledgement and ignores `turn_end` while waiting for it.
+
+The normal-turn branch additionally depends on two verified protocol properties: events from one WebSocket are delivered in receive order, and a streamed normal turn produces `delta` or `stream_end` before its `turn_end`. If the gateway ever permits a valid `turn_end`-only normal turn, sends a complete `message` before continuing the same turn, or interleaves multiple turns on one connection, local state alone cannot prove ownership; preserve `chat_id` plus a turn/stream identifier through the transport event and correlate explicitly.
+
+### Separate Stream Finalization from Turn Completion
+
+`stream_end` and `turn_end` answer different questions:
+
+- `stream_end` finalizes assistant content. Its optional `text`/`content` may contain the server's canonical final text, including rewritten media URLs, so it replaces the last assistant bubble instead of appending a duplicate.
+- `turn_end` says a normal active turn has finished and may re-enable sending when the state machine permits it.
+
+The legacy `done` alias maps to two ordered UI events: `STREAM_END` first, then `TURN_END`. Content is therefore finalized before the turn becomes idle.
+
+### Serialize Connection Teardown
+
+Disconnect, reconnect, and shutdown share transport handles and worker threads. A lifecycle worker serializes these requests, closes the WebSocket to unblock receive, joins the receive/connect workers, and only then releases shared state. UI-facing disconnect remains asynchronous so the window thread never blocks waiting for network timeouts.
+
+On final application shutdown:
+
+1. Stop chat transport and null its window-message target.
+2. Drain queued chat-event payloads that can no longer be delivered.
+3. Compensate an unconfirmed `/new` from its in-memory backup and retry dirty history persistence.
+4. Release chat UI state, then destroy the page.
 
 ## Why This Matters
 
-### Why separate transport from UI state
+### Persistence Must Fail Without Destroying Recovery Data
 
-Without separation, `main.cpp` would contain WinHTTP handle management, thread joins, JSON frame parsing, message array management, and UI field updates — all interleaved. The three-layer split means:
-- Transport can be unit-tested in isolation (no UI dependency)
-- UI state changes don't require touching WinHTTP code
-- `main.cpp` stays focused on app-level wiring (tray, health, config, i18n)
+Treating a missing, malformed, or temporarily unreadable file as the same empty state can destroy the only recoverable copy on the next save. Separate load outcomes and gate writes after I/O errors. Atomic replacement protects the last valid snapshot from partial writes, while quarantine preserves malformed or future-version data for diagnosis.
 
-### Why async disconnect matters
+### Completion Events Need State Preconditions
 
-`chat_disconnect` joins the receive thread with a 10s timeout. Calling this synchronously from the health check timer would freeze the UI for up to 10s when the gateway stops. `chat_disconnect_async` moves this to a worker thread and posts `DISCONNECT_DONE` so the UI updates asynchronously.
+`turn_end` is authoritative for a normal active turn, but it is not a universal acknowledgement for every input. Inline commands may have their own terminal response, and delayed events remain valid protocol frames even when they are no longer valid answers to the current UI operation. State preconditions provide the missing ownership boundary when the protocol does not expose a turn identifier.
 
-### Why generation-safe close matters
+### Destructive UI Operations Need Rollback
 
-Without generation tracking, a race occurs: connection A's recv_thread is closing its websocket, but connection B has already started and set `g_websocket` to a new handle. The recv_thread would close B's handle. The generation counter ensures recv_thread only closes handles from its own connection generation.
+Clearing history immediately after a successful socket write confuses transport acceptance with server success. Keeping a process-local pre-command snapshot until acknowledgement makes reported failure, disconnect, gateway stop, and graceful shutdown converge on one compensation path. It does not provide a distributed rollback or a crash-durable transaction.
 
-### Why the thunk adapter matters
+### Partial and Final Assistant Text Are One Message
 
-Without the thunk, `chat_ui.c` would need to know about the gateway lifecycle state or process APIs, leaking `process.h` dependencies into the UI layer. The thunk keeps `chat_ui.c` dependent only on `chat.h`, `ui_core.h`, and `cJSON`.
+Rendering both streamed text and canonical final text as separate bubbles misrepresents one logical reply and can lose server-side rewrites. Updating one assistant bubble preserves the semantic relationship between partial and final events.
 
 ## When to Apply
 
-- **Integrating any streaming network client** (WebSocket, Server-Sent Events, raw TCP) into a native GUI with a message loop — use the PostMessage event pattern
-- **Separating transport from reactive UI state** in any framework where UI updates are driven by external events — the three-layer split generalizes beyond Win32
-- **Bridging function signature mismatches** when a callback-driven framework needs a `void`-parameter function but your API takes parameters — the thunk pattern is zero-cost and keeps dependencies clean
-- **Thread lifecycle in connection-oriented code** — generation-safe close, joinable connect/recv threads, and async disconnect apply to any reconnecting client
-- **Multi-agent code review on thread-safe code** — the 9-reviewer panel approach (correctness, security, reliability, adversarial, testing, maintainability, project-standards, agent-native, learnings) surfaces P0/P1 issues that single-pass review misses
+- Native GUI clients that receive asynchronous streaming events on worker threads
+- Commands whose acknowledgement differs from ordinary request completion
+- Clients without a reliable request/turn identifier on every terminal event
+- Local history or cache files that must survive ordinary restarts and failed atomic writes
+- Reactive message lists that combine partial and final representations of one reply
 
 ## Examples
 
-### Gateway context registration + thunk
+### Startup Wiring
 
 ```c
-/* main.cpp */
-static int health_running_thunk(void) {
-    return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
-}
-
-/* At init */
 chat_ui_bind(g_page, is_zh);
-chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
+chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
 chat_ui_reset_idle();
+chat_ui_configure_history(config_get_active_path());
 ```
 
-### Send flow (chat_ui.c)
+The config module remains the authority for installed-versus-portable location selection; chat history only derives a sibling path from the selected config path.
 
-```c
-void chat_ui_on_send(int health_running, int webui_port, const char* webui_auth) {
-    if (!g_page) return;
+### Safe Send Ordering
 
-    char* raw = ui_page_get_json(g_page, "draft");
-    if (!raw) return;
-    cJSON* j = cJSON_Parse(raw);
-    ui_page_free(raw);
-    const char* text = (j && cJSON_IsString(j)) ? j->valuestring : NULL;
-    if (!text || !text[0]) { cJSON_Delete(j); return; }
-
-    if (!health_running) {
-        chat_ui_status_i18n("请先启动 nanobot", "Start nanobot first");
-        cJSON_Delete(j);
-        return;
-    }
-
-    if (!chat_is_ready()) {
-        chat_ui_status_i18n("连接中…连接后请再次发送",
-                           "Connecting… send again when connected");
-        chat_set_endpoint(webui_port, webui_auth);
-        chat_connect();
-        cJSON_Delete(j);
-        return;
-    }
-
-    append_msg("user", text);
-    ui_page_set_text(g_page, "draft", L"");
-    g_chat_streaming = 0;
-    if (chat_send(text) != 0) {
-        chat_ui_status_i18n("发送失败", "Send failed");
-    }
-    cJSON_Delete(j);
-}
+```text
+validate draft and recover any read error
+prepare /new backup when needed
+chat_send(...)
+if send succeeds:
+  enter the operation-specific turn state
+  update local messages
+  persist the dirty snapshot
 ```
 
-### Streaming delta accumulation (chat_ui.c)
+A normal user bubble is appended only after the transport accepts the send. A `/new` reset is provisionally applied only after both backup allocation and transport send succeed.
 
-```c
-static void append_delta(const char* chunk) {
-    if (!chunk || !chunk[0]) return;
-    ensure_messages();
-    int n = cJSON_GetArraySize(g_messages);
-    if (!g_chat_streaming || n <= 0) {
-        begin_assistant();  /* start a new assistant bubble */
-        n = cJSON_GetArraySize(g_messages);
-    }
-    cJSON* last = cJSON_GetArrayItem(g_messages, n - 1);
-    cJSON* t = cJSON_GetObjectItem(last, "text");
-    const char* old = (t && cJSON_IsString(t)) ? t->valuestring : "";
-    size_t len = strlen(old) + strlen(chunk) + 1;
-    char* merged = (char*)malloc(len);
-    if (!merged) return;
-    snprintf(merged, len, "%s%s", old, chunk);
-    cJSON_ReplaceItemInObject(last, "text", cJSON_CreateString(merged));
-    free(merged);
-    push_messages_ui();  /* sync to UI via ui_page_set_json */
-}
-```
+### Verification Boundaries
 
-### CRLF injection prevention (chat.c)
+`test_chat_history` covers schema and Unicode round trips; upstream-compatible `/new` normalization; invalid document shapes and an overlong message; file round trips and empty replacement; physical and escaped NUL rejection; invalid-file quarantine; rolling retention by count and total serialized text; escaped-text file sizing; path derivation; missing files; and invalid-parameter error contracts.
 
-```c
-static int secret_is_safe(const char* s) {
-    if (!s) return 1;
-    for (const unsigned char* p = (const unsigned char*)s; *p; p++) {
-        if (*p == '\r' || *p == '\n' || *p < 0x20)
-            return 0;
-    }
-    return 1;
-}
-
-/* Before formatting HTTP header with the secret: */
-if (!secret_is_safe(g_bootstrap_secret)) {
-    /* reject — prevents header injection via webui_auth config */
-}
-```
-
-### Health check integration (main.cpp)
-
-```c
-/* health_worker performs the blocking HTTP request off the UI thread and
- * posts WM_ASYNC_HEALTH_RESULT. This handler runs on the UI thread. */
-static void apply_health_result(int running) {
-    if (running) {
-        /* ... update status to running ... */
-        if (!chat_is_ready()) {
-            chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
-            chat_connect();  /* auto-connect when gateway becomes healthy */
-        }
-    } else {
-        /* ... update status to stopped ... */
-        chat_disconnect_async();        /* non-blocking disconnect */
-        chat_ui_on_gateway_stopped();   /* update UI status */
-    }
-}
-```
-
-The native gateway lifecycle also watches the real process handle for immediate exit events. HTTP health and process death remain separate signals: chat connection state follows the UI-thread lifecycle transition, never a synchronous health request from the send-click path.
+Release verification also includes the full Windows build and CTest suite. The UI/WebSocket state machine does not yet have an automated harness; the missing inline-command completion case was found by manual testing with existing history. Real read faults, oversized-file loading, strict aggregate-load limits, quarantine failure, the UI write gate, and crash recovery are also not covered by the current unit tests. Future state-machine extraction should cover exact acknowledgement, stale content while waiting for acknowledgement, content after acknowledgement, message-only inline completion, delayed `turn_end`, `done`, disconnect/shutdown compensation, and `stream_end.text` replacement.
 
 ## Related
 
-- `AGENTS.md` — project layout, build commands, runtime behavior (updated with chat.c, webui_port, webui_auth)
-- `core-ui/docs/uix-ai-guide.md` — core-ui SFC pattern reference (v-for, v-model, ScrollView)
-- [State-Driven Gateway Lifecycle Management on Windows](state-driven-gateway-lifecycle.md) — asynchronous health ownership, process-exit events, state transitions, and handle-close discipline
-- [nanobot gateway](https://github.com/HKUDS/nanobot) — upstream Python gateway with WebSocket chat endpoint
+- [State-Driven Gateway Lifecycle Management on Windows](state-driven-gateway-lifecycle.md) — state-scoped asynchronous observations and lifecycle ownership
+- [Nanobot Gateway Overview](../reference/nanobot-gateway-overview.md) — upstream WebSocket event and command reference; distinguish `/new` message content from `type: "new_chat"`
+- [Testing and CI Setup](../infrastructure/testing-and-ci-setup.md) — native CTest boundaries and remaining transport/UI integration-test gap
+- `core-ui/docs/uix-ai-guide.md` — reactive UI conventions used by the chat page
+- [nanobot gateway](https://github.com/HKUDS/nanobot) — upstream command and WebSocket implementation
