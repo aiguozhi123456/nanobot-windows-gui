@@ -65,7 +65,8 @@ static void save_failure_status(void) {
 
 static void save_if_dirty(void) {
     DWORD error;
-    if (!g_history_path[0] || g_history_read_error || g_saved_revision == g_revision) return;
+    if (!g_history_path[0] || g_history_read_error ||
+        g_turn_state == CHAT_TURN_NEW_WAIT_ACK || g_saved_revision == g_revision) return;
     if (chat_history_save(g_history_path, g_messages, &error) == 0)
         g_saved_revision = g_revision;
     else
@@ -421,6 +422,7 @@ void chat_ui_on_send(int health_running) {
     char* raw;
     cJSON* json;
     const char* text;
+    size_t text_length;
     int is_new;
     cJSON* backup = NULL;
     cJSON* empty_history = NULL;
@@ -430,7 +432,14 @@ void chat_ui_on_send(int health_running) {
     json = cJSON_Parse(raw);
     ui_page_free(raw);
     text = json && cJSON_IsString(json) ? json->valuestring : NULL;
-    if (!text || !text[0]) { cJSON_Delete(json); return; }
+    if (!text) { cJSON_Delete(json); return; }
+    text_length = strlen(text);
+    if (text_length > CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES) {
+        chat_ui_status_i18n("消息过长，无法发送", "Message is too long to send");
+        cJSON_Delete(json);
+        return;
+    }
+    if (chat_history_is_blank_message(text)) { cJSON_Delete(json); return; }
     if (!recover_history_before_send()) {
         cJSON_Delete(json);
         return;
@@ -447,11 +456,6 @@ void chat_ui_on_send(int health_running) {
         return;
     }
     is_new = chat_history_is_new_command(text);
-    if (strlen(text) > CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES) {
-        chat_ui_status_i18n("消息过长，无法发送", "Message is too long to send");
-        cJSON_Delete(json);
-        return;
-    }
     if (is_new) {
         ensure_messages();
         backup = cJSON_Duplicate(g_messages, 1);

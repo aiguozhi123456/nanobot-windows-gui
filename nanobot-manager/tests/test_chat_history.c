@@ -82,6 +82,18 @@ static void test_empty_and_commands(void) {
     TEST_CHECK(!chat_history_is_new_command("\xC2/new"));
 }
 
+static void test_blank_messages(void) {
+    static const char invalid_utf8[] = "\xC2";
+    TEST_CHECK(chat_history_is_blank_message(""));
+    TEST_CHECK(chat_history_is_blank_message(" \t\r\n\v\f"));
+    TEST_CHECK(chat_history_is_blank_message("\xC2\xA0\xE3\x80\x80"));
+    TEST_CHECK(chat_history_is_blank_message("\x1C"));
+    TEST_CHECK(!chat_history_is_blank_message("\xEF\xBB\xBF"));
+    TEST_CHECK(!chat_history_is_blank_message("\xE1\xA0\x8E"));
+    TEST_CHECK(!chat_history_is_blank_message("hello"));
+    TEST_CHECK(!chat_history_is_blank_message(invalid_utf8));
+}
+
 static void test_invalid_documents_and_limits(void) {
     const char* invalid[] = {
         "[]", "{\"version\":2,\"messages\":[]}",
@@ -343,6 +355,7 @@ static void test_path_and_invalid_load_contracts(void) {
 TEST_LIST = {
     { "parse_serialize_and_ids", test_parse_serialize_and_ids },
     { "empty_and_commands", test_empty_and_commands },
+    { "blank_messages", test_blank_messages },
     { "invalid_documents_and_limits", test_invalid_documents_and_limits },
     { "decoded_nul_escapes_are_invalid", test_decoded_nul_escapes_are_invalid },
     { "file_roundtrip_and_empty_overwrite", test_file_roundtrip_and_empty_overwrite },

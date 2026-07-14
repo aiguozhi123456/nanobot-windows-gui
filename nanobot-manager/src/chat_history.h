@@ -28,6 +28,7 @@ int chat_history_parse_json(const char* json, cJSON** out_messages);
 char* chat_history_serialize(const cJSON* ui_messages);
 int chat_history_save(const wchar_t* path, const cJSON* ui_messages, DWORD* out_error);
 int chat_history_is_new_command(const char* text);
+int chat_history_is_blank_message(const char* text);
 
 #ifdef __cplusplus
 }

@@ -85,6 +85,23 @@ static int is_ascii_bot_suffix(unsigned char value) {
         (value >= '0' && value <= '9') || value == '_';
 }
 
+int chat_history_is_blank_message(const char* text) {
+    const unsigned char* bytes = (const unsigned char*)text;
+    size_t length;
+    size_t offset = 0;
+    if (!bytes) return 0;
+    length = strlen(text);
+    while (offset < length) {
+        size_t consumed;
+        unsigned int codepoint;
+        if (!utf8_decode(bytes + offset, length - offset, &consumed, &codepoint) ||
+            !is_python_space(codepoint))
+            return 0;
+        offset += consumed;
+    }
+    return 1;
+}
+
 int chat_history_is_new_command(const char* text) {
     const unsigned char* bytes = (const unsigned char*)text;
     size_t length;

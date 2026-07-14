@@ -26,6 +26,9 @@ static HINTERNET g_session = NULL;
 static HINTERNET g_connect = NULL;
 static HINTERNET g_websocket = NULL;
 
+#define CHAT_RECV_INITIAL_CAPACITY (16U * 1024U)
+#define CHAT_RECV_MAX_WIRE_BYTES (2U * 1024U * 1024U)
+
 static HANDLE g_thread = NULL;         /* recv_thread */
 static HANDLE g_connect_thread = NULL; /* connect_thread */
 static volatile LONG g_stop = 0;
@@ -352,10 +355,17 @@ static void handle_json_frame(const char* json, size_t len) {
         if (text && cJSON_IsString(text) && text->valuestring)
             post_event(CHAT_EVT_DELTA, chat_strdup(text->valuestring));
     } else if (strcmp(event, "message") == 0) {
-        cJSON* text = cJSON_GetObjectItem(root, "text");
-        if (!text) text = cJSON_GetObjectItem(root, "content");
-        if (text && cJSON_IsString(text) && text->valuestring)
-            post_event(CHAT_EVT_MESSAGE, chat_strdup(text->valuestring));
+        cJSON* kind = cJSON_GetObjectItem(root, "kind");
+        const char* kind_name = (kind && cJSON_IsString(kind)) ? kind->valuestring : NULL;
+        /* These are interim activity frames, not completed assistant turns. */
+        if (!kind_name || (strcmp(kind_name, "tool_hint") != 0 &&
+                           strcmp(kind_name, "progress") != 0 &&
+                           strcmp(kind_name, "reasoning") != 0)) {
+            cJSON* text = cJSON_GetObjectItem(root, "text");
+            if (!text) text = cJSON_GetObjectItem(root, "content");
+            if (text && cJSON_IsString(text) && text->valuestring)
+                post_event(CHAT_EVT_MESSAGE, chat_strdup(text->valuestring));
+        }
     } else if (strcmp(event, "stream_end") == 0 || strcmp(event, "done") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
         if (!text) text = cJSON_GetObjectItem(root, "content");
@@ -380,8 +390,10 @@ static void handle_json_frame(const char* json, size_t len) {
 
 static DWORD WINAPI recv_thread(LPVOID param) {
     (void)param;
-    char frame[65536];
+    char* frame = NULL;
     size_t acc = 0;
+    size_t frame_capacity = 0;
+    const char* receive_error = NULL;
 
     while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
         HINTERNET ws;
@@ -390,12 +402,27 @@ static DWORD WINAPI recv_thread(LPVOID param) {
         LeaveCriticalSection(&g_cs);
         if (!ws) break;
 
-        DWORD space = (DWORD)(sizeof(frame) - acc - 1);
-        if (space == 0) {
-            /* Buffer full mid-fragment: drop connection rather than
-               call Receive with length 0. */
-            break;
+        if (acc == frame_capacity) {
+            size_t new_capacity;
+            char* grown;
+
+            if (frame_capacity >= CHAT_RECV_MAX_WIRE_BYTES) {
+                receive_error = "Incoming WebSocket message exceeds 2 MiB";
+                break;
+            }
+            new_capacity = frame_capacity ? frame_capacity * 2 : CHAT_RECV_INITIAL_CAPACITY;
+            if (new_capacity > CHAT_RECV_MAX_WIRE_BYTES || new_capacity < frame_capacity)
+                new_capacity = CHAT_RECV_MAX_WIRE_BYTES;
+            grown = (char*)realloc(frame, new_capacity + 1);
+            if (!grown) {
+                receive_error = "Out of memory receiving WebSocket message";
+                break;
+            }
+            frame = grown;
+            frame_capacity = new_capacity;
         }
+
+        DWORD space = (DWORD)(frame_capacity - acc);
 
         DWORD read = 0;
         WINHTTP_WEB_SOCKET_BUFFER_TYPE btype = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
@@ -412,9 +439,11 @@ static DWORD WINAPI recv_thread(LPVOID param) {
             btype == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
             btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
             btype == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) {
+            if (read > CHAT_RECV_MAX_WIRE_BYTES - acc) {
+                receive_error = "Incoming WebSocket message exceeds 2 MiB";
+                break;
+            }
             acc += read;
-            if (acc >= sizeof(frame) - 1)
-                acc = sizeof(frame) - 1;
             frame[acc] = '\0';
 
             if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
@@ -424,6 +453,10 @@ static DWORD WINAPI recv_thread(LPVOID param) {
             }
         }
     }
+
+    free(frame);
+    if (receive_error)
+        post_event(CHAT_EVT_ERROR, chat_strdup(receive_error));
 
     EnterCriticalSection(&g_cs);
     /* Only tear down if we still own the live socket (avoid closing a
@@ -611,19 +644,31 @@ static DWORD WINAPI lifecycle_thread(LPVOID param) {
             }
             LeaveCriticalSection(&g_cs);
 
-            AcquireSRWLockExclusive(&g_disconnect_lock);
             EnterCriticalSection(&g_cs);
             if (g_lifecycle_request == CHAT_LIFECYCLE_RECONNECT && !g_shutting_down) {
+                int start_reconnect;
                 g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-                g_lifecycle_busy = 0;
-                chat_connect_locked();
+                LeaveCriticalSection(&g_cs);
+
+                /* Queue completion before any replacement worker can report
+                   CONNECTED or READY. */
+                post_event(CHAT_EVT_DISCONNECT_DONE, NULL);
+
+                AcquireSRWLockExclusive(&g_disconnect_lock);
+                EnterCriticalSection(&g_cs);
+                start_reconnect = !g_shutting_down &&
+                    g_lifecycle_request == CHAT_LIFECYCLE_NONE;
+                if (start_reconnect)
+                    chat_connect_locked();
+                if (start_reconnect)
+                    g_lifecycle_busy = 0;
                 LeaveCriticalSection(&g_cs);
                 ReleaseSRWLockExclusive(&g_disconnect_lock);
-                post_event(CHAT_EVT_DISCONNECT_DONE, NULL);
-                break;
+                if (start_reconnect)
+                    break;
+                continue;
             }
             LeaveCriticalSection(&g_cs);
-            ReleaseSRWLockExclusive(&g_disconnect_lock);
         }
     }
 }
