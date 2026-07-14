@@ -119,6 +119,14 @@ Section Uninstall
 
     DeleteRegValue HKCU "${PRODUCT_AUTORUN_KEY}" "${PRODUCT_AUTORUN_NAME}"
 
+    ; Credential Manager records are scoped to a Windows user. This elevated
+    ; uninstaller can only remove the credential visible in its current context.
+    nsExec::ExecToLog '"$INSTDIR\nanobot-manager.exe" --delete-credential'
+    Pop $0
+    ${If} $0 != 0
+        DetailPrint "Warning: bootstrap credential cleanup failed (exit $0). It can only remove the credential for the current executing Windows user."
+    ${EndIf}
+
     Delete "$INSTDIR\nanobot-manager.exe"
     Delete "$INSTDIR\core-ui.dll"
     Delete "$INSTDIR\app.ico"

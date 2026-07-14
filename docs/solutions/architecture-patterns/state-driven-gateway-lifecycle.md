@@ -1,6 +1,7 @@
 ---
 title: "State-Driven Gateway Lifecycle Management on Windows"
 date: 2026-07-13
+last_updated: 2026-07-14
 category: architecture-patterns
 module: nanobot-manager/process
 problem_type: architecture_pattern
@@ -12,6 +13,8 @@ applies_when:
   - "Reconciling process liveness with asynchronous HTTP service readiness"
   - "Attaching to a service started before or outside the manager"
   - "Coordinating process handles, wait callbacks, stop workers, and UI state"
+  - "Keeping health and WebUI endpoints independent while adopting a verified runtime port"
+  - "Migrating a bootstrap secret out of plaintext configuration"
 tags:
   - gateway-lifecycle
   - win32
@@ -21,6 +24,8 @@ tags:
   - pid-reuse
   - handle-ownership
   - control-plane
+  - credential-manager
+  - secret-migration
 resolution_type: code_fix
 ---
 
@@ -38,6 +43,9 @@ That split authority produced several forms of drift:
 - Foreground start behavior was mixed with `gateway stop`, even though that command relies on the state record created by background mode.
 - Raw process globals, wait registrations, and multiple handle-close sites created races, leaks, and double-close paths.
 - `CTRL_BREAK_EVENT` was treated as graceful shutdown even though a `CREATE_NO_WINDOW` child has no compatible console relationship.
+- A configured health port changed the manager's probe target without changing the gateway launch command, while the independent WebUI port was vulnerable to being treated as a derived endpoint.
+- A stale state record could name a reused PID, and several `GetProcessTimes` calls passed invalid `NULL` output pointers instead of failing closed when identity was unavailable.
+- The optional bootstrap secret was serialized as `webui_auth` in `config.json` and exposed through reactive UI state instead of a native credential boundary.
 
 The durable result is a control-plane-first supervision model: use nanobot's CLI, health endpoint, and state record as the primary lifecycle contract, then use Win32 process APIs as transport, observation, identity verification, and guarded fallback. The implementation is centered in `nanobot-manager/src/process.c` and `nanobot-manager/src/process.h`, with asynchronous orchestration and UI transitions in `nanobot-manager/src/main.cpp`.
 
@@ -50,6 +58,11 @@ The durable result is a control-plane-first supervision model: use nanobot's CLI
 - **Console-control shutdown:** `CTRL_BREAK_EVENT` is not a reliable control plane for a detached, no-window process.
 - **Uncoordinated handle cleanup:** closing a process handle before draining its registered wait, or closing it from both the stop worker and exit callback, creates stale-handle and double-close races.
 - **Assuming state-file field shapes:** upstream writes `identity` as a decimal FILETIME string, `started_at` as UTC ISO 8601 ending in `Z`, and `command` as a JSON argv array—not a shell command string.
+- **Treating HTTP 200 as process identity:** health proves readiness at an endpoint, not that the listener belongs to the PID in a state record.
+- **Deriving WebUI as health plus one:** the gateway health listener and WebUI/bootstrap/WebSocket listener are independent interfaces with independent configuration.
+- **Cleaning a legacy secret only on Stop:** Stop is optional and does not cover first upgrade, autostart, startup failure, or users who leave the gateway running.
+- **Masking a secret in reactive UI:** visual masking does not keep the value out of the page data model, snapshots, or generic diagnostics.
+- **Passing `NULL` for unused `GetProcessTimes` outputs:** all four `FILETIME` outputs require valid storage; unused results belong in local variables.
 
 ## Guidance
 
@@ -76,7 +89,7 @@ The OS APIs support the target's contract; they do not replace it. Process enume
 3. `py.exe`
 4. `python.exe`, `python3.exe`, and `pythonw.exe`
 
-`nanobot_resolve` execution-probes the Python tier with `-m nanobot --version` and returns one `nm_resolution` containing `found`, `exe`, `is_python`, and `source`. Configured native executables and `nanobot.exe` found on `PATH` are trusted from file existence or path resolution and receive their final validation when launched. Every interactive and autostart entry point uses the same resolver. `kick_resolve_worker` snapshots the pointer-owned configuration before off-thread work begins, and the UI derives installation state from the resolver result.
+`nanobot_resolve` probes candidates against the capability the manager actually requires: `gateway --help` must exit successfully and contain a standalone `--background` token. This distinguishes not found, incompatible, and probe-failed outcomes before Start. A configured executable is an explicit override, so its failure does not silently select a different executable from `PATH`; successful probes are cached for the session while failures remain retryable. Every interactive and autostart entry point uses the same resolver. `kick_resolve_worker` snapshots pointer-owned configuration before off-thread work begins, and the UI derives installation state from the resolver result.
 
 The invariant is:
 
@@ -93,6 +106,13 @@ Start uses the lifecycle mode whose stop semantics are supported upstream:
 ```text
 nanobot gateway --background
 python -m nanobot gateway --background
+```
+
+The configured Gateway Health Port is part of that command in both forms:
+
+```text
+nanobot gateway --background --port <health-port>
+python -m nanobot gateway --background --port <health-port>
 ```
 
 The process returned directly by `CreateProcess` is the short-lived background launcher, not the gateway to supervise. Wait for and close the launcher handles, read the real PID from `%USERPROFILE%\.nanobot\run\gateway.json`, and open that PID. The handle stored in guarded state must always refer to the real gateway.
@@ -114,17 +134,58 @@ An illustrative record is:
 }
 ```
 
-`nanobot_read_gateway_state` reconstructs the argv array when a command-line view is useful. `nanobot_start` compares the live process creation FILETIME with `identity` first and uses `started_at` only as a compatibility fallback before adopting the handle.
+`nanobot_read_gateway_state` reconstructs the argv array when a command-line view is useful. `nanobot_detect_running_port` adopts a state-record port only when the PID is live and its creation time matches `identity`; it uses `started_at` only when `identity` is absent, while an invalid present identity fails closed. Mismatched-port startup finishes with that same strict verifier and returns `NANOBOT_START_UNVERIFIED_STATE` when the record cannot be verified.
 
-The current implementation does not yet apply that full identity comparison everywhere. `nanobot_attach_running` confirms that the recorded PID is alive and captures its creation time, but does not compare it with the record's `identity`; the process-tree fallback also discovers children before validating the root process creation time. Treat these as explicit hardening follow-ups: identity validation should be shared by start, attach, and destructive fallback, and the root must be validated before traversing or terminating descendants.
+An unverified state record is not proof that its process is safe to terminate. Startup recovery destroys a mismatched-port candidate only when the launcher completed successfully, the candidate is not the prior recorded PID, its creation time is readable, and it was created no earlier than this launcher attempt. Otherwise the manager closes only its own handle and reports the failure.
+
+The strict identity gate is intentionally scoped. Same-port startup retains a compatibility path when identity metadata is absent or unparseable, `nanobot_attach_running` captures live creation time without comparing it to the record, and process-tree fallback discovers children before validating the root. These remain hardening follow-ups; do not generalize the mismatched-port and detection guarantees to every attach or stop path.
 
 Stop follows the same rendezvous. `nanobot_stop` invokes `gateway stop --timeout 20`, interprets the CLI result, and confirms death through the tracked handle. `TerminateProcess` and process-tree termination are escalation paths, not the normal control plane; destructive fallback must remain bounded by the identity-validation limitations above.
+
+### Keep health and WebUI endpoint roles separate
+
+The manager carries three related values with different ownership:
+
+```text
+configured health port -> next gateway launch and fallback readiness probe
+verified state port    -> effective health port for the current gateway
+configured WebUI port  -> browser, bootstrap, and WebSocket connections
+```
+
+Changing the configured health port is disabled while lifecycle state is resolving, starting, running, or stopping because it applies to the gateway process. The WebUI port is a manager-side connection override and remains independent. Neither endpoint is derived from the other, and the effective runtime health port is never written back as the user's next-launch preference.
+
+### Treat process identity queries as fallible
+
+All creation-time checks supply valid storage for every `GetProcessTimes` output:
+
+```c
+FILETIME created, exited, kernel, user;
+BOOL known = GetProcessTimes(process, &created, &exited, &kernel, &user);
+```
+
+Identity-query failure means unknown identity. Callers must avoid publishing verified state or entering a destructive fallback that depends on that identity; they must not substitute a zero timestamp or omit required outputs with `NULL`.
+
+### Migrate bootstrap credentials before deleting plaintext
+
+Non-sensitive settings remain in `config.json`, but the Bootstrap Credential lives under the fixed generic Windows Credential Manager target `nanobot-manager/bootstrap-secret/v1`. Credential writes preserve the previous value, write the replacement, read it back, and restore or delete on failed verification. The secret is absent from normal config serialization and Core UI reactive state; the settings page displays only credential status and opens a temporary native password control for replacement.
+
+Legacy `webui_auth` is treated only as migration input. Migration follows this order:
+
+1. Read the current credential and reject a conflict without changing either source.
+2. Store and read back the legacy value when no credential exists.
+3. Save the active config without `webui_auth`.
+4. Remove only that key from any separate legacy JSON while preserving unknown fields.
+5. Flush and atomically replace the file, then verify cleanup where elevation was required.
+
+An adjacent Program Files config may require a `runas` helper. That helper accepts only the fixed `--scrub-adjacent-legacy-auth` action and no caller-controlled path, preventing elevation from becoming a general file-rewrite primitive. Cancellation or failed verification leaves startup blocked or cleanup pending rather than claiming the plaintext was removed.
+
+Secrets, credential blobs, bootstrap headers, tokens, and thread-local copies are cleared with `SecureZeroMemory` on replacement, error, disconnect, and shutdown paths. The native chat layer receives a short-lived secret copy; the UI page model never owns one.
 
 ### Separate death events from health state
 
 Process exit is an event. `nanobot_watch_handle` registers a one-shot `RegisterWaitForSingleObject` on the real gateway handle. Its callback performs no lifecycle mutation and only posts `WM_CHILD_EXITED`; the window procedure owns the transition.
 
-Health is sampled state. `health_worker` runs `nanobot_check_running` off the UI thread and posts `WM_ASYNC_HEALTH_RESULT`. It uses boot-phase backoff before settling into a steady cadence, tolerates one transient steady-state failure, and uses a generation counter to prevent superseded workers from posting stale results.
+Health is sampled state. `health_worker` runs `nanobot_detect_running_port` off the UI thread; that function verifies a state-record identity before probing its port and otherwise probes the configured fallback port. The worker posts `WM_ASYNC_HEALTH_RESULT`, uses boot-phase backoff before settling into a steady cadence, tolerates one transient steady-state failure, and uses a generation counter to prevent superseded workers from posting stale results.
 
 `NM_STATE_DEAD` currently represents terminal gateway unavailability, not proof that the process handle signaled. It is entered after an unsolicited process-exit event or after two consecutive health failures while Running; a health-driven transition can therefore occur while the process still exists.
 
@@ -170,6 +231,8 @@ Moving blocking probes away from the message pump keeps the GUI responsive durin
 
 Exact upstream-schema verification matters for the same reason. The decimal FILETIME identity, UTC start time, and argv-array command are interoperability contracts; defensive parsing should be based on upstream implementation or observed records, not field-name guesses.
 
+Credential migration follows the same evidence rule as process adoption: establish and verify the new authoritative state before deleting the old one. That ordering avoids both silent credential loss and a false-success UI while plaintext remains on disk.
+
 ## When to Apply
 
 Apply this pattern when a GUI or tray application supervises a separately owned CLI service and one or more of these conditions hold:
@@ -181,6 +244,8 @@ Apply this pattern when a GUI or tray application supervises a separately owned 
 - Process death and application health require different latency or failure handling.
 - Several asynchronous paths can observe or close the same process handle.
 - Persisted PIDs require shared stale-state and PID-reuse validation before attach or destructive fallback.
+- A service exposes separate health and user-facing endpoints whose ports cannot be inferred from each other.
+- A secret must move from a legacy plaintext store into an OS credential store without losing recoverability on partial failure.
 
 Do not add the full pattern to an in-process component with no independent lifecycle, or to a child whose entire lifetime is strictly joined by one parent thread. Even there, retain the core rule: use the highest-level contract available and make ownership explicit before adding fallbacks.
 
@@ -191,9 +256,10 @@ Do not add the full pattern to an in-process component with no independent lifec
 1. `WinMain` initializes guarded state and kicks resolution for detection or silent-tray start.
 2. The resolver derives installation UI state from one runnable command result.
 3. Start launches background mode, discards launcher handles, reads and validates the state record, and opens the real gateway PID.
-4. A process wait posts immediate death events while a health worker polls readiness and steady health.
-5. Stop enters the stopping state, runs the upstream stop command on a worker, confirms death, and escalates only when necessary.
-6. Manager exit closes only its observation handle. A future manager launch attaches to the still-running gateway.
+4. The current gateway's verified state port becomes the effective health endpoint; WebUI/bootstrap continues using its independent configured port.
+5. A process wait posts immediate death events while a health worker polls readiness and steady health.
+6. Stop enters the stopping state, runs the upstream stop command on a worker, confirms death, and escalates only when necessary.
+7. Manager exit closes only its observation handle. A future manager launch attaches to the still-running gateway.
 
 ### Verification checklist
 
@@ -204,12 +270,19 @@ Do not add the full pattern to an in-process component with no independent lifec
 - **Relaunch attach:** quit the manager without stopping the gateway, relaunch, and verify PID, health, chat, and death observation are restored.
 - **Config-only path:** remove nanobot/Python from `PATH`, configure only `nanobot_path`, and verify detection, Start, and autostart use it.
 - **No-tray autostart:** verify boot backoff, handle release, process exit, and that the gateway remains running.
-- **State-record identity:** verify the decimal identity, UTC `started_at`, and argv-array command. Confirm start rejects mismatches; add regression coverage when attach and process-tree fallback are hardened to use the same identity gate.
+- **Capability probe:** point the manager at a nanobot version without `gateway --background` and verify it reports incompatibility before launch.
+- **Independent ports:** configure unrelated health and WebUI ports; verify the launch command contains the health port and bootstrap/WebSocket use only the WebUI port.
+- **State-record identity:** verify the decimal identity, UTC `started_at`, and argv-array command. Confirm detection does not trust an unverified state port and mismatched-port startup rejects unverifiable state.
+- **Conservative cleanup:** vary launcher result, prior PID, candidate creation availability, and creation ordering; termination is eligible only when every ownership condition holds.
+- **Process-time failure:** verify an unavailable creation time does not publish verified identity or authorize cleanup. Keep every direct `GetProcessTimes` call supplied with four valid outputs.
+- **Credential round trip:** store, read, replace, and delete through a process-unique test target so tests never alter the product credential.
+- **Legacy migration:** verify normal serialization never emits `webui_auth`, the scrub preserves unknown JSON fields, conflicts change neither source, and malformed or inaccessible files do not report success.
+- **Manual upgrade matrix:** cover no legacy secret, matching and conflicting credentials, Program Files elevation, cancelled UAC, and chat reconnect after credential replacement or deletion.
 - **Build and package:** run `scripts\build.bat` and `scripts\package.bat`; verify the Release executable and NSIS installer complete cleanly.
 
 ## Related
 
 - [nanobot Gateway Overview](../reference/nanobot-gateway-overview.md) — upstream gateway commands, endpoints, and compatibility baseline.
 - [Native WebSocket Chat Integration](native-websocket-chat-integration.md) — related worker-to-UI messaging, generation, and resource-close discipline for chat transport.
-- [Testing and CI Setup](../infrastructure/testing-and-ci-setup.md) — current boundary between unit coverage and manual process/WinHTTP integration verification.
-- [Configuration System](config-system.md) — manager-owned configuration values consumed by lifecycle resolution and health.
+- [Testing and CI Setup](../infrastructure/testing-and-ci-setup.md) — CTest wiring and the boundary between native unit coverage and manual process/WinHTTP integration verification.
+- [Configuration System](config-system.md) — manager-owned non-sensitive configuration and legacy JSON migration behavior; its older plaintext `webui_auth` examples require refresh.

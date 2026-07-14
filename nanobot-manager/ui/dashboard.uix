@@ -17,7 +17,10 @@ export default {
       stayInTray: false,
       nanobotPath: "",
       webuiPort: "8765",
-      webuiAuth: "",
+      healthPort: "18790",
+      canEditGatewayPort: true,
+      credentialStatus: "",
+      hasCredential: false,
       theme: "system",
       installed: true,
       lang: "zh",
@@ -352,11 +355,6 @@ export default {
     color: var(--fg-on-accent);
   }
 
-  .settings-page {
-    padding: 16px 20px 20px;
-    gap: 0;
-  }
-
   .settings-section-title {
     font-size: 11px;
     font-weight: 600;
@@ -429,14 +427,6 @@ export default {
     border-radius: 8px;
   }
 
-  .auth-input {
-    height: 32px;
-    font-size: 13px;
-    padding: 0 8px;
-    background: var(--bg-2);
-    border-radius: 8px;
-  }
-
   .apply-row {
     flex-direction: row;
     justify-content: flex-end;
@@ -459,6 +449,61 @@ export default {
     font-size: 12px;
     font-weight: 600;
     color: var(--fg-on-accent);
+  }
+
+  .credential-row {
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 0 4px;
+  }
+
+  .credential-status-wrap {
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: var(--bg-2);
+    border-radius: 8px;
+  }
+
+  .credential-status-label {
+    font-size: 11px;
+    color: var(--fg-3);
+  }
+
+  .credential-status-val {
+    font-size: 12px;
+    color: var(--fg-2);
+    flex: 1;
+  }
+
+  .credential-actions {
+    flex-direction: row;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
+  .credential-btn {
+    padding: 6px 14px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    cursor: pointer;
+  }
+
+  .credential-btn:hover {
+    opacity: 0.92;
+  }
+
+  .credential-btn-clear {
+    background: var(--bg-2);
+    color: var(--fg-2);
+  }
+
+  .credential-btn-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: inherit;
   }
 
   .theme-row {
@@ -651,7 +696,7 @@ export default {
           </div>
         </div>
 
-        <div v-if="page=='settings'" class="page-scroll">
+        <ScrollView v-if="page=='settings'" class="page-scroll">
           <label class="settings-section-title">{{ $t('settings_general') }}</label>
 
           <div class="setting-row">
@@ -684,18 +729,33 @@ export default {
 
           <div class="setting-row setting-col">
             <div class="setting-label-wrap">
-              <label class="setting-label">{{ $t('setting_webui_port') }}</label>
-              <label class="setting-sub">{{ $t('setting_webui_port_sub') }}</label>
+              <label class="setting-label">{{ $t('setting_gateway_port') }}</label>
+              <label class="setting-sub">{{ $t('setting_gateway_port_sub') }}</label>
             </div>
-            <input id="webui_port_input" v-model="webuiPort" type="number" min="1" max="65535" class="port-input" placeholder="8765"/>
+            <input id="health_port_input" v-model="healthPort" :enabled="canEditGatewayPort" class="port-input" placeholder="18790"/>
           </div>
 
           <div class="setting-row setting-col">
             <div class="setting-label-wrap">
-              <label class="setting-label">{{ $t('setting_webui_auth') }}</label>
-              <label class="setting-sub">{{ $t('setting_webui_auth_sub') }}</label>
+              <label class="setting-label">{{ $t('setting_webui_port') }}</label>
+              <label class="setting-sub">{{ $t('setting_webui_port_sub') }}</label>
             </div>
-            <input id="webui_auth_input" v-model="webuiAuth" class="auth-input" placeholder="(optional)"/>
+            <input id="webui_port_input" v-model="webuiPort" class="port-input" placeholder="8765"/>
+          </div>
+
+          <div class="credential-row">
+            <div class="credential-status-wrap">
+              <label class="credential-status-label">{{ $t('setting_credential_status') }}</label>
+              <label class="credential-status-val" id="credential_status_text">{{ credentialStatus }}</label>
+            </div>
+            <div class="credential-actions">
+              <div id="btn_clear_credential" class="credential-btn credential-btn-clear" :enabled="hasCredential">
+                <label class="credential-btn-label">{{ $t('setting_credential_clear') }}</label>
+              </div>
+              <div id="btn_manage_credential" class="credential-btn">
+                <label class="credential-btn-label">{{ $t('setting_credential_manage') }}</label>
+              </div>
+            </div>
           </div>
 
           <div class="apply-row">
@@ -764,7 +824,7 @@ export default {
               </svg>
             </div>
           </div>
-        </div>
+        </ScrollView>
 
       </div>
     </div>

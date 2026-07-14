@@ -13,15 +13,24 @@ extern "C" {
 typedef enum {
     NM_SRC_NONE = 0,
     NM_SRC_CONFIG,        /* cfg->nanobot_path, existence-validated               */
-    NM_SRC_PATH_NANOBOT,  /* SearchPathA(NULL,"nanobot.exe",...)                  */
+    NM_SRC_PATH_NANOBOT,  /* SearchPathW(NULL,L"nanobot.exe",...)                 */
     NM_SRC_PYTHON,        /* py.exe / python{,3,w}.exe -m nanobot (probe-passed)  */
 } nm_source;
 
+typedef enum {
+    NM_RES_READY = 0,
+    NM_RES_NOT_FOUND,
+    NM_RES_INCOMPATIBLE,
+    NM_RES_PROBE_FAILED,
+    NM_RES_UNCHECKED
+} nm_resolution_status;
+
 typedef struct {
-    int         found;      /* == (exe != NULL)                                   */
-    char*       exe;        /* malloc'd; NULL if !found                           */
+    int         found;      /* derived: READY or UNCHECKED                         */
+    char*       exe;        /* malloc'd candidate path; may be set on an error    */
     int         is_python;  /* 1 => "<exe> -m nanobot gateway", else "<exe> gateway" */
     nm_source   source;     /* diagnostic/UI hint only                            */
+    nm_resolution_status status;
 } nm_resolution;
 
 void nm_resolution_free(nm_resolution* r);   /* frees exe, zeroes struct        */
@@ -32,26 +41,40 @@ int  nanobot_resolve_candidates(const app_config* cfg,
                                 char*** out_exes, int** out_is_python, int* out_count);
 void nm_candidates_free(char** exes, int* is_python, int count);
 
-/* Thin wrapper: iterates candidates; for the python tier runs a validation probe
- * ("<exe>" -m nanobot --version, ~10s, exit 0 + output check). cfg may be NULL
- * (skips NM_SRC_CONFIG).
- * `quick`: when non-zero, the python tier is accepted on SearchPathA existence
- * alone (no ~10s probe). Use when any nanobot exe suffices to invoke a CLI
- * subcommand (e.g. stop) and the probe cost is not justified. The tradeoff: a
- * python without nanobot installed may be accepted -> the CLI then fails fast
- * and the caller escalates (acceptable for the stop path). */
+/* Iterates candidates and, unless `quick`, probes `gateway --help` for the
+ * standalone --background token. Explicit cfg->nanobot_path is an override:
+ * failures never fall back to PATH. `quick` returns an existing candidate with
+ * NM_RES_UNCHECKED for the stop path. */
 int  nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick);
 
 /* --- Process lifecycle ----------------------------------------------------- */
 
 int   nanobot_check_running(int port);
-int   nanobot_start(const char* exe, int is_python, int* out_pid);
+/* Detect a live gateway, preferring the verified port in gateway.json and
+ * falling back to configured_port once (without probing it twice). */
+int   nanobot_detect_running_port(int configured_port, int* out_port);
+/* Starts the background launcher and adopts the verified gateway state. The
+ * configured health_port remains the next-launch preference; out_effective_health_port
+ * receives the authoritative state-file port when valid. */
+int   nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
+                    int* out_effective_health_port);
+
+int   nanobot_unverified_candidate_is_owned(DWORD launcher_wait,
+                                            DWORD launcher_exit_code,
+                                            DWORD candidate_pid,
+                                            int prior_state_found,
+                                            DWORD prior_pid,
+                                            int candidate_creation_known,
+                                            FILETIME candidate_creation_ft,
+                                            FILETIME launcher_started_ft);
 
 /* nanobot_start distinct failure codes (caller may surface these verbatim).
  * Success == 0; positive values are GetLastError() codes from CreateProcess. */
 #define NANOBOT_START_NO_STATEFILE  (-1)   /* launcher ran but gateway.json missing/no pid */
 #define NANOBOT_START_OPEN_FAILED   (-2)   /* OpenProcess on state-file pid failed          */
 #define NANOBOT_START_STALE_PID     (-3)   /* state-file pid was already dead (stale file)  */
+#define NANOBOT_START_LAUNCHER_FAILED (-4) /* launcher exited non-zero and no live gateway  */
+#define NANOBOT_START_UNVERIFIED_STATE (-5) /* mismatched state-file port lacks verified identity */
 
 /* Snapshot of ~/.nanobot/run/gateway.json -- the authoritative source for the
  * REAL foreground gateway pid after `nanobot gateway --background`. The stub

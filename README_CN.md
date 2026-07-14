@@ -15,14 +15,14 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 - 最小化到系统托盘（设置开关）
 - 中英双语界面，运行时切换
 - 主题：跟随系统 / 深色 / 浅色
-- 可配置 WebUI 端口与可选认证 secret
+- 可配置 Gateway 健康端口与 Manager WebUI 端口，认证密钥保存到 Credential Manager
 - NSIS 安装包，猫表情图标，中英文双语安装向导
 
 ## 依赖
 
 - Windows 10/11（64 位）
 - [Visual Studio 2022](https://visualstudio.microsoft.com/) 或更新版本（支持 VS 2026），含 C++ CMake 工具集
-- [Python 3.x](https://www.python.org/) + nanobot-ai（`pip install nanobot-ai`）
+- [Python 3.x](https://www.python.org/) + nanobot-ai >= 0.2.2（`python -m pip install -U "nanobot-ai>=0.2.2"`）
 
 ## 构建
 
@@ -57,11 +57,13 @@ scripts\package.bat
 ```
 nanobot-manager.exe              打开 GUI 面板
 nanobot-manager.exe --autostart  静默模式：启动 nanobot 后退出（用于开机自启）
+nanobot-manager.exe --delete-credential  删除当前用户保存的引导认证密钥
+nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
 ```
 
 ## 配置
 
-首次运行时在 exe 同目录生成 `config.json`：
+安装版将 `config.json` 保存到 `%LOCALAPPDATA%\nanobot-manager\config.json`。带有同目录 `portable.flag` 的便携版，以及独立复制的 exe，均在 exe 同目录保存：
 
 ```json
 {
@@ -70,7 +72,6 @@ nanobot-manager.exe --autostart  静默模式：启动 nanobot 后退出（用�
   "stay_in_tray": false,
   "health_check_port": 18790,
   "webui_port": 8765,
-  "webui_auth": "",
   "theme_mode": 0,
   "language": "zh"
 }
@@ -81,11 +82,15 @@ nanobot-manager.exe --autostart  静默模式：启动 nanobot 后退出（用�
 | `nanobot_path` | string \| null | null | 覆盖自动检测的命令路径 |
 | `autostart_nanobot` | bool | false | 管理器启动时是否自动启动 nanobot |
 | `stay_in_tray` | bool | false | 最小化到系统托盘而非退出 |
-| `health_check_port` | int | 18790 | `/health` 检查端口 |
-| `webui_port` | int | 8765 | gateway WebUI 端口（聊天/WebSocket），与 health 端口相互独立 |
-| `webui_auth` | string | "" | 可选的引导认证 secret（gateway `tokenIssueSecret`） |
+| `health_check_port` | int | 18790 | 下次由 Manager 启动 Gateway 时使用的 `/health` 配置端口；发现已运行 Gateway 时界面显示其实际端口 |
+| `webui_port` | int | 8765 | 仅 Manager 聊天/WebSocket 的连接覆盖，独立于 Gateway 端口 |
+| 引导认证密钥 | Credential Manager | 未设置 | 可选 gateway `tokenIssueSecret`；绝不写入 `config.json`（旧版 `webui_auth` 启动时迁移） |
 | `theme_mode` | int | 0 | 0 = 跟随系统，1 = 深色，2 = 浅色 |
 | `language` | string | "zh" | 界面语言：`zh` 或 `en` |
+
+卸载会调用 `--delete-credential`，但 Windows Credential Manager 凭据按用户隔离：提权安装程序只能清除其当前执行用户的凭据。正常清理请优先使用应用内的“清除”操作。
+
+从旧版本首次升级启动时，管理器会将 `webui_auth` 迁移到 Credential Manager 并删除明文键。若旧配置位于 `Program Files`，Windows 可能显示 UAC 提示，仅用于清除 exe 相邻旧配置中的该明文键；取消提示会取消本次启动并保留“待清理”状态，不会静默宣称已安全。
 
 ## 项目结构
 
@@ -112,7 +117,7 @@ nanobot-manager/
 
 ## 测试
 
-单元测试使用内置的 C 测试框架，通过 CTest 运行。覆盖 config JSON 的往返（加载/保存/校验）和开机自启注册表逻辑。
+单元测试使用内置的 C 测试框架，通过 CTest 运行。覆盖 config JSON 的迁移/校验、使用每进程测试 target 的 Credential Manager 存取删除，以及开机自启注册表逻辑。
 
 带测试构建（默认开启）：
 

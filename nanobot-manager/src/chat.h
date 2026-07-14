@@ -22,17 +22,20 @@ enum {
 /* Initialize module (call once). hwnd receives WM_CHAT_EVENT. */
 void chat_init(HWND hwnd, UINT msg_id);
 
-/* Set WebUI/WS host port and optional bootstrap secret (tokenIssueSecret). */
+/* Set WebUI/WS host port and an optional short-lived bootstrap secret. */
 void chat_set_endpoint(int webui_port, const char* bootstrap_secret);
 
 /* Connect async. Idempotent if already connected/connecting. */
 int chat_connect(void);
 
-/* Disconnect and join worker threads (may block up to ~10s). */
+/* Disconnect and join worker threads. */
 void chat_disconnect(void);
 
 /* Disconnect on a worker thread; posts CHAT_EVT_DISCONNECT_DONE when finished. */
 void chat_disconnect_async(void);
+
+/* Queue a disconnect followed by a connection using the latest endpoint. */
+void chat_reconnect_async(void);
 
 /* 1 if WebSocket is up (may not have chat_id yet). */
 int chat_is_connected(void);

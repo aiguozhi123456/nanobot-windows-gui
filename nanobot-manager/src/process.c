@@ -45,13 +45,55 @@ static void process_log(const char* fmt, ...) {
 
 /* --- Python interpreter name set -------------------------------------------
  * Single source of truth for "what counts as a python interpreter". The narrow
- * table drives SearchPathA probing in the candidate builder. The names are
+ * table drives SearchPathW probing in the candidate builder. The names are
  * version-tolerant by prefix so python3.11.exe, pythonw3.12.exe, ... are
  * recognized; callers reject mismatches via the probe.
  */
 static const char* const g_python_exes[] = {
     "py.exe", "python.exe", "python3.exe", "pythonw.exe"
 };
+
+static wchar_t* utf8_to_wide_alloc(const char* text) {
+    if (!text) return NULL;
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    if (length <= 0) return NULL;
+    wchar_t* wide = (wchar_t*)malloc((size_t)length * sizeof(*wide));
+    if (!wide) return NULL;
+    if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, wide, length)) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static char* wide_to_utf8_alloc(const wchar_t* text) {
+    if (!text) return NULL;
+    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, NULL, 0,
+                                     NULL, NULL);
+    if (length <= 0) return NULL;
+    char* utf8 = (char*)malloc((size_t)length);
+    if (!utf8) return NULL;
+    if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text, -1, utf8, length,
+                             NULL, NULL)) {
+        free(utf8);
+        return NULL;
+    }
+    return utf8;
+}
+
+static wchar_t* build_command_line(const wchar_t* exe, const wchar_t* arguments) {
+    if (!exe || !arguments) return NULL;
+    size_t exe_len = wcslen(exe);
+    size_t arg_len = wcslen(arguments);
+    if (exe_len > (SIZE_MAX - arg_len - 5) / sizeof(wchar_t)) return NULL;
+    wchar_t* command = (wchar_t*)malloc((exe_len + arg_len + 5) * sizeof(*command));
+    if (!command) return NULL;
+    if (swprintf_s(command, exe_len + arg_len + 5, L"\"%s\"%s", exe, arguments) < 0) {
+        free(command);
+        return NULL;
+    }
+    return command;
+}
 
 /* --- Pure candidate builder ------------------------------------------------ */
 
@@ -71,38 +113,50 @@ int nanobot_resolve_candidates(const app_config* cfg,
         return 0;
     }
     int   count = 0;
-    char  found[MAX_PATH];
+    wchar_t found[MAX_PATH];
 
     /* Tier 1: config path, existence-validated (GetFileAttributesW). */
     if (cfg && cfg->nanobot_path && cfg->nanobot_path[0]) {
-        wchar_t wpath[MAX_PATH];
-        if (MultiByteToWideChar(CP_UTF8, 0, cfg->nanobot_path, -1, wpath, MAX_PATH)) {
+        wchar_t* wpath = utf8_to_wide_alloc(cfg->nanobot_path);
+        if (wpath) {
             DWORD attr = GetFileAttributesW(wpath);
             if (attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
                 const char* base = strrchr(cfg->nanobot_path, '\\');
                 if (!base) base = strrchr(cfg->nanobot_path, '/');
                 base = base ? base + 1 : cfg->nanobot_path;
-                exes[count]  = _strdup(cfg->nanobot_path);
-                is_py[count] = (_stricmp(base, "nanobot.exe") != 0) ? 1 : 0;
-                count++;
+                char* configured_exe = _strdup(cfg->nanobot_path);
+                if (configured_exe) {
+                    exes[count] = configured_exe;
+                    is_py[count] = (_stricmp(base, "nanobot.exe") != 0) ? 1 : 0;
+                    count++;
+                }
             }
+            free(wpath);
         }
     }
 
     /* Tier 2: nanobot.exe on PATH (trusted). */
-    if (count < CAP && SearchPathA(NULL, "nanobot.exe", NULL, MAX_PATH, found, NULL)) {
-        exes[count]  = _strdup(found);
-        is_py[count] = 0;
-        count++;
+    if (count < CAP && SearchPathW(NULL, L"nanobot.exe", NULL, _countof(found), found, NULL)) {
+        char* found_utf8 = wide_to_utf8_alloc(found);
+        if (found_utf8) {
+            exes[count] = found_utf8;
+            is_py[count] = 0;
+            count++;
+        }
     }
 
     /* Tiers 3-4: py.exe (PEP 397 launcher) then python{,3,w}.exe on PATH. */
     for (int i = 0; i < (int)_countof(g_python_exes) && count < CAP; i++) {
-        if (SearchPathA(NULL, g_python_exes[i], NULL, MAX_PATH, found, NULL)) {
-            exes[count]  = _strdup(found);
-            is_py[count] = 1;
-            count++;
+        wchar_t* name = utf8_to_wide_alloc(g_python_exes[i]);
+        if (name && SearchPathW(NULL, name, NULL, _countof(found), found, NULL)) {
+            char* found_utf8 = wide_to_utf8_alloc(found);
+            if (found_utf8) {
+                exes[count] = found_utf8;
+                is_py[count] = 1;
+                count++;
+            }
         }
+        free(name);
     }
 
     *out_exes = exes;
@@ -120,90 +174,122 @@ void nm_candidates_free(char** exes, int* is_python, int count) {
     free(is_python);
 }
 
-/* --- Validation probe (python tier) ---------------------------------------- */
+/* --- Capability probe ------------------------------------------------------- */
+typedef enum { PROBE_READY, PROBE_INCOMPATIBLE, PROBE_FAILED } probe_result;
+typedef enum { OUTPUT_HAS_TOKEN, OUTPUT_NO_TOKEN, OUTPUT_READ_FAILED } output_result;
 
-/* Runs `"<exe>" --version` (is_python=0) or `"<exe>" -m nanobot --version`
- * (is_python=1), captures stdout+stderr, and verifies the result. Child is run
- * hidden (CREATE_NO_WINDOW); a hung probe is terminated, never leaked. */
-static int run_probe(const char* exe, int is_python) {
-    char cmdline[MAX_PATH * 2];
-    snprintf(cmdline, sizeof(cmdline),
-        is_python ? "\"%s\" -m nanobot --version" : "\"%s\" --version",
-        exe);
+static int token_char(unsigned char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '_' || c == '-';
+}
 
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(sa);
-    sa.bInheritHandle = TRUE;
-    sa.lpSecurityDescriptor = NULL;
-
-    HANDLE read_pipe = NULL, write_pipe = NULL;
-    if (!CreatePipe(&read_pipe, &write_pipe, &sa, 0))
-        return 0;  /* cannot capture output safely -> treat as not-verified     */
-    /* Parent's read end must not be inherited. */
-    SetHandleInformation(read_pipe, HANDLE_FLAG_INHERIT, 0);
-
-    STARTUPINFOA si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = write_pipe;
-    si.hStdError  = write_pipe;
-    si.hStdInput  = NULL;
-
-    int ok = 0;
-    if (CreateProcessA(NULL, cmdline, NULL, NULL, TRUE,
-            CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        /* Close parent's copy of the write end so ReadFile sees EOF once the
-         * child exits (or is terminated). */
-        CloseHandle(write_pipe);
-        write_pipe = NULL;
-
-        DWORD wait = WaitForSingleObject(pi.hProcess, 10000);
-        if (wait == WAIT_TIMEOUT)
-            TerminateProcess(pi.hProcess, 1);
-
-        char  buf[512];
-        char  out[1600];
-        int   out_len = 0;
-        DWORD got = 0;
-        while (ReadFile(read_pipe, buf, sizeof(buf), &got, NULL) && got > 0) {
-            int room = (int)sizeof(out) - 1 - out_len;
-            if (room <= 0) break;
-            int copy = ((int)got < room) ? (int)got : room;
-            memcpy(out + out_len, buf, (size_t)copy);
-            out_len += copy;
-        }
-        out[out_len] = '\0';
-
-        DWORD exit_code = 1;
-        GetExitCodeProcess(pi.hProcess, &exit_code);
-
-        if (is_python) {
-            /* python -m nanobot: exit 0 iff the module loads and runs. Do NOT
-             * string-match: the "No module named nanobot" error also contains
-             * the word "nanobot", so output alone is a false-positive risk. */
-            ok = (exit_code == 0) ? 1 : 0;
-        } else {
-            /* Bare exe: confirm it self-identifies as nanobot. If we captured
-             * output it must mention "nanobot"; if capture yielded nothing,
-             * accept exit 0 (robustness against capture failure).            */
-            for (int i = 0; i < out_len; i++) {
-                char c = out[i];
-                if (c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
-                out[i] = c;
+static output_result output_has_background_token(const wchar_t* path) {
+    FILE* file = _wfopen(path, L"rb");
+    char previous = '\0';
+    int matched = 0;
+    int found = 0;
+    int byte;
+    if (!file) return OUTPUT_READ_FAILED;
+    while ((byte = fgetc(file)) != EOF) {
+        const char* expected = "--background";
+        if ((char)byte == expected[matched]) {
+            if (matched == 0 && token_char((unsigned char)previous)) continue;
+            matched++;
+            if (matched == 12) {
+                int next = fgetc(file);
+                found = next == EOF || !token_char((unsigned char)next);
+                if (next != EOF) ungetc(next, file);
+                matched = 0;
             }
-            int mentions = (strstr(out, "nanobot") != NULL);
-            ok = (exit_code == 0 && (out_len == 0 || mentions)) ? 1 : 0;
+        } else {
+            matched = ((char)byte == '-') ? 1 : 0;
         }
-
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
+        previous = (char)byte;
     }
+    if (ferror(file) || fclose(file) != 0) return OUTPUT_READ_FAILED;
+    return found ? OUTPUT_HAS_TOKEN : OUTPUT_NO_TOKEN;
+}
 
-    if (read_pipe)  CloseHandle(read_pipe);
-    if (write_pipe) CloseHandle(write_pipe);
-    return ok;
+static probe_result run_probe(const char* exe, int is_python) {
+    wchar_t directory[MAX_PATH], output_path[MAX_PATH];
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    STARTUPINFOEXW siex;
+    PROCESS_INFORMATION pi;
+    HANDLE output = INVALID_HANDLE_VALUE, input = INVALID_HANDLE_VALUE;
+    SIZE_T attribute_size = 0;
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    HANDLE inheritable_handles[2];
+    int attributes_initialized = 0;
+    probe_result result = PROBE_FAILED;
+    output_path[0] = L'\0';
+    wchar_t* wide_exe = utf8_to_wide_alloc(exe);
+    wchar_t* cmdline = build_command_line(wide_exe,
+        is_python ? L" -m nanobot gateway --help" : L" gateway --help");
+    if (!wide_exe || !cmdline) {
+        free(wide_exe);
+        free(cmdline);
+        return result;
+    }
+    if (!GetTempPathW(_countof(directory), directory) ||
+        !GetTempFileNameW(directory, L"nmp", 0, output_path)) goto cleanup;
+    output = CreateFileW(output_path, GENERIC_WRITE, FILE_SHARE_READ, &sa,
+                         TRUNCATE_EXISTING, FILE_ATTRIBUTE_TEMPORARY, NULL);
+    if (output == INVALID_HANDLE_VALUE) goto cleanup;
+    input = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                        &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (input == INVALID_HANDLE_VALUE) goto cleanup;
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_size);
+    attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attribute_size);
+    if (!attributes || !InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size))
+        goto cleanup;
+    attributes_initialized = 1;
+    inheritable_handles[0] = input;
+    inheritable_handles[1] = output;
+    if (!UpdateProcThreadAttribute(attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                   inheritable_handles, sizeof(inheritable_handles),
+                                   NULL, NULL))
+        goto cleanup;
+
+    ZeroMemory(&siex, sizeof(siex)); ZeroMemory(&pi, sizeof(pi));
+    siex.StartupInfo.cb = sizeof(siex);
+    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    siex.StartupInfo.hStdInput = input;
+    siex.StartupInfo.hStdOutput = output;
+    siex.StartupInfo.hStdError = output;
+    siex.lpAttributeList = attributes;
+    if (CreateProcessW(NULL, cmdline, NULL, NULL, TRUE,
+                       CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                       NULL, NULL, &siex.StartupInfo, &pi)) {
+        CloseHandle(output); output = INVALID_HANDLE_VALUE;
+        CloseHandle(input); input = INVALID_HANDLE_VALUE;
+        DWORD wait = WaitForSingleObject(pi.hProcess, 10000);
+        if (wait == WAIT_TIMEOUT) {
+            if (TerminateProcess(pi.hProcess, 1))
+                WaitForSingleObject(pi.hProcess, 2000);
+        } else if (wait == WAIT_OBJECT_0) {
+            DWORD exit_code = 1;
+            if (GetExitCodeProcess(pi.hProcess, &exit_code) && exit_code == 0) {
+                output_result output_state = output_has_background_token(output_path);
+                if (output_state == OUTPUT_HAS_TOKEN)
+                    result = PROBE_READY;
+                else if (output_state == OUTPUT_NO_TOKEN)
+                    result = PROBE_INCOMPATIBLE;
+            }
+        }
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+    }
+cleanup:
+    if (attributes_initialized)
+        DeleteProcThreadAttributeList(attributes);
+    if (attributes)
+        free(attributes);
+    if (input != INVALID_HANDLE_VALUE) CloseHandle(input);
+    if (output != INVALID_HANDLE_VALUE) CloseHandle(output);
+    if (output_path[0]) DeleteFileW(output_path);
+    free(wide_exe);
+    free(cmdline);
+    return result;
 }
 
 /* --- Probe cache (success-only, session-scoped) ----------------------------
@@ -241,10 +327,24 @@ static void probe_cache_add(const char* exe) {
 int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
     if (!out) return 0;
     out->found = 0; out->exe = NULL; out->is_python = 0; out->source = NM_SRC_NONE;
+    out->status = NM_RES_NOT_FOUND;
+
+    if (cfg && cfg->nanobot_path && cfg->nanobot_path[0]) {
+        wchar_t configured_path[MAX_PATH];
+        if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cfg->nanobot_path,
+                                 -1, configured_path, _countof(configured_path)) ||
+            GetFileAttributesW(configured_path) == INVALID_FILE_ATTRIBUTES ||
+            (GetFileAttributesW(configured_path) & FILE_ATTRIBUTE_DIRECTORY)) {
+            out->status = NM_RES_PROBE_FAILED;
+            return 0;
+        }
+    }
 
     char** exes = NULL;
     int*   is_py = NULL;
     int    count = 0;
+    int    saw_incompatible = 0;
+    int    saw_failed = 0;
     nanobot_resolve_candidates(cfg, &exes, &is_py, &count);
 
     for (int i = 0; i < count; i++) {
@@ -261,18 +361,28 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
         else
             src = NM_SRC_PYTHON;
 
-        /* Config + path-nanobot tiers are trusted by file existence. The python
-         * tier must be probed (cached on success) -- UNLESS `quick` is set, in
-         * which case existence alone is accepted (stop-CLI context: we just need
-         * any nanobot exe to invoke `gateway stop`; a false accept fails fast). */
-        if (py && !quick) {
+        if (!quick) {
             if (!probe_cache_hit(exe)) {
-                if (!run_probe(exe, 1))
-                    continue;            /* not installed via this interpreter  */
+                probe_result probe = run_probe(exe, py);
+                if (probe != PROBE_READY) {
+                    if (src == NM_SRC_CONFIG) {
+                        out->exe = _strdup(exe); out->is_python = py; out->source = src;
+                        out->status = probe == PROBE_INCOMPATIBLE
+                            ? NM_RES_INCOMPATIBLE : NM_RES_PROBE_FAILED;
+                        nm_candidates_free(exes, is_py, count);
+                        return 0;
+                    }
+                    if (probe == PROBE_INCOMPATIBLE)
+                        saw_incompatible = 1;
+                    else
+                        saw_failed = 1;
+                    continue;
+                }
                 probe_cache_add(exe);    /* sticky success                      */
             }
         }
 
+        out->status = quick ? NM_RES_UNCHECKED : NM_RES_READY;
         out->found = 1;
         out->exe = _strdup(exe);
         out->is_python = py;
@@ -282,6 +392,10 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
     }
 
     nm_candidates_free(exes, is_py, count);
+    if (saw_incompatible)
+        out->status = NM_RES_INCOMPATIBLE;
+    else if (saw_failed)
+        out->status = NM_RES_PROBE_FAILED;
     return 0;
 }
 
@@ -292,6 +406,7 @@ void nm_resolution_free(nm_resolution* r) {
     r->found = 0;
     r->is_python = 0;
     r->source = NM_SRC_NONE;
+    r->status = NM_RES_NOT_FOUND;
 }
 
 int nanobot_check_running(int port) {
@@ -333,6 +448,29 @@ static unsigned long long filetime_to_ull(FILETIME ft) {
     value.LowPart = ft.dwLowDateTime;
     value.HighPart = ft.dwHighDateTime;
     return value.QuadPart;
+}
+
+static BOOL get_process_creation_time(HANDLE process, FILETIME* create_time) {
+    FILETIME exit_time, kernel_time, user_time;
+    if (!process || process == INVALID_HANDLE_VALUE || !create_time)
+        return FALSE;
+    return GetProcessTimes(process, create_time, &exit_time, &kernel_time, &user_time);
+}
+
+int nanobot_unverified_candidate_is_owned(DWORD launcher_wait,
+                                          DWORD launcher_exit_code,
+                                          DWORD candidate_pid,
+                                          int prior_state_found,
+                                          DWORD prior_pid,
+                                          int candidate_creation_known,
+                                          FILETIME candidate_creation_ft,
+                                          FILETIME launcher_started_ft) {
+    if (launcher_wait != WAIT_OBJECT_0 || launcher_exit_code != 0 ||
+        candidate_pid == 0 || !candidate_creation_known)
+        return 0;
+    if (prior_state_found && candidate_pid == prior_pid)
+        return 0;
+    return filetime_to_ull(candidate_creation_ft) >= filetime_to_ull(launcher_started_ft);
 }
 
 int nanobot_get_process_uptime_seconds(int pid, unsigned long long* out_seconds) {
@@ -671,10 +809,8 @@ int nanobot_attach_running(void) {
      *    Matches nanobot_start's tolerance: zeroed on failure -> guard inert. */
     FILETIME create;
     ZeroMemory(&create, sizeof(create));
-    if (GetProcessTimes(h, &create, NULL, NULL, NULL))
-        nm_state_set_create_ft(&create);
-    else
-        nm_state_set_create_ft(&create);   /* zeroed => reuse guard inert        */
+    get_process_creation_time(h, &create);
+    nm_state_set_create_ft(&create);       /* zeroed on failure => guard inert   */
 
     /* 6. Publish: hand ownership of `h` to g_state. start_tick is approximate
      *    (the gateway's true start time is the state file's started_at, but
@@ -940,6 +1076,7 @@ int nanobot_read_gateway_state(nm_gateway_state* out) {
     fclose(f);
 
     cJSON* root = cJSON_Parse(buf);
+    SecureZeroMemory(buf, (size_t)len + 1);
     free(buf);
     if (!root) return 0;                /* malformed JSON => treat as not found */
 
@@ -996,6 +1133,62 @@ int nanobot_read_gateway_state(nm_gateway_state* out) {
     return 0;
 }
 
+/* Trust a state-file port only when its claimed process is still alive and its
+ * recorded process identity matches. Without this guard, a stale state file
+ * can turn an unrelated service that reused the port into a false Running UI. */
+static int gateway_state_pid_is_verified_live(const nm_gateway_state* state) {
+    HANDLE process;
+    FILETIME created, expected_utc, expected_local;
+    unsigned long long actual;
+    int have_local = 0;
+
+    if (!state || !state->pid) return 0;
+    process = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+                          FALSE, state->pid);
+    if (!process) return 0;
+    if (WaitForSingleObject(process, 0) == WAIT_OBJECT_0 ||
+        !get_process_creation_time(process, &created)) {
+        CloseHandle(process);
+        return 0;
+    }
+    CloseHandle(process);
+    actual = filetime_to_ull(created);
+
+    if (state->identity[0]) {
+        FILETIME identity;
+        if (!identity_to_filetime(state->identity, &identity)) return 0;
+        return filetimes_within_tol(filetime_to_ull(identity), actual,
+                                    2ULL * 10000000ULL);
+    }
+    if (!state->started_at[0] ||
+        !iso8601_to_filetimes(state->started_at, &expected_utc, &expected_local,
+                              &have_local))
+        return 0;
+    if (filetimes_within_tol(filetime_to_ull(expected_utc), actual,
+                             NM_PID_REUSE_TOL_FT))
+        return 1;
+    return have_local && filetimes_within_tol(filetime_to_ull(expected_local), actual,
+                                               NM_PID_REUSE_TOL_FT);
+}
+
+int nanobot_detect_running_port(int configured_port, int* out_port) {
+    if (out_port) *out_port = 0;
+    nm_gateway_state state;
+    ZeroMemory(&state, sizeof(state));
+    if (nanobot_read_gateway_state(&state) == 0 && state.found &&
+        state.port >= 1 && state.port <= 65535 &&
+        gateway_state_pid_is_verified_live(&state) && nanobot_check_running(state.port)) {
+        if (out_port) *out_port = state.port;
+        return 1;
+    }
+    if (configured_port >= 1 && configured_port <= 65535 &&
+        (!state.found || state.port != configured_port) && nanobot_check_running(configured_port)) {
+        if (out_port) *out_port = configured_port;
+        return 1;
+    }
+    return 0;
+}
+
 /* P3a: `nanobot gateway --background` spawns a short-lived launcher that forks
  * the real foreground gateway, writes ~/.nanobot/run/gateway.json, and exits
  * within ~1s. We must NOT keep the launcher's handle: WaitForSingleObject on it
@@ -1007,10 +1200,22 @@ int nanobot_read_gateway_state(nm_gateway_state* out) {
  * WaitForSingleObject + CloseHandle. If you store the launcher handle, the
  * health/death detector will report a "crash" ~1s after every successful start.
  */
-int nanobot_start(const char* exe, int is_python, int* out_pid) {
+int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
+                   int* out_effective_health_port) {
     if (out_pid) *out_pid = 0;
+    if (out_effective_health_port) *out_effective_health_port = health_port;
+    if (!exe || !exe[0] || health_port < 1 || health_port > 65535)
+        return ERROR_INVALID_PARAMETER;
 
-    STARTUPINFOA si;
+    /* A mismatched-port record must prove process identity before we publish
+     * it. Keep the prior PID so recovery only terminates a process this launch
+     * demonstrably replaced, never a pre-existing instance. */
+    nm_gateway_state prior_state;
+    ZeroMemory(&prior_state, sizeof(prior_state));
+    int prior_state_found = nanobot_read_gateway_state(&prior_state) == 0 &&
+                            prior_state.found && prior_state.pid > 0;
+
+    STARTUPINFOW si;
     PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -1019,25 +1224,34 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
 
     /* Workdir-derivation (unchanged from pre-P3a): strip the last path
      * component from the exe path so nanobot runs from its install dir. */
-    char workdir[MAX_PATH];
-    strncpy(workdir, exe, MAX_PATH - 1);
-    workdir[MAX_PATH - 1] = '\0';
-    char* slash = strrchr(workdir, '\\');
-    if (!slash) slash = strrchr(workdir, '/');
+    wchar_t* wide_exe = utf8_to_wide_alloc(exe);
+    if (!wide_exe) return ERROR_NO_UNICODE_TRANSLATION;
+    wchar_t* workdir = _wcsdup(wide_exe);
+    if (!workdir) { free(wide_exe); return ERROR_NOT_ENOUGH_MEMORY; }
+    wchar_t* slash = wcsrchr(workdir, L'\\');
+    if (!slash) slash = wcsrchr(workdir, L'/');
     if (slash) *slash = '\0'; else workdir[0] = '\0';
 
     /* P3a: append --background. The launcher forks the foreground gateway,
      * writes the state file, and exits fast. */
-    char cmdline[MAX_PATH * 2];
-    snprintf(cmdline, sizeof(cmdline),
-        is_python ? "\"%s\" -m nanobot gateway --background"
-                  : "\"%s\" gateway --background",
-        exe);
+    wchar_t arguments[96];
+    swprintf_s(arguments, _countof(arguments),
+        is_python ? L" -m nanobot gateway --background --port %d"
+                  : L" gateway --background --port %d", health_port);
+    wchar_t* cmdline = build_command_line(wide_exe, arguments);
+    if (!cmdline) { free(workdir); free(wide_exe); return ERROR_NOT_ENOUGH_MEMORY; }
 
-    if (!CreateProcessA(NULL, cmdline, NULL, NULL, FALSE,
+    FILETIME launcher_started_ft;
+    GetSystemTimeAsFileTime(&launcher_started_ft);
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
             CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
             NULL, workdir[0] ? workdir : NULL, &si, &pi))
-        return (int)GetLastError();
+    {
+        int error = (int)GetLastError();
+        free(cmdline); free(workdir); free(wide_exe);
+        return error;
+    }
+    free(cmdline); free(workdir); free(wide_exe);
 
     /* --- The launcher is short-lived: wait for it to finish writing the state
      * file, then close BOTH handles immediately. We NEVER keep the launcher
@@ -1070,12 +1284,17 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
         Sleep(200);
     }
     if (!got_pid) {
+        if (wait == WAIT_OBJECT_0 && dwExit != 0) {
+            process_log("nanobot_start: launcher exit=%lu; no valid gateway pid", dwExit);
+            return NANOBOT_START_LAUNCHER_FAILED;
+        }
         process_log("nanobot_start: state file missing or no pid after ~2s");
         return NANOBOT_START_NO_STATEFILE;
     }
 
-    process_log("nanobot_start: state file reports pid=%d port=%d identity=%s",
-        (int)gs.pid, gs.port, gs.identity[0] ? gs.identity : "(none)");
+    process_log("nanobot_start: expected port=%d; state file reports pid=%d port=%d identity=%s%s",
+        health_port, (int)gs.pid, gs.port, gs.identity[0] ? gs.identity : "(none)",
+        gs.port > 0 && gs.port != health_port ? " (port mismatch)" : "");
 
     /* --- OpenProcess the real gateway pid. If the pid is ALREADY dead the
      * state file is stale (left over from a prior run); give the new launcher
@@ -1084,8 +1303,10 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) Sleep(200);    /* let the launcher overwrite stale file */
 
-        h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                        FALSE, gs.pid);
+        DWORD process_access = SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+        if (gs.port >= 1 && gs.port <= 65535 && gs.port != health_port)
+            process_access |= PROCESS_TERMINATE;
+        h = OpenProcess(process_access, FALSE, gs.pid);
         if (!h) {
             process_log("nanobot_start: OpenProcess(pid=%d) failed err=%d",
                 (int)gs.pid, (int)GetLastError());
@@ -1113,7 +1334,7 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
          * (defense-in-depth, not a gate). */
         {
             FILETIME create_check;
-            if (!GetProcessTimes(h, &create_check, NULL, NULL, NULL)) {
+            if (!get_process_creation_time(h, &create_check)) {
                 process_log("nanobot_start: PID-reuse cross-check skipped "
                     "(GetProcessTimes failed) pid=%d", (int)gs.pid);
                 break;                  /* live handle; check inert */
@@ -1192,6 +1413,71 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
         return NANOBOT_START_STALE_PID;
     }
 
+    /* Only the port-mismatch path changes the endpoint we expose.  Wait for
+     * the writer to finish refreshing identity/started_at, then trust it only
+     * when the live process matches that record. */
+    if (gs.port >= 1 && gs.port <= 65535 && gs.port != health_port) {
+        int verified = gateway_state_pid_is_verified_live(&gs);
+        for (int attempt = 0; !verified && attempt < 10; attempt++) {
+            nm_gateway_state refreshed;
+            Sleep(200);
+            ZeroMemory(&refreshed, sizeof(refreshed));
+            if (nanobot_read_gateway_state(&refreshed) != 0 || !refreshed.found ||
+                refreshed.pid == 0)
+                continue;
+            if (refreshed.pid != gs.pid) {
+                HANDLE refreshed_handle = OpenProcess(
+                    SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                    FALSE, refreshed.pid);
+                if (!refreshed_handle ||
+                    WaitForSingleObject(refreshed_handle, 0) == WAIT_OBJECT_0) {
+                    if (refreshed_handle) CloseHandle(refreshed_handle);
+                    continue;
+                }
+                CloseHandle(h);
+                h = refreshed_handle;
+                process_log("nanobot_start: state record refreshed to pid=%d while verifying port mismatch",
+                            (int)refreshed.pid);
+            }
+            gs = refreshed;
+            if (gs.port < 1 || gs.port > 65535 || gs.port == health_port)
+                break; /* requested-port compatibility path remains unchanged */
+            verified = gateway_state_pid_is_verified_live(&gs);
+        }
+        if (gs.port >= 1 && gs.port <= 65535 && gs.port != health_port && !verified) {
+            FILETIME candidate_creation_ft;
+            int candidate_creation_known = get_process_creation_time(
+                h, &candidate_creation_ft) ? 1 : 0;
+            int ownership_proven = nanobot_unverified_candidate_is_owned(
+                wait, dwExit, gs.pid, prior_state_found, prior_state.pid,
+                candidate_creation_known, candidate_creation_ft, launcher_started_ft);
+            process_log("nanobot_start: refusing unverified state candidate pid=%d port=%d",
+                        (int)gs.pid, gs.port);
+            if (ownership_proven) {
+                if (TerminateProcess(h, ERROR_INVALID_DATA)) {
+                    DWORD terminate_wait = WaitForSingleObject(h, 5000);
+                    process_log("nanobot_start: cleanup performed for unverified candidate pid=%d wait=%lu",
+                                (int)gs.pid, (unsigned long)terminate_wait);
+                } else {
+                    process_log("nanobot_start: cleanup failed for owned unverified candidate pid=%d err=%d",
+                                (int)gs.pid, (int)GetLastError());
+                }
+            } else {
+                process_log("nanobot_start: cleanup skipped because ownership is unproven");
+            }
+            CloseHandle(h);
+            return NANOBOT_START_UNVERIFIED_STATE;
+        }
+    }
+
+    int effective_port = (gs.port >= 1 && gs.port <= 65535) ? gs.port : health_port;
+    if (effective_port != health_port)
+        process_log("nanobot_start: adopted actual health port=%d (requested=%d)",
+                    effective_port, health_port);
+    else if (gs.port < 1 || gs.port > 65535)
+        process_log("nanobot_start: state port invalid; using requested health port=%d",
+                    health_port);
+
     /* --- Live: capture creation time (PID-reuse guard for P4), then publish.
      * Close any previously-stored handle first to avoid a leak on re-start.
      * C2: route through nm_state_close_handle so an armed RegisterWait (e.g.
@@ -1216,7 +1502,9 @@ int nanobot_start(const char* exe, int is_python, int* out_pid) {
     nm_state_set_resolved_is_python(is_python);
 
     if (out_pid) *out_pid = (int)gs.pid;
-    process_log("nanobot started (gateway pid=%d)", (int)gs.pid);
+    if (out_effective_health_port) *out_effective_health_port = effective_port;
+    process_log("nanobot started (gateway pid=%d health_port=%d)", (int)gs.pid,
+                effective_port);
     return 0;
 }
 
@@ -1244,7 +1532,7 @@ static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
         HANDLE q = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
         if (q) {
             FILETIME ft;
-            BOOL ok = GetProcessTimes(q, &ft, NULL, NULL, NULL);
+            BOOL ok = get_process_creation_time(q, &ft);
             CloseHandle(q);
             if (ok && filetime_to_ull(ft) != filetime_to_ull(*expected_create)) {
                 process_log("pid reuse suspected, skipping terminate pid=%u", (unsigned)pid);
@@ -1406,14 +1694,12 @@ int nanobot_stop(void) {
         }
     }
 
-    char cmdline[MAX_PATH * 2];
-    snprintf(cmdline, sizeof(cmdline),
-        resolved_is_python
-            ? "\"%s\" -m nanobot gateway stop --timeout 20"
-            : "\"%s\" gateway stop --timeout 20",
-        resolved_exe);
+    wchar_t* wide_exe = utf8_to_wide_alloc(resolved_exe);
+    wchar_t* cmdline = build_command_line(wide_exe,
+        resolved_is_python ? L" -m nanobot gateway stop --timeout 20"
+                           : L" gateway stop --timeout 20");
 
-    STARTUPINFOA si;
+    STARTUPINFOW si;
     PROCESS_INFORMATION stop_pi;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
@@ -1425,13 +1711,15 @@ int nanobot_stop(void) {
     }
 
     int spawned = 0;
-    if (CreateProcessA(NULL, cmdline, NULL, NULL, stdout_file ? TRUE : FALSE,
+    if (cmdline && CreateProcessW(NULL, cmdline, NULL, NULL, stdout_file ? TRUE : FALSE,
             CREATE_NO_WINDOW, NULL, NULL, &si, &stop_pi)) {
         spawned = 1;
     } else {
-        process_log("nanobot stop: CreateProcessA failed err=%d (escalating)",
+        process_log("nanobot stop: CreateProcessW failed err=%d (escalating)",
             (int)GetLastError());
     }
+    free(cmdline);
+    free(wide_exe);
 
     int stop_exit_code = -1;
     if (spawned) {

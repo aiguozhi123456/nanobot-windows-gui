@@ -3,6 +3,7 @@
 #include "autostart.h"
 #include "chat.h"
 #include "chat_ui.h"
+#include "credential.h"
 #include "version.h"
 
 #include "ui_core.h"
@@ -29,6 +30,7 @@ static int       g_tray_icon_owned = 0;
 static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
 static int       g_autostart_silent = 0;
+static int       g_effective_health_port = 18790;
 
 #define TIMER_UPTIME 1003
 #define ID_TRAY_SHOW 40001
@@ -38,11 +40,13 @@ static int       g_autostart_silent = 0;
 #define WM_TRAY_ICON            (WM_APP + 3)
 #define WM_CHILD_EXITED         (WM_APP + 4)   /* P5a: posted by the thread-pool wait callback
                                                 * when g_state.handle becomes signaled       */
-#define WM_ASYNC_HEALTH_RESULT  (WM_APP + 5)   /* WPARAM = running(0/1)                                       */
+#define WM_ASYNC_HEALTH_RESULT  (WM_APP + 5)   /* LPARAM = health_result_payload* (handler frees)             */
 #define WM_ASYNC_RESOLVE_DONE   (WM_APP + 6)   /* WPARAM = start_intent(0/1), LPARAM = resolve_payload* (malloc'd; handler frees) */
 #define WM_CHAT_EVENT           (WM_APP + 10)
 
 static void tray_remove(void);
+static int has_arg(LPCWSTR cmd, const wchar_t* arg);
+static int can_edit_gateway_port(void);
 
 static void show_main_window(void) {
     if (!g_win) return;
@@ -197,6 +201,16 @@ static void set_status(const char* status, const char* text, const char* sub) {
         ui_page_set_bool(g_page, "canStart", 1);
         ui_page_set_bool(g_page, "canStop", 0);
     }
+    ui_page_set_bool(g_page, "canEditGatewayPort", can_edit_gateway_port());
+}
+
+static int can_edit_gateway_port(void) {
+    nm_state state = nm_state_get();
+    return state == NM_STATE_IDLE || state == NM_STATE_DEAD;
+}
+
+static void refresh_effective_health_port(void) {
+    page_set_int("port", g_effective_health_port);
 }
 
 /* --- Status i18n (single-source keys) ---------------------------------------
@@ -216,6 +230,7 @@ static const status_i18n_entry g_status_i18n[] = {
     { "status_exited_sub",           "nanobot 网关已退出",             "nanobot gateway exited" },
     { "status_starting",             "启动中…",                        "Starting…" },
     { "status_starting_sub",         "等待健康检查",                   "Waiting for health check" },
+    { "status_health_worker_failed_sub", "状态检测线程无法启动",          "Health-check worker could not be started" },
     { "status_stopping",             "停止中…",                        "Stopping…" },
     { "status_stopping_sub",         "正在关闭 nanobot",               "Shutting down nanobot" },
     { "status_detecting",            "检测中…",                        "Detecting…" },
@@ -223,6 +238,10 @@ static const status_i18n_entry g_status_i18n[] = {
     { "status_not_found",            "未找到",                         "Not found" },
     { "status_not_found_sub",        "找不到 nanobot，请安装或设置路径",
                                      "Cannot find nanobot. Please install or set path." },
+    { "status_incompatible",         "版本不兼容",                     "Incompatible version" },
+    { "status_incompatible_sub",     "需要 nanobot-ai >= 0.2.2（缺少 gateway --background）", "Requires nanobot-ai >= 0.2.2 (missing gateway --background)" },
+    { "status_probe_failed",         "检测失败",                       "Detection failed" },
+    { "status_probe_failed_sub",     "无法检测 nanobot 的 gateway --background 支持", "Could not probe nanobot gateway --background support" },
     { "status_start_fail",           "启动失败",                       "Start failed" },
     { "status_not_installed",        "未安装",                         "Not installed" },
     { "status_not_installed_sub",    "nanobot 未安装",                 "nanobot is not installed" },
@@ -230,6 +249,8 @@ static const status_i18n_entry g_status_i18n[] = {
                                      "Background launcher did not write state file" },
     { "status_fail_open_failed_sub", "OpenProcess 失败",               "OpenProcess failed" },
     { "status_fail_stale_pid_sub",   "状态文件中的 PID 已失效",        "State file PID is stale" },
+    { "status_fail_launcher_sub",    "后台启动器异常退出，未发现有效网关进程", "Background launcher exited without a valid gateway process" },
+    { "status_fail_unverified_state_sub", "状态记录身份无法验证",       "State record identity cannot be verified" },
 };
 
 static const char* t_status(const char* key) {
@@ -246,6 +267,36 @@ static const char* t_status(const char* key) {
 static void set_status_i18n(const char* status,
                             const char* text_key, const char* sub_key) {
     set_status(status, t_status(text_key), t_status(sub_key));
+}
+
+static void apply_resolve_failure(void) {
+    nm_state state = nm_state_get();
+    if (state == NM_STATE_RUNNING || state == NM_STATE_STARTING ||
+        state == NM_STATE_STOPPING)
+        return;
+
+    nm_state_set_state(NM_STATE_IDLE);
+    nm_state_set_installed(0);
+    set_status_i18n("stopped", "status_probe_failed", "status_probe_failed_sub");
+    ui_page_set_bool(g_page, "installed", 0);
+    ui_page_set_bool(g_page, "canStart", 0);
+    ui_page_set_bool(g_page, "canStop", 0);
+}
+
+static void apply_health_worker_failure(void) {
+    nm_state state = nm_state_get();
+    if (state == NM_STATE_RUNNING || state == NM_STATE_STOPPING)
+        return;
+    if (state == NM_STATE_STARTING) {
+        set_status_i18n("starting", "status_starting", "status_health_worker_failed_sub");
+        return;
+    }
+    if (state == NM_STATE_RESOLVING) {
+        nm_state_set_state(NM_STATE_IDLE);
+        set_status_i18n("stopped", "status_probe_failed", "status_probe_failed_sub");
+        ui_page_set_bool(g_page, "canStart", 0);
+        ui_page_set_bool(g_page, "canStop", 0);
+    }
 }
 
 /* Append "key=value\n" to a language blob buffer. Returns 0 on overflow. */
@@ -279,8 +330,11 @@ static int append_status_i18n_lang(char* buf, size_t cap, size_t* used, int zh) 
  * every successful probe and on every fresh start. */
 static int s_health_fail_streak = 0;
 
-static void apply_health_result(int running) {
+static void apply_health_result(int running, int actual_port) {
     if (running) {
+        if (actual_port >= 1 && actual_port <= 65535)
+            g_effective_health_port = actual_port;
+        refresh_effective_health_port();
         s_health_fail_streak = 0;
         /* P5b: if we discovered a running gateway we didn't start (manager
          * relaunch with the gateway still up, or an externally-started
@@ -308,7 +362,10 @@ static void apply_health_result(int running) {
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
         if (!chat_is_ready()) {
-            chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
+            char secret[128] = {0};
+            credential_load(secret, sizeof(secret), NULL);
+            chat_set_endpoint(g_cfg.webui_port, secret);
+            SecureZeroMemory(secret, sizeof(secret));
             chat_connect();
         }
         return;
@@ -344,6 +401,8 @@ static void apply_health_result(int running) {
     s_health_fail_streak = 0;
     stop_uptime_timer();
     nm_state_set_pid(0);
+    g_effective_health_port = g_cfg.health_check_port;
+    refresh_effective_health_port();
     chat_disconnect_async();
     chat_ui_on_gateway_stopped();
 }
@@ -353,22 +412,28 @@ static void apply_health_result(int running) {
  * synchronous loop, which has no UI thread). Posts WM_ASYNC_HEALTH_RESULT; the
  * UI thread never blocks on HTTP.
  *
- * Generation counter: each kick increments g_health_gen and the fresh worker
- * captures its own gen. A newer kick stale-marks older workers, which exit on
- * the next bail check without posting more results. */
+ * Generation counter: each successful kick increments g_health_gen and passes
+ * the generation to its worker. A newer kick stale-marks older workers, which
+ * exit on the next bail check without posting more results. */
 static volatile LONG g_health_gen = 0;
 
+typedef struct { HWND hwnd; LONG gen; int configured_port; } health_ctx;
+typedef struct { int running; int actual_port; } health_result_payload;
+
 static DWORD WINAPI health_worker(LPVOID param) {
-    HWND hwnd = (HWND)param;
-    LONG my_gen = InterlockedIncrement(&g_health_gen);
-    int  port   = g_cfg.health_check_port;
+    health_ctx* c = (health_ctx*)param;
+    HWND hwnd = c->hwnd;
+    LONG my_gen = c->gen;
+    int configured_port = c->configured_port;
+    free(c);
 
     static const int cadence[] = {1000,1000,1500,2000,2000,3000,3000,5000,5000,5000};
     const int boot_count = (int)(sizeof(cadence) / sizeof(cadence[0]));
     int i = 0;
 
     for (;;) {
-        int running = nanobot_check_running(port);
+        int actual_port = 0;
+        int running = nanobot_detect_running_port(configured_port, &actual_port);
 
         /* M7: bail BEFORE posting so a superseded worker does not inject a
          * stale result after a newer kick. The stale blip was masked by streak
@@ -382,7 +447,12 @@ static DWORD WINAPI health_worker(LPVOID param) {
         if (s != NM_STATE_STARTING && s != NM_STATE_RUNNING && s != NM_STATE_RESOLVING)
             return 0;
 
-        PostMessageW(hwnd, WM_ASYNC_HEALTH_RESULT, (WPARAM)(running ? 1 : 0), 0);
+        health_result_payload* result = (health_result_payload*)malloc(sizeof(*result));
+        if (!result) return 0;
+        result->running = running;
+        result->actual_port = actual_port;
+        if (!PostMessageW(hwnd, WM_ASYNC_HEALTH_RESULT, 0, (LPARAM)result))
+            free(result);
 
         int delay = (i < boot_count) ? cadence[i] : 15000;
         Sleep(delay);
@@ -392,8 +462,23 @@ static DWORD WINAPI health_worker(LPVOID param) {
 }
 
 static void kick_health_worker(HWND hwnd) {
-    InterlockedIncrement(&g_health_gen);  /* stale-mark any running worker    */
-    CloseHandle(CreateThread(NULL, 0, health_worker, hwnd, 0, NULL));
+    health_ctx* c = (health_ctx*)calloc(1, sizeof(health_ctx));
+    if (!c) {
+        apply_health_worker_failure();
+        return;
+    }
+    c->hwnd = hwnd;
+    c->configured_port = g_effective_health_port;
+
+    HANDLE thread = CreateThread(NULL, 0, health_worker, c, CREATE_SUSPENDED, NULL);
+    if (thread) {
+        c->gen = InterlockedIncrement(&g_health_gen);
+        ResumeThread(thread);
+        CloseHandle(thread);
+    } else {
+        free(c);
+        apply_health_worker_failure();
+    }
 }
 
 /* --- Resolve worker -------------------------------------------------------- */
@@ -415,6 +500,7 @@ typedef struct {
     int       is_python;
     nm_source source;     /* diagnostic only */
     int       found;
+    nm_resolution_status status;
 } resolve_payload;        /* heap; handler frees exe + struct on every path */
 
 static DWORD WINAPI resolve_worker(LPVOID param) {
@@ -432,8 +518,15 @@ static DWORD WINAPI resolve_worker(LPVOID param) {
     free(c);                  /* frees the ctx struct (path_snap preserved in local) */
 
     resolve_payload* p = (resolve_payload*)calloc(1, sizeof(resolve_payload));
+    if (!p) {
+        PostMessageW(hwnd, WM_ASYNC_RESOLVE_DONE, (WPARAM)start_intent, 0);
+        free(path_snap);
+        return 0;
+    }
     nm_resolution res;
-    if (nanobot_resolve(&cfg_snap, &res, 0) && res.found) {
+    nanobot_resolve(&cfg_snap, &res, 0);
+    p->status = res.status;
+    if (res.found) {
         p->exe        = res.exe;            /* take ownership (no double-strdup) */
         p->is_python  = res.is_python;
         p->source     = res.source;
@@ -452,26 +545,56 @@ static DWORD WINAPI resolve_worker(LPVOID param) {
 }
 
 static void kick_resolve_worker(HWND hwnd, int start_intent) {
+    nm_state previous_state = nm_state_get();
     resolve_ctx* c = (resolve_ctx*)calloc(1, sizeof(resolve_ctx));
-    if (!c) return;
+    if (!c) {
+        apply_resolve_failure();
+        return;
+    }
     c->hwnd = hwnd;
     c->start_intent = start_intent;
     /* I1: snapshot nanobot_path on the UI thread (serialized with on_change_path). */
     c->nanobot_path_snap = _strdup(g_cfg.nanobot_path ? g_cfg.nanobot_path : "");
-    /* M2: reflect the resolving phase. Cleared in on_resolve_done (-> STARTING
-     * on start success, -> IDLE on terminal paths) and in apply_health_result
-     * (-> RUNNING / IDLE). */
-    nm_state_set_state(NM_STATE_RESOLVING);
-    CloseHandle(CreateThread(NULL, 0, resolve_worker, c, 0, NULL));
+    if (!c->nanobot_path_snap) {
+        free(c);
+        apply_resolve_failure();
+        return;
+    }
+    /* A path probe must never overwrite a live gateway lifecycle state. */
+    if (previous_state != NM_STATE_RUNNING && previous_state != NM_STATE_STARTING &&
+        previous_state != NM_STATE_STOPPING) {
+        nm_state_set_state(NM_STATE_RESOLVING);
+        ui_page_set_bool(g_page, "canEditGatewayPort", 0);
+    }
+    HANDLE thread = CreateThread(NULL, 0, resolve_worker, c, 0, NULL);
+    if (thread) {
+        CloseHandle(thread);
+    } else {
+        free(c->nanobot_path_snap);
+        free(c);
+        apply_resolve_failure();
+    }
 }
 
 /* UI-thread handler for WM_ASYNC_RESOLVE_DONE. Frees payload (exe + struct)
  * on every return path. */
 static void on_resolve_done(resolve_payload* p, int start_intent) {
-    if (!p) return;
+    if (!p) {
+        apply_resolve_failure();
+        return;
+    }
 
-    nm_state_set_installed(p->found ? 1 : 0);
-    ui_page_set_bool(g_page, "installed", p->found ? 1 : 0);
+    nm_state state = nm_state_get();
+    if (state == NM_STATE_RUNNING || state == NM_STATE_STARTING ||
+        state == NM_STATE_STOPPING) {
+        free(p->exe);
+        free(p);
+        return;
+    }
+
+    int detected = p->status != NM_RES_NOT_FOUND;
+    nm_state_set_installed(detected ? 1 : 0);
+    ui_page_set_bool(g_page, "installed", detected ? 1 : 0);
     ui_page_set_bool(g_page, "canStart",  p->found ? 1 : 0);
 
     if (p->exe) {
@@ -483,7 +606,14 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
     if (!p->found) {
         /* M2: resolve failed -> settle to IDLE (clears RESOLVING). */
         nm_state_set_state(NM_STATE_IDLE);
-        set_status_i18n("stopped", "status_not_found", "status_not_found_sub");
+        if (p->status == NM_RES_INCOMPATIBLE)
+            set_status_i18n("stopped", "status_incompatible", "status_incompatible_sub");
+        else if (p->status == NM_RES_PROBE_FAILED)
+            set_status_i18n("stopped", "status_probe_failed", "status_probe_failed_sub");
+        else
+            set_status_i18n("stopped", "status_not_found", "status_not_found_sub");
+        ui_page_set_bool(g_page, "canStart", 0);
+        ui_page_set_bool(g_page, "canStop", 0);
         free(p->exe);
         free(p);
         return;
@@ -491,11 +621,15 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
 
     if (start_intent) {
         int pid_local = 0;
-        int rc = nanobot_start(p->exe, p->is_python, &pid_local);
+        int effective_port = g_cfg.health_check_port;
+        int rc = nanobot_start(p->exe, p->is_python, g_cfg.health_check_port,
+                               &pid_local, &effective_port);
 
         if (rc == 0) {
             nm_state_set_state(NM_STATE_STARTING);   /* M2: clears RESOLVING */
             nm_state_set_pid((DWORD)pid_local);
+            g_effective_health_port = effective_port;
+            refresh_effective_health_port();
             set_status_i18n("starting", "status_starting", "status_starting_sub");
             page_set_int("pid", pid_local);
             HWND hwnd = (HWND)ui_window_hwnd(g_win);
@@ -516,6 +650,10 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
                 hint_key = "status_fail_open_failed_sub";
             else if (rc == NANOBOT_START_STALE_PID)
                 hint_key = "status_fail_stale_pid_sub";
+            else if (rc == NANOBOT_START_LAUNCHER_FAILED)
+                hint_key = "status_fail_launcher_sub";
+            else if (rc == NANOBOT_START_UNVERIFIED_STATE)
+                hint_key = "status_fail_unverified_state_sub";
             char buf[256];
             if (is_zh())
                 snprintf(buf, sizeof(buf), "启动失败 (错误 %d)", rc);
@@ -550,7 +688,11 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         return 0;
     }
     if (msg == WM_ASYNC_HEALTH_RESULT) {
-        apply_health_result((int)wp);
+        health_result_payload* result = (health_result_payload*)lp;
+        if (result) {
+            apply_health_result(result->running, result->actual_port);
+            free(result);
+        }
         return 0;
     }
     if (msg == WM_ASYNC_STOP_DONE) {
@@ -560,6 +702,8 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         set_status_i18n("stopped", "status_stopped", "status_stopped_sub");
         stop_uptime_timer();
         nm_state_set_pid(0);
+        g_effective_health_port = g_cfg.health_check_port;
+        refresh_effective_health_port();
         s_health_fail_streak = 0;
         chat_disconnect_async();
         chat_ui_on_gateway_stopped();
@@ -594,6 +738,8 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         s_health_fail_streak = 0;
         set_status_i18n("stopped", "status_stopped", "status_exited_sub");
         stop_uptime_timer();
+        g_effective_health_port = g_cfg.health_check_port;
+        refresh_effective_health_port();
         chat_disconnect_async();
         chat_ui_on_gateway_stopped();
         return 0;
@@ -695,13 +841,39 @@ static void on_change_path(UiWidget w, void* ud) {
 
     if (GetOpenFileNameW(&ofn)) {
         char utf8[MAX_PATH];
-        WideCharToMultiByte(CP_UTF8, 0, file, -1, utf8, MAX_PATH, NULL, NULL);
+        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, file, -1,
+                                 utf8, _countof(utf8), NULL, NULL)) {
+            MessageBoxW((HWND)ui_window_hwnd(g_win),
+                is_zh() ? L"路径无法转换为 UTF-8。" : L"The path could not be converted to UTF-8.",
+                is_zh() ? L"保存失败" : L"Save failed", MB_OK | MB_ICONERROR);
+            return;
+        }
 
-        if (g_cfg.nanobot_path) free(g_cfg.nanobot_path);
-        g_cfg.nanobot_path = _strdup(utf8);
-        config_save(&g_cfg);
+        char* new_path = _strdup(utf8);
+        if (!new_path) {
+            MessageBoxW((HWND)ui_window_hwnd(g_win),
+                is_zh() ? L"内存不足，路径未更改。" : L"Out of memory. The path was not changed.",
+                is_zh() ? L"保存失败" : L"Save failed", MB_OK | MB_ICONERROR);
+            return;
+        }
+        app_config proposed = g_cfg;
+        proposed.nanobot_path = new_path;
+        if (config_save(&proposed) != 0) {
+            wchar_t message[256];
+            swprintf_s(message, _countof(message),
+                is_zh() ? L"无法保存路径（错误 %lu）。路径未更改。"
+                        : L"Could not save path (error %lu). The path was not changed.",
+                (unsigned long)config_get_last_error());
+            MessageBoxW((HWND)ui_window_hwnd(g_win), message,
+                is_zh() ? L"保存失败" : L"Save failed", MB_OK | MB_ICONERROR);
+            free(new_path);
+            return;
+        }
+        free(g_cfg.nanobot_path);
+        g_cfg.nanobot_path = new_path;
 
         ui_page_set_text(g_page, "nanobotPath", file);
+        kick_resolve_worker((HWND)ui_window_hwnd(g_win), 0);
     }
 }
 
@@ -718,54 +890,256 @@ static void on_btn_send_mount(UiPage p, UiWidget w, void* ud) {
     chat_ui_mount_send(p, w, NULL);
 }
 
-/* Apply WebUI port + auth from the Network section of the settings page. */
+static void restore_webui_port_input(void) {
+    wchar_t port[16];
+    swprintf_s(port, _countof(port), L"%d",
+               g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
+    ui_page_set_text(g_page, "webuiPort", port);
+}
+
+static void restore_health_port_input(void) {
+    wchar_t port[16];
+    swprintf_s(port, _countof(port), L"%d", g_cfg.health_check_port);
+    ui_page_set_text(g_page, "healthPort", port);
+}
+
+static int read_port_input(const char* name, int* out_port) {
+    char* raw = ui_page_get_json(g_page, name);
+    if (!raw) return 0;
+    cJSON* value = cJSON_Parse(raw);
+    ui_page_free(raw);
+    if (!value) return 0;
+    int valid = cJSON_IsString(value) && value->valuestring &&
+        config_parse_port(value->valuestring, out_port);
+    cJSON_Delete(value);
+    return valid;
+}
+
+static void set_chat_endpoint_from_credential(int reconnect) {
+    char secret[128] = {0};
+    credential_load(secret, sizeof(secret), NULL);
+    chat_set_endpoint(g_cfg.webui_port, secret);
+    SecureZeroMemory(secret, sizeof(secret));
+    if (reconnect) chat_reconnect_async();
+}
+
+static void update_credential_ui(void) {
+    char secret[128] = {0};
+    DWORD error = ERROR_SUCCESS;
+    int state = credential_load(secret, sizeof(secret), &error);
+    SecureZeroMemory(secret, sizeof(secret));
+    if (state == 1) {
+        page_set("credentialStatus", is_zh() ? "已安全保存" : "Securely saved");
+        ui_page_set_bool(g_page, "hasCredential", 1);
+    } else if (state == 0) {
+        page_set("credentialStatus", is_zh() ? "未设置" : "Not set");
+        ui_page_set_bool(g_page, "hasCredential", 0);
+    } else {
+        char text[96];
+        snprintf(text, sizeof(text), is_zh() ? "读取失败（错误 %lu）" : "Read failed (error %lu)",
+                 (unsigned long)error);
+        page_set("credentialStatus", text);
+        ui_page_set_bool(g_page, "hasCredential", 0);
+    }
+}
+
+typedef struct { HWND edit; int accepted; char secret[128]; } credential_prompt;
+#define IDC_CREDENTIAL_EDIT 5101
+#define IDC_CREDENTIAL_OK 5102
+#define IDC_CREDENTIAL_CANCEL 5103
+
+static LRESULT CALLBACK credential_prompt_proc(HWND hwnd, UINT message, WPARAM wp, LPARAM lp) {
+    credential_prompt* prompt = (credential_prompt*)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if (message == WM_NCCREATE) {
+        prompt = (credential_prompt*)((CREATESTRUCTW*)lp)->lpCreateParams;
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)prompt);
+    }
+    if (message == WM_CREATE) {
+        HWND label = CreateWindowExW(0, L"STATIC", is_zh() ? L"认证密钥：" : L"Bootstrap secret:", WS_CHILD | WS_VISIBLE, 18, 18, 290, 20, hwnd, NULL, NULL, NULL);
+        prompt->edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_PASSWORD | ES_AUTOHSCROLL, 18, 42, 290, 24, hwnd, (HMENU)(INT_PTR)IDC_CREDENTIAL_EDIT, NULL, NULL);
+        HWND ok = CreateWindowExW(0, L"BUTTON", is_zh() ? L"确定" : L"OK", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON, 150, 78, 76, 26, hwnd, (HMENU)(INT_PTR)IDC_CREDENTIAL_OK, NULL, NULL);
+        HWND cancel = CreateWindowExW(0, L"BUTTON", is_zh() ? L"取消" : L"Cancel", WS_CHILD | WS_VISIBLE | WS_TABSTOP, 232, 78, 76, 26, hwnd, (HMENU)(INT_PTR)IDC_CREDENTIAL_CANCEL, NULL, NULL);
+        if (!prompt || !label || !prompt->edit || !ok || !cancel) { DestroyWindow(hwnd); return -1; }
+        SetFocus(prompt->edit);
+        return 0;
+    }
+    if (message == WM_COMMAND && prompt && LOWORD(wp) == IDC_CREDENTIAL_OK) {
+        wchar_t input[128] = {0};
+        int length = GetWindowTextW(prompt->edit, input, _countof(input));
+        int valid = length >= 1 && length <= 127;
+        for (int i = 0; valid && i < length; i++) if (input[i] < 0x21 || input[i] > 0x7e) valid = 0;
+        if (!valid) {
+            MessageBoxW(hwnd, is_zh() ? L"请输入 1 到 127 个可打印 ASCII 字符。" : L"Enter 1 to 127 printable ASCII characters.", is_zh() ? L"无效密钥" : L"Invalid secret", MB_OK | MB_ICONERROR);
+            SecureZeroMemory(input, sizeof(input));
+            return 0;
+        }
+        for (int i = 0; i < length; i++) prompt->secret[i] = (char)input[i];
+        prompt->accepted = 1;
+        SecureZeroMemory(input, sizeof(input));
+        DestroyWindow(hwnd);
+        return 0;
+    }
+    if (message == WM_COMMAND && prompt && LOWORD(wp) == IDC_CREDENTIAL_CANCEL) { DestroyWindow(hwnd); return 0; }
+    if (message == WM_CLOSE) { DestroyWindow(hwnd); return 0; }
+    if (message == WM_NCDESTROY) SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    return DefWindowProcW(hwnd, message, wp, lp);
+}
+
+static int prompt_for_credential(HWND owner, char secret[128]) {
+    static ATOM prompt_class = 0;
+    if (!prompt_class) {
+        WNDCLASSW wc; ZeroMemory(&wc, sizeof(wc));
+        wc.lpfnWndProc = credential_prompt_proc; wc.hInstance = GetModuleHandleW(NULL);
+        wc.lpszClassName = L"nanobotManagerCredentialPrompt"; wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        prompt_class = RegisterClassW(&wc);
+        if (!prompt_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
+    }
+    credential_prompt prompt; ZeroMemory(&prompt, sizeof(prompt));
+    HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"nanobotManagerCredentialPrompt", is_zh() ? L"管理认证密钥" : L"Manage bootstrap secret", WS_CAPTION | WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 330, 145, owner, NULL, GetModuleHandleW(NULL), &prompt);
+    if (!dialog) return 0;
+    EnableWindow(owner, FALSE); ShowWindow(dialog, SW_SHOW);
+    MSG message;
+    int quit = 0, quit_code = 0;
+    while (IsWindow(dialog)) {
+        BOOL result = GetMessageW(&message, NULL, 0, 0);
+        if (result == -1) { DestroyWindow(dialog); break; }
+        if (result == 0) { quit = 1; quit_code = (int)message.wParam; DestroyWindow(dialog); break; }
+        if (!IsDialogMessageW(dialog, &message)) { TranslateMessage(&message); DispatchMessageW(&message); }
+    }
+    EnableWindow(owner, TRUE); SetForegroundWindow(owner);
+    if (prompt.accepted) memcpy(secret, prompt.secret, sizeof(prompt.secret));
+    SecureZeroMemory(prompt.secret, sizeof(prompt.secret));
+    if (quit) PostQuitMessage(quit_code);
+    return prompt.accepted;
+}
+
+static void on_manage_credential(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    char secret[128] = {0};
+    if (!prompt_for_credential((HWND)ui_window_hwnd(g_win), secret)) return;
+    DWORD error = ERROR_SUCCESS;
+    if (credential_store(secret, &error) == 0) { set_chat_endpoint_from_credential(1); update_credential_ui(); }
+    else {
+        wchar_t message[160];
+        swprintf_s(message, _countof(message), is_zh() ? L"无法保存认证密钥（错误 %lu）。" : L"Could not save credential (error %lu).", (unsigned long)error);
+        MessageBoxW((HWND)ui_window_hwnd(g_win), message, is_zh() ? L"保存失败" : L"Save failed", MB_OK | MB_ICONERROR);
+    }
+    SecureZeroMemory(secret, sizeof(secret));
+}
+
+static void on_clear_credential(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    HWND owner = (HWND)ui_window_hwnd(g_win);
+    if (MessageBoxW(owner, is_zh() ? L"确定要清除已保存的认证密钥吗？" : L"Clear the saved bootstrap secret?", is_zh() ? L"确认" : L"Confirm", MB_YESNO | MB_ICONWARNING) != IDYES) return;
+    DWORD error = ERROR_SUCCESS;
+    if (credential_delete(&error) == 0) { chat_set_endpoint(g_cfg.webui_port, ""); chat_reconnect_async(); update_credential_ui(); }
+    else {
+        wchar_t message[160];
+        swprintf_s(message, _countof(message), is_zh() ? L"无法清除认证密钥（错误 %lu）。" : L"Could not clear credential (error %lu).", (unsigned long)error);
+        MessageBoxW(owner, message, is_zh() ? L"清除失败" : L"Clear failed", MB_OK | MB_ICONERROR);
+    }
+}
+
+/* Apply gateway health and independent manager WebUI ports transactionally. */
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
-    /* Read webuiPort (number input may serialize as string or number) */
-    int new_port = 0;
-    char* raw_port = ui_page_get_json(g_page, "webuiPort");
-    if (raw_port) {
-        cJSON* jp = cJSON_Parse(raw_port);
-        if (jp && cJSON_IsString(jp))
-            new_port = atoi(jp->valuestring);
-        else if (jp && cJSON_IsNumber(jp))
-            new_port = jp->valueint;
-        cJSON_Delete(jp);
-        ui_page_free(raw_port);
-    }
-    if (new_port < 1 || new_port > 65535) {
-        /* Invalid: restore the current value and bail */
-        wchar_t wpw[16];
-        swprintf_s(wpw, _countof(wpw), L"%d",
-                   g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
-        ui_page_set_text(g_page, "webuiPort", wpw);
+    int new_health_port = 0, new_webui_port = 0;
+    if (!read_port_input("healthPort", &new_health_port) || !read_port_input("webuiPort", &new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
+    nm_state lifecycle = nm_state_get();
+    if (new_health_port != g_cfg.health_check_port && !can_edit_gateway_port()) {
+        restore_health_port_input();
+        MessageBoxW((HWND)ui_window_hwnd(g_win), is_zh() ? L"请停止 Gateway 后再修改 Gateway 端口。" : L"Stop the Gateway before changing its port.", is_zh() ? L"端口未修改" : L"Port not changed", MB_OK | MB_ICONINFORMATION);
         return;
     }
-    /* Read webuiAuth (optional) */
-    char new_auth[128] = {0};
-    char* raw_auth = ui_page_get_json(g_page, "webuiAuth");
-    if (raw_auth) {
-        cJSON* ja = cJSON_Parse(raw_auth);
-        if (ja && cJSON_IsString(ja) && ja->valuestring) {
-            strncpy(new_auth, ja->valuestring, sizeof(new_auth) - 1);
-            new_auth[sizeof(new_auth) - 1] = '\0';
-        }
-        cJSON_Delete(ja);
-        ui_page_free(raw_auth);
+    app_config proposed = g_cfg;
+    proposed.health_check_port = new_health_port;
+    proposed.webui_port = new_webui_port;
+    if (config_save(&proposed) != 0) {
+        wchar_t message[256];
+        if (is_zh())
+            swprintf_s(message, _countof(message), L"无法保存网络设置（错误 %lu）。输入内容未更改。",
+                       (unsigned long)config_get_last_error());
+        else
+            swprintf_s(message, _countof(message), L"Could not save network settings (error %lu). Your input was kept.",
+                       (unsigned long)config_get_last_error());
+        MessageBoxW((HWND)ui_window_hwnd(g_win), message,
+                    is_zh() ? L"保存失败" : L"Save failed", MB_OK | MB_ICONERROR);
+        return;
     }
-    g_cfg.webui_port = new_port;
-    strncpy(g_cfg.webui_auth, new_auth, sizeof(g_cfg.webui_auth) - 1);
-    g_cfg.webui_auth[sizeof(g_cfg.webui_auth) - 1] = '\0';
-    config_save(&g_cfg);
-    /* Sync into the chat subsystem and reconnect */
-    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
-    chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
-    chat_connect();
+    int webui_changed = g_cfg.webui_port != proposed.webui_port;
+    g_cfg.health_check_port = proposed.health_check_port;
+    g_cfg.webui_port = proposed.webui_port;
+    if (can_edit_gateway_port()) {
+        g_effective_health_port = g_cfg.health_check_port;
+        refresh_effective_health_port();
+    }
+    restore_health_port_input(); restore_webui_port_input();
+    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
+    if (webui_changed) set_chat_endpoint_from_credential(1);
 }
 
 static void on_btn_apply_network_mount(UiPage p, UiWidget w, void* ud) {
     (void)p; (void)ud;
     ui_widget_on_click(w, on_apply_network, NULL);
+}
+
+static void on_manage_credential_mount(UiPage p, UiWidget w, void* ud) { (void)p; (void)ud; ui_widget_on_click(w, on_manage_credential, NULL); }
+static void on_clear_credential_mount(UiPage p, UiWidget w, void* ud) { (void)p; (void)ud; ui_widget_on_click(w, on_clear_credential, NULL); }
+
+typedef enum { MIGRATION_SUCCESS, MIGRATION_CLEANUP_PENDING, MIGRATION_CONFLICT,
+               MIGRATION_FAILURE } migration_result;
+
+static int elevate_adjacent_legacy_scrub(void) {
+    wchar_t exe[MAX_PATH];
+    SHELLEXECUTEINFOW info;
+    DWORD exit_code = 1;
+    int present = 1;
+    if (!GetModuleFileNameW(NULL, exe, _countof(exe))) return 0;
+    ZeroMemory(&info, sizeof(info));
+    info.cbSize = sizeof(info);
+    info.fMask = SEE_MASK_NOCLOSEPROCESS;
+    info.lpVerb = L"runas";
+    info.lpFile = exe;
+    info.lpParameters = L"--scrub-adjacent-legacy-auth";
+    info.nShow = SW_HIDE;
+    if (!ShellExecuteExW(&info) || !info.hProcess) return 0;
+    WaitForSingleObject(info.hProcess, INFINITE);
+    GetExitCodeProcess(info.hProcess, &exit_code);
+    CloseHandle(info.hProcess);
+    return exit_code == 0 && config_adjacent_legacy_auth_present(&present) == 0 && !present;
+}
+
+static migration_result migrate_legacy_credential(void) {
+    if (!g_cfg.legacy_migration_pending) return MIGRATION_SUCCESS;
+    if (g_cfg.legacy_migration_pending != 1) return MIGRATION_FAILURE;
+    if (!g_cfg.legacy_webui_auth[0]) return MIGRATION_FAILURE;
+    char existing[128] = {0};
+    DWORD error = ERROR_SUCCESS;
+    int state = credential_load(existing, sizeof(existing), &error);
+    int safe_to_remove = 0;
+    if (state == 0) {
+        safe_to_remove = credential_store(g_cfg.legacy_webui_auth, &error) == 0;
+    } else if (state == 1) {
+        safe_to_remove = strcmp(existing, g_cfg.legacy_webui_auth) == 0;
+        if (!safe_to_remove) error = ERROR_ALREADY_EXISTS;
+    }
+    SecureZeroMemory(existing, sizeof(existing));
+    if (!safe_to_remove)
+        return error == ERROR_ALREADY_EXISTS ? MIGRATION_CONFLICT : MIGRATION_FAILURE;
+    app_config cleaned = g_cfg;
+    cleaned.legacy_migration_pending = 0;
+    SecureZeroMemory(cleaned.legacy_webui_auth, sizeof(cleaned.legacy_webui_auth));
+    if (config_save(&cleaned) != 0) return MIGRATION_FAILURE;
+    int scrubbed = 1;
+    if (g_cfg.legacy_source_path[0] &&
+        _wcsicmp(g_cfg.legacy_source_path, config_get_active_path()) != 0) {
+        scrubbed = config_scrub_legacy_auth(g_cfg.legacy_source_path) == 0;
+        if (!scrubbed && config_get_last_error() == ERROR_ACCESS_DENIED)
+            scrubbed = elevate_adjacent_legacy_scrub();
+    }
+    g_cfg.legacy_migration_pending = 0;
+    SecureZeroMemory(g_cfg.legacy_webui_auth, sizeof(g_cfg.legacy_webui_auth));
+    return scrubbed ? MIGRATION_SUCCESS : MIGRATION_CLEANUP_PENDING;
 }
 
 static void apply_theme(int mode) {
@@ -951,22 +1325,33 @@ static int run_autostart_mode(void) {
      * freeze). This is the documented exception to "no resolve/health on the
      * UI thread". */
     nm_resolution res;
-    if (!nanobot_resolve(&g_cfg, &res, 0) || !res.found) {
+    nanobot_resolve(&g_cfg, &res, 0);
+    if (!res.found) {
+        nm_state_set_installed(res.status != NM_RES_NOT_FOUND);
+        if (res.status == NM_RES_INCOMPATIBLE)
+            autostart_log("nanobot incompatible: requires nanobot-ai >= 0.2.2 (missing gateway --background)");
+        else if (res.status == NM_RES_PROBE_FAILED)
+            autostart_log("nanobot capability probe failed, skipping");
+        else
+            autostart_log("nanobot not installed, skipping");
         nm_resolution_free(&res);
-        nm_state_set_installed(0);
-        autostart_log("nanobot not installed, skipping");
         return 0;
     }
     nm_state_set_installed(1);
 
-    if (nanobot_check_running(g_cfg.health_check_port)) {
+    int detected_port = 0;
+    if (nanobot_detect_running_port(g_cfg.health_check_port, &detected_port)) {
         nm_resolution_free(&res);
-        autostart_log("nanobot already running");
+        char message[128];
+        snprintf(message, sizeof(message), "nanobot already running on health port %d", detected_port);
+        autostart_log(message);
         return 0;
     }
 
     int pid = 0;
-    int rc = nanobot_start(res.exe, res.is_python, &pid);
+    int effective_port = g_cfg.health_check_port;
+    int rc = nanobot_start(res.exe, res.is_python, g_cfg.health_check_port, &pid,
+                           &effective_port);
     nm_resolution_free(&res);
     if (rc != 0) {
         char buf[128];
@@ -981,7 +1366,7 @@ static int run_autostart_mode(void) {
     const int boot_count = (int)(sizeof(cadence) / sizeof(cadence[0]));
     for (int i = 0; i < boot_count; i++) {
         Sleep(cadence[i]);
-        if (nanobot_check_running(g_cfg.health_check_port)) {
+        if (nanobot_detect_running_port(effective_port, &detected_port)) {
             autostart_log("nanobot started and health check passed");
             /* M6: release the OpenProcess handle the manager won't track further
              * in this no-tray path (no watch was armed). OS would reclaim it on
@@ -1002,7 +1387,52 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     /* Initialize guarded process state before any worker thread or read/write. */
     nm_state_init();
 
-    config_load(&g_cfg);
+    if (has_arg(GetCommandLineW(), L"--delete-credential")) {
+        return credential_delete(NULL) == 0 ? 0 : 1;
+    }
+    if (has_arg(GetCommandLineW(), L"--scrub-adjacent-legacy-auth")) {
+        return config_scrub_adjacent_legacy_auth() == 0 ? 0 : 1;
+    }
+
+    if (config_load(&g_cfg) != 0) {
+        wchar_t message[MAX_PATH + 256];
+        swprintf_s(message, _countof(message),
+            L"无法读取配置，程序未启动。\nCould not load configuration; startup was cancelled.\n\n错误 / Error: %lu\n路径 / Path: %s",
+            (unsigned long)config_get_last_error(), config_get_active_path());
+        if (has_arg(GetCommandLineW(), L"--autostart"))
+            autostart_log("configuration load failed; autostart cancelled");
+        else
+            MessageBoxW(NULL, message, L"nanobot-manager - Configuration error", MB_OK | MB_ICONERROR);
+        config_free(&g_cfg);
+        return 1;
+    }
+    migration_result migration = migrate_legacy_credential();
+    if (migration == MIGRATION_CONFLICT) {
+        MessageBoxW(NULL,
+            L"旧配置密钥与 Credential Manager 中现有密钥不同；两个来源均未修改，程序未启动。\n"
+            L"The legacy secret conflicts with the Credential Manager value; neither source was changed and startup was cancelled.",
+            L"nanobot-manager - Credential migration", MB_OK | MB_ICONERROR);
+        config_free(&g_cfg);
+        return 1;
+    }
+    if (migration == MIGRATION_FAILURE) {
+        MessageBoxW(NULL,
+            L"旧认证密钥无法安全迁移，程序未启动。请先在原配置可写的环境中重试。\n"
+            L"The legacy credential could not be migrated safely; startup was cancelled.",
+            L"nanobot-manager - Credential migration", MB_OK | MB_ICONERROR);
+        config_free(&g_cfg);
+        return 1;
+    }
+    if (migration == MIGRATION_CLEANUP_PENDING) {
+        wchar_t warning[MAX_PATH + 256];
+        swprintf_s(warning, _countof(warning),
+            L"认证密钥和当前配置已安全迁移，但旧配置中的明文清理未完成（可能已取消 UAC），本次启动已取消。\n路径 / Path: %s\n\n"
+            L"Credential and active configuration were secured, but legacy plaintext cleanup is pending (the UAC request may have been cancelled). Startup was cancelled.\nPath: %s",
+            g_cfg.legacy_source_path, g_cfg.legacy_source_path);
+        MessageBoxW(NULL, warning, L"nanobot-manager - Credential migration", MB_OK | MB_ICONERROR);
+        config_free(&g_cfg);
+        return 1;
+    }
     g_tray_enabled_effective = g_cfg.stay_in_tray;
 
     LPCWSTR wcmd = GetCommandLineW();
@@ -1063,8 +1493,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "chat_placeholder=输入消息…\n"
             "chat_send=发送\n"
             "install_not_found=未找到 nanobot\n"
-            "install_hint=请安装：pip install nanobot-ai\n"
-            "metric_port=端口\n"
+            "install_hint=请安装：python -m pip install -U \"nanobot-ai>=0.2.2\"\n"
+            "metric_port=Gateway 端口\n"
             "metric_pid=进程\n"
             "metric_uptime=运行时间\n"
             "btn_start=启动\n"
@@ -1081,10 +1511,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_language=语言\n"
             "open_webui=打开 WebUI\n"
             "settings_network=网络\n"
+            "setting_gateway_port=Gateway 端口\n"
+            "setting_gateway_port_sub=用于 /health；下次启动生效\n"
             "setting_webui_port=WebUI 端口\n"
-            "setting_webui_port_sub=本地 WebSocket 网关端口\n"
-            "setting_webui_auth=认证密钥\n"
-            "setting_webui_auth_sub=可选，用于引导握手（tokenIssueSecret）\n"
+            "setting_webui_port_sub=仅 Manager 连接覆盖，与 Gateway 端口独立\n"
+            "setting_credential_status=认证密钥\n"
+            "setting_credential_manage=管理\n"
+            "setting_credential_clear=清除\n"
             "setting_apply=应用\n"
             "auto_detect=自动检测\n";
         const char* en_prefix =
@@ -1093,8 +1526,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "chat_placeholder=Type a message…\n"
             "chat_send=Send\n"
             "install_not_found=nanobot not found\n"
-            "install_hint=Please install: pip install nanobot-ai\n"
-            "metric_port=Port\n"
+            "install_hint=Please install: python -m pip install -U \"nanobot-ai>=0.2.2\"\n"
+            "metric_port=Gateway Port\n"
             "metric_pid=PID\n"
             "metric_uptime=Uptime\n"
             "btn_start=Start\n"
@@ -1111,10 +1544,13 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_language=Language\n"
             "open_webui=Open WebUI\n"
             "settings_network=Network\n"
+            "setting_gateway_port=Gateway Port\n"
+            "setting_gateway_port_sub=Used for /health; applies on next start\n"
             "setting_webui_port=WebUI Port\n"
-            "setting_webui_port_sub=Local WebSocket gateway port\n"
-            "setting_webui_auth=Auth Secret\n"
-            "setting_webui_auth_sub=Optional, bootstrap handshake secret (tokenIssueSecret)\n"
+            "setting_webui_port_sub=Manager connection override only; independent of Gateway port\n"
+            "setting_credential_status=Bootstrap Secret\n"
+            "setting_credential_manage=Manage\n"
+            "setting_credential_clear=Clear\n"
             "setting_apply=Apply\n"
             "auto_detect=Auto-detect\n";
 
@@ -1160,8 +1596,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
 
     wchar_t port_w[16];
+    g_effective_health_port = g_cfg.health_check_port;
     swprintf_s(port_w, _countof(port_w), L"%d", g_cfg.health_check_port);
     ui_page_set_text(g_page, "port", port_w);
+    ui_page_set_text(g_page, "healthPort", port_w);
 
     if (g_cfg.nanobot_path && g_cfg.nanobot_path[0]) {
         wchar_t wpath[MAX_PATH];
@@ -1171,14 +1609,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         page_set("nanobotPath", is_zh() ? "自动检测" : "Auto-detect");
     }
 
-    /* WebUI port + auth initial values */
+    /* WebUI port and Credential Manager state initial values. */
     {
         wchar_t wpw[16];
         swprintf_s(wpw, _countof(wpw), L"%d",
                    g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
         ui_page_set_text(g_page, "webuiPort", wpw);
-        page_set("webuiAuth", g_cfg.webui_auth[0] ? g_cfg.webui_auth : "");
     }
+    update_credential_ui();
 
     apply_theme(g_cfg.theme_mode);
 
@@ -1196,7 +1634,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     /* Chat initial state */
     chat_ui_bind(g_page, is_zh);
-    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
+    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
     chat_ui_reset_idle();
 
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
@@ -1206,6 +1644,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_apply_network", on_btn_apply_network_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_manage_credential", on_manage_credential_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_clear_credential", on_clear_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_send", on_btn_send_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
@@ -1230,7 +1670,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_tray_enabled_effective)
         tray_add(hwnd);
 
-    chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
+    set_chat_endpoint_from_credential(0);
     chat_init(hwnd, WM_CHAT_EVENT);
 
     /* Initial detect (or start, for silent-tray) off the UI thread. UI shows

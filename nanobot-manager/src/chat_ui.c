@@ -10,7 +10,6 @@ static UiPage g_page = 0;
 static int (*g_is_zh)(void) = NULL;
 static int (*g_health_fn)(void) = NULL;
 static int g_webui_port = 8765;
-static char g_webui_auth[128] = {0};
 
 static cJSON* g_messages = NULL;
 static int g_msg_next_id = 1;
@@ -46,15 +45,9 @@ void chat_ui_bind(UiPage page, int (*is_zh_fn)(void)) {
     g_is_zh = is_zh_fn;
 }
 
-void chat_ui_set_gateway(int (*health_fn)(void), int webui_port, const char* webui_auth) {
+void chat_ui_set_gateway(int (*health_fn)(void), int webui_port) {
     g_health_fn = health_fn;
     g_webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
-    if (webui_auth) {
-        strncpy(g_webui_auth, webui_auth, sizeof(g_webui_auth) - 1);
-        g_webui_auth[sizeof(g_webui_auth) - 1] = '\0';
-    } else {
-        g_webui_auth[0] = '\0';
-    }
 }
 
 void chat_ui_status(const char* utf8) {
@@ -202,7 +195,7 @@ void chat_ui_on_event(WPARAM kind, char* detail) {
     free(detail);
 }
 
-void chat_ui_on_send(int health_running, int webui_port, const char* webui_auth) {
+void chat_ui_on_send(int health_running) {
     if (!g_page) return;
 
     char* raw = ui_page_get_json(g_page, "draft");
@@ -229,7 +222,6 @@ void chat_ui_on_send(int health_running, int webui_port, const char* webui_auth)
         chat_ui_status_i18n(
             "\xe8\xbf\x9e\xe6\x8e\xa5\xe4\xb8\xad\xe2\x80\xa6\xe8\xbf\x9e\xe6\x8e\xa5\xe5\x90\x8e\xe8\xaf\xb7\xe5\x86\x8d\xe6\xac\xa1\xe5\x8f\x91\xe9\x80\x81",
             "Connecting\xe2\x80\xa6 send again when connected");
-        chat_set_endpoint(webui_port, webui_auth);
         chat_connect();
         cJSON_Delete(j);
         return;
@@ -250,7 +242,7 @@ static void on_send_click(UiWidget w, void* ud) {
     (void)w;
     (void)ud;
     int running = g_health_fn ? g_health_fn() : 0;
-    chat_ui_on_send(running, g_webui_port, g_webui_auth);
+    chat_ui_on_send(running);
 }
 
 void chat_ui_mount_send(UiPage p, UiWidget w, void* ud) {

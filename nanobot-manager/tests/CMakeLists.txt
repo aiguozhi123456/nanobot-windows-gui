@@ -25,7 +25,18 @@ target_include_directories(test_config PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${cjson_SOURCE_DIR}
 )
-target_link_libraries(test_config PRIVATE cjson)
+target_link_libraries(test_config PRIVATE cjson shell32 ole32 advapi32)
+
+nm_add_test(test_credential ${CMAKE_SOURCE_DIR}/src/credential.c)
+target_include_directories(test_credential PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_credential PRIVATE advapi32)
+
+nm_add_test(test_process ${CMAKE_SOURCE_DIR}/src/process.c)
+target_include_directories(test_process PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${cjson_SOURCE_DIR}
+)
+target_link_libraries(test_process PRIVATE cjson winhttp shell32 ole32 advapi32)
 
 # autostart: real HKCU\...\Run round-trip (saves & restores the original value).
 # advapi32 provides the registry API used both in the test and in autostart.c.

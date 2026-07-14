@@ -8,7 +8,8 @@ Native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot). Prod
 |------|------|
 | `nanobot-manager/src/main.cpp` | WinMain, UI mount callbacks, tray, theme/locale, health timers, chat UI wiring |
 | `nanobot-manager/src/process.c` | Find/start/stop nanobot, WinHTTP `/health` |
-| `nanobot-manager/src/config.c` | `config.json` next to the exe (cJSON) |
+| `nanobot-manager/src/config.c` | installed/portable `config.json`, atomic saves, legacy secret migration (cJSON) |
+| `nanobot-manager/src/credential.c` | Windows Credential Manager storage for the WebUI bootstrap secret |
 | `nanobot-manager/src/chat.c` | WebUI bootstrap + WinHTTP WebSocket chat client (connect/send/stream) |
 | `nanobot-manager/src/autostart.c` | `HKCU\...\Run` value `nanobot-manager` → `"exe" --autostart` |
 | `nanobot-manager/ui/dashboard.uix` | Core UI SFC (layout + reactive state, chat page) |
@@ -44,18 +45,22 @@ scripts\package.bat
 
 → `nanobot-manager\dist\nanobot-manager-setup.exe` (runs `build.bat` first).
 
-No repo-level unit/integration test suite or CI for the manager. Verification = build + manual run.
+Native module tests run through CTest and CI uses the Windows MSVC build. Verification for release-facing changes = build + CTest + relevant manual run.
+
+```bat
+ctest --test-dir nanobot-manager\build -C Release --output-on-failure
+```
 
 ## Runtime behavior agents miss
 
-- **Start command**: `nanobot.exe gateway`, else `python.exe -m nanobot gateway` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`).
+- **Start command**: `nanobot.exe gateway --background --port N`, else `python.exe -m nanobot gateway --background --port N` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`). Full resolution probes for `--background` support.
 - **Health**: `GET http://localhost:{health_check_port}/health` via WinHTTP; HTTP 200 = running. Default port **18790**.
 - **WebUI open**: `http://localhost:{webui_port}` (default **8765**, independent of health port). Not `health_check_port + 1`.
-- **Chat**: native page talks to the same WebUI host via `GET /webui/bootstrap` then WebSocket (see `chat.c`). Optional `webui_auth` = gateway `tokenIssueSecret`.
+- **Chat**: native page talks to the same WebUI host via `GET /webui/bootstrap` then WebSocket (see `chat.c`). Optional gateway `tokenIssueSecret` is stored in Windows Credential Manager, not normal config or reactive UI state.
 - **`--autostart`**: if `stay_in_tray` is false → start nanobot (if needed) and exit; if tray enabled → silent tray + optional start. Logs: `nanobot-manager-autostart.log` / `nanobot-manager-process.log` beside exe.
 - **config.json** (exe directory) fields in code (README table is incomplete):
 
-  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port`, `webui_port` (default 8765), `webui_auth` (optional bootstrap secret), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`).
+  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port`, `webui_port` (default 8765), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`). Legacy `webui_auth` is migration-only and is never serialized.
 
 - **i18n**: zh/en strings are **embedded** in `main.cpp` via `ui_page_load_language_string`, not external `.lang` files. UI copy changes often need both `.uix` (`$t('key')`) and those strings.
 - **UI wiring**: widget `id`s in `dashboard.uix` must match `ui_page_on_widget_mount(..., "id", ...)` in `main.cpp`. Native clicks/toggles are mounted from C++; reactive fields use `ui_page_set_*` / page `data()`.
