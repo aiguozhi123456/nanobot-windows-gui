@@ -355,6 +355,24 @@ export default {
     color: var(--fg-on-accent);
   }
 
+  .btn-send:disabled {
+    background: var(--disabled-bg);
+    color: var(--disabled-text);
+    opacity: 1;
+    cursor: default;
+  }
+
+  .btn-send:disabled:hover {
+    background: var(--disabled-bg);
+    color: var(--disabled-text);
+    opacity: 1;
+    cursor: default;
+  }
+
+  .btn-send:disabled .btn-send-label {
+    color: var(--disabled-text);
+  }
+
   .settings-section-title {
     font-size: 11px;
     font-weight: 600;
@@ -616,7 +634,7 @@ export default {
             <label class="chat-status-text">{{ chatStatus }}</label>
           </div>
 
-          <ScrollView class="chat-scroll">
+          <ScrollView id="chat_scroll" class="chat-scroll">
             <div class="chat-list">
               <div v-if="messages.length == 0" class="chat-empty">
                 <svg class="chat-empty-icon" width="36" height="36" viewBox="0 0 24 24">

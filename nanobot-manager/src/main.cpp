@@ -22,6 +22,7 @@ static UiPage    g_page  = 0;
 static UiWindow  g_win   = 0;
 static app_config g_cfg  = {0};
 static UINT_PTR  g_uptime_timer = 0;
+static UINT_PTR  g_chat_ui_timer = 0;
 static int       g_theme_mode = 0;
 static int       g_tray_enabled_effective = 0;
 static int       g_allow_exit = 0;
@@ -33,6 +34,8 @@ static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
 
 #define TIMER_UPTIME 1003
+#define TIMER_CHAT_UI 1004
+#define CHAT_UI_FRAME_MS 33
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
 
@@ -160,6 +163,7 @@ static void update_uptime(void) {
 static VOID CALLBACK on_timer_uptime(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)tick;
     update_uptime();
+    chat_ui_tick(GetTickCount64());
 }
 
 static void start_uptime_timer(int pid) {
@@ -202,6 +206,11 @@ static void set_status(const char* status, const char* text, const char* sub) {
         ui_page_set_bool(g_page, "canStop", 0);
     }
     ui_page_set_bool(g_page, "canEditGatewayPort", can_edit_gateway_port());
+}
+
+static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    chat_ui_publish_tick();
 }
 
 static int can_edit_gateway_port(void) {
@@ -361,7 +370,7 @@ static void apply_health_result(int running, int actual_port) {
             start_uptime_timer((int)v.pid);
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
-        if (!chat_is_ready()) {
+        if (chat_needs_connect() && chat_ui_can_auto_connect()) {
             char secret[128] = {0};
             credential_load(secret, sizeof(secret), NULL);
             chat_set_endpoint(g_cfg.webui_port, secret);
@@ -745,7 +754,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         return 0;
     }
     if (msg == WM_CHAT_EVENT) {
-        chat_ui_on_event(wp, (char*)lp);
+        chat_ui_on_event(wp, (chat_event*)lp);
         return 0;
     }
     if (msg == WM_TRAY_ICON) {
@@ -883,11 +892,6 @@ static void on_open_webui(UiWidget w, void* ud) {
     int webui_port = g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765;
     swprintf_s(url, _countof(url), L"http://localhost:%d", webui_port);
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
-}
-
-static void on_btn_send_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    chat_ui_mount_send(p, w, NULL);
 }
 
 static void restore_webui_port_input(void) {
@@ -1647,7 +1651,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_apply_network", on_btn_apply_network_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_manage_credential", on_manage_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_clear_credential", on_clear_credential_mount, NULL);
-    ui_page_on_widget_mount(g_page, "btn_send", on_btn_send_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_send", chat_ui_mount_send, NULL);
+    ui_page_on_widget_mount(g_page, "chat_input", chat_ui_mount_input, NULL);
+    ui_page_on_widget_mount(g_page, "chat_scroll", chat_ui_mount_scroll, NULL);
+    ui_page_on_widget_unmount(g_page, "chat_scroll", chat_ui_unmount_scroll, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
     ui_page_on_widget_mount(g_page, "theme_system", on_theme_system_mount, NULL);
@@ -1668,6 +1675,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_hwnd = hwnd;
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
+    g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     if (g_tray_enabled_effective)
         tray_add(hwnd);
 
@@ -1692,13 +1700,17 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     {
         MSG m;
         while (PeekMessageW(&m, hwnd, WM_CHAT_EVENT, WM_CHAT_EVENT, PM_REMOVE)) {
-            free((void*)m.lParam);
+            chat_event_free((chat_event*)m.lParam);
         }
     }
 
     stop_uptime_timer();
     tray_remove();
     RemoveWindowSubclass(hwnd, subclass_proc, 0);
+    if (g_chat_ui_timer) {
+        KillTimer(hwnd, TIMER_CHAT_UI);
+        g_chat_ui_timer = 0;
+    }
     chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);

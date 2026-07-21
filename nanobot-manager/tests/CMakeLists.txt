@@ -50,3 +50,13 @@ target_include_directories(test_chat_history PRIVATE
     ${cjson_SOURCE_DIR}
 )
 target_link_libraries(test_chat_history PRIVATE cjson)
+
+nm_add_test(test_chat_protocol
+    ${CMAKE_SOURCE_DIR}/src/chat_protocol.c
+    ${CMAKE_SOURCE_DIR}/src/chat_history.c
+)
+target_include_directories(test_chat_protocol PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+    ${cjson_SOURCE_DIR}
+)
+target_link_libraries(test_chat_protocol PRIVATE cjson)

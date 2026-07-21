@@ -232,14 +232,45 @@ invalid:
     return -1;
 }
 
-int chat_history_parse_json(const char* json, cJSON** out_messages) {
+void chat_history_document_init(chat_history_document* document) {
+    if (document) memset(document, 0, sizeof(*document));
+}
+
+void chat_history_document_free(chat_history_document* document) {
+    if (!document) return;
+    cJSON_Delete(document->messages);
+    chat_history_document_init(document);
+}
+
+int chat_history_is_valid_chat_id(const char* chat_id) {
+    size_t length;
+    if (!chat_id) return 0;
+    length = strlen(chat_id);
+    if (length < 1 || length > 64) return 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)chat_id[i];
+        if (!is_ascii_bot_suffix(c) && c != ':' && c != '-')
+            return 0;
+    }
+    return 1;
+}
+
+int chat_history_document_can_resume(const chat_history_document* document, int webui_port) {
+    return document && document->version == 2 && document->webui_port == webui_port &&
+        document->resume_safe && chat_history_is_valid_chat_id(document->chat_id);
+}
+
+int chat_history_parse_json(const char* json, chat_history_document* out_document) {
     cJSON* root;
     cJSON* version;
     cJSON* messages;
     const char* end = NULL;
     size_t length;
-    if (!json || !out_messages) return -1;
-    *out_messages = NULL;
+    cJSON* port;
+    cJSON* chat_id;
+    cJSON* resume_safe;
+    if (!json || !out_document) return -1;
+    chat_history_document_init(out_document);
     length = strlen(json);
     if (json_contains_decoded_nul_escape(json, length)) return -1;
     root = cJSON_ParseWithLengthOpts(json, length, &end, 0);
@@ -247,27 +278,66 @@ int chat_history_parse_json(const char* json, cJSON** out_messages) {
     while (end && is_json_trim_space((unsigned char)*end)) end++;
     version = cJSON_GetObjectItemCaseSensitive(root, "version");
     messages = cJSON_GetObjectItemCaseSensitive(root, "messages");
-    if (!end || *end || !exact_members(root, "version", "messages") || !cJSON_IsNumber(version) ||
-        version->valuedouble != 1.0 || version->valueint != 1 ||
-        copy_normalized_messages(messages, out_messages, 1) != 0) {
+    if (!end || *end || !cJSON_IsNumber(version)) {
         cJSON_Delete(root);
         return -1;
     }
+    if (version->valuedouble == 1.0 && version->valueint == 1 &&
+        exact_members(root, "version", "messages") &&
+        copy_normalized_messages(messages, &out_document->messages, 1) == 0) {
+        out_document->version = 1;
+        cJSON_Delete(root);
+        return 0;
+    }
+    port = cJSON_GetObjectItemCaseSensitive(root, "webui_port");
+    chat_id = cJSON_GetObjectItemCaseSensitive(root, "chat_id");
+    resume_safe = cJSON_GetObjectItemCaseSensitive(root, "resume_safe");
+    if (!(version->valuedouble == 2.0 && version->valueint == 2) ||
+        !cJSON_IsObject(root) || !port || !chat_id || !resume_safe ||
+        !cJSON_IsNumber(port) || port->valuedouble != (double)port->valueint ||
+        port->valueint < 1 || port->valueint > 65535 ||
+        !cJSON_IsString(chat_id) || !chat_id->valuestring ||
+        !chat_history_is_valid_chat_id(chat_id->valuestring) ||
+        !cJSON_IsBool(resume_safe) || !messages) {
+        cJSON_Delete(root); return -1;
+    }
+    {
+        const cJSON* child; int count = 0;
+        for (child = root->child; child; child = child->next) {
+            if (!child->string || (strcmp(child->string, "version") && strcmp(child->string, "webui_port") &&
+                strcmp(child->string, "chat_id") && strcmp(child->string, "resume_safe") && strcmp(child->string, "messages"))) {
+                cJSON_Delete(root); return -1;
+            }
+            count++;
+        }
+        if (count != 5 || copy_normalized_messages(messages, &out_document->messages, 1) != 0) {
+            cJSON_Delete(root); return -1;
+        }
+    }
+    out_document->version = 2;
+    out_document->webui_port = port->valueint;
+    strcpy_s(out_document->chat_id, sizeof(out_document->chat_id), chat_id->valuestring);
+    out_document->resume_safe = cJSON_IsTrue(resume_safe) ? 1 : 0;
     cJSON_Delete(root);
     return 0;
 }
 
-char* chat_history_serialize(const cJSON* ui_messages) {
+char* chat_history_serialize(const chat_history_document* document) {
     cJSON* normalized = NULL;
     cJSON* root;
     char* serialized;
-    if (copy_normalized_messages(ui_messages, &normalized, 0) != 0) return NULL;
+    if (!document || document->version != 2 || document->webui_port < 1 ||
+        document->webui_port > 65535 || !chat_history_is_valid_chat_id(document->chat_id) ||
+        !document->messages || copy_normalized_messages(document->messages, &normalized, 0) != 0) return NULL;
     root = cJSON_CreateObject();
     if (!root) {
         cJSON_Delete(normalized);
         return NULL;
     }
-    if (!cJSON_AddNumberToObject(root, "version", 1) ||
+    if (!cJSON_AddNumberToObject(root, "version", 2) ||
+        !cJSON_AddNumberToObject(root, "webui_port", document->webui_port) ||
+        !cJSON_AddStringToObject(root, "chat_id", document->chat_id) ||
+        !cJSON_AddBoolToObject(root, "resume_safe", document->resume_safe ? 1 : 0) ||
         !cJSON_AddItemToObject(root, "messages", normalized)) {
         cJSON_Delete(normalized);
         cJSON_Delete(root);
@@ -278,14 +348,14 @@ char* chat_history_serialize(const cJSON* ui_messages) {
     return serialized;
 }
 
-chat_history_load_result chat_history_load(const wchar_t* path, cJSON** out_messages, DWORD* out_error) {
+chat_history_load_result chat_history_load(const wchar_t* path, chat_history_document* out_document, DWORD* out_error) {
     HANDLE file;
     LARGE_INTEGER size;
     DWORD read_total = 0;
     char* content;
-    if (out_messages) *out_messages = NULL;
+    if (out_document) chat_history_document_init(out_document);
     if (out_error) *out_error = ERROR_SUCCESS;
-    if (!path || !out_messages) {
+    if (!path || !out_document) {
         if (out_error) *out_error = ERROR_INVALID_PARAMETER;
         return CHAT_HISTORY_LOAD_IO_ERROR;
     }
@@ -336,7 +406,7 @@ chat_history_load_result chat_history_load(const wchar_t* path, cJSON** out_mess
         return CHAT_HISTORY_LOAD_INVALID;
     }
     content[read_total] = '\0';
-    if (chat_history_parse_json(content, out_messages) != 0) {
+    if (chat_history_parse_json(content, out_document) != 0) {
         free(content);
         if (out_error) *out_error = ERROR_INVALID_DATA;
         return CHAT_HISTORY_LOAD_INVALID;
@@ -374,7 +444,55 @@ int chat_history_quarantine_invalid(const wchar_t* path, DWORD* out_error) {
     return result;
 }
 
-int chat_history_save(const wchar_t* path, const cJSON* ui_messages, DWORD* out_error) {
+int chat_history_archive(const wchar_t* path, DWORD* out_error) {
+    wchar_t* archive_path;
+    size_t path_length;
+    int result = -1;
+    if (out_error) *out_error = ERROR_SUCCESS;
+    if (!path || !path[0]) { if (out_error) *out_error = ERROR_INVALID_PARAMETER; return -1; }
+    path_length = wcslen(path);
+    archive_path = (wchar_t*)malloc((path_length + 64) * sizeof(wchar_t));
+    if (!archive_path) { if (out_error) *out_error = ERROR_NOT_ENOUGH_MEMORY; return -1; }
+    for (unsigned int attempt = 0; attempt < 64; attempt++) {
+        swprintf_s(archive_path, path_length + 64, L"%s.archive.%lu.%lu.%u", path,
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(), attempt);
+        if (MoveFileExW(path, archive_path, MOVEFILE_WRITE_THROUGH)) { result = 0; break; }
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
+    }
+    if (result != 0 && out_error) *out_error = GetLastError();
+    free(archive_path);
+    return result;
+}
+
+int chat_history_copy_to_archive(const wchar_t* path, wchar_t* out_archive_path, size_t out_count, DWORD* out_error) {
+    wchar_t* archive_path;
+    size_t path_length;
+    int result = -1;
+    if (out_error) *out_error = ERROR_SUCCESS;
+    if (!path || !path[0] || !out_archive_path || out_count == 0) {
+        if (out_error) *out_error = ERROR_INVALID_PARAMETER;
+        return -1;
+    }
+    path_length = wcslen(path);
+    archive_path = (wchar_t*)malloc((path_length + 64) * sizeof(wchar_t));
+    if (!archive_path) { if (out_error) *out_error = ERROR_NOT_ENOUGH_MEMORY; return -1; }
+    for (unsigned int attempt = 0; attempt < 64; attempt++) {
+        swprintf_s(archive_path, path_length + 64, L"%s.archive.%lu.%lu.%u", path,
+            (unsigned long)GetCurrentProcessId(), (unsigned long)GetTickCount(), attempt);
+        if (wcslen(archive_path) + 1 > out_count) { if (out_error) *out_error = ERROR_INSUFFICIENT_BUFFER; break; }
+        if (CopyFileW(path, archive_path, TRUE)) {
+            wcscpy_s(out_archive_path, out_count, archive_path);
+            result = 0;
+            break;
+        }
+        if (GetLastError() != ERROR_FILE_EXISTS && GetLastError() != ERROR_ALREADY_EXISTS) break;
+    }
+    if (result != 0 && out_error && *out_error == ERROR_SUCCESS) *out_error = GetLastError();
+    free(archive_path);
+    return result;
+}
+
+int chat_history_save(const wchar_t* path, const chat_history_document* document, DWORD* out_error) {
     char* serialized;
     wchar_t* temporary_path;
     size_t path_length;
@@ -383,11 +501,11 @@ int chat_history_save(const wchar_t* path, const cJSON* ui_messages, DWORD* out_
     DWORD length;
     int result = -1;
     if (out_error) *out_error = ERROR_SUCCESS;
-    if (!path || !path[0] || !ui_messages) {
+    if (!path || !path[0] || !document) {
         if (out_error) *out_error = ERROR_INVALID_PARAMETER;
         return -1;
     }
-    serialized = chat_history_serialize(ui_messages);
+    serialized = chat_history_serialize(document);
     if (!serialized) {
         if (out_error) *out_error = ERROR_INVALID_DATA;
         return -1;

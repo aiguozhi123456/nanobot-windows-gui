@@ -1,4 +1,6 @@
 #include "chat.h"
+#include "chat_history.h"
+#include "chat_protocol.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -11,7 +13,14 @@
 #define WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET 114
 #endif
 
+#ifndef WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT
+#define WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT 115
+#endif
+
 /* WINHTTP_WEB_SOCKET_* types/APIs are provided by winhttp.h on Win8+ SDKs. */
+
+#define CHAT_CLOSE_STATUS WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS
+#define CHAT_CLOSE_TIMEOUT_MS 2000U
 
 static CRITICAL_SECTION g_cs;
 static int g_cs_inited = 0;
@@ -33,7 +42,9 @@ static HANDLE g_thread = NULL;         /* recv_thread */
 static HANDLE g_connect_thread = NULL; /* connect_thread */
 static volatile LONG g_stop = 0;
 static volatile LONG g_ready = 0;      /* socket up */
+static volatile LONG g_attached = 0;
 static volatile LONG g_connecting = 0;
+static volatile LONGLONG g_generation = 1;
 
 enum {
     CHAT_LIFECYCLE_NONE,
@@ -50,11 +61,21 @@ static int g_lifecycle_busy = 0;
 static int g_shutting_down = 0;
 
 static char g_chat_id[128] = {0};
+static char g_attach_id[128] = {0};
 static char g_ws_path[256] = "/";
 static char g_token[512] = {0};
 
-static int chat_connect_locked(void);
-static void chat_disconnect_internal(void);
+static int chat_connect_locked(UINT64 generation);
+static void chat_disconnect_internal(int invalidate_events);
+
+/* Call while g_cs is held before creating transport workers. */
+static int chat_lifecycle_operational_unlocked(void) {
+    return chat_protocol_lifecycle_operational(g_lifecycle_event != NULL,
+        g_lifecycle_thread != NULL, g_shutting_down);
+}
+
+typedef struct { UINT64 generation; } connect_context;
+typedef struct { HINTERNET websocket; UINT64 generation; } recv_context;
 
 /* Always-NUL-terminated bounded copy from untrusted/gateway strings. */
 static void chat_copy_str(char* dst, size_t dst_sz, const char* src) {
@@ -85,24 +106,55 @@ static char* chat_strdup(const char* s) {
     return p;
 }
 
-static void post_event(WPARAM kind, char* detail_or_null) {
+void chat_event_free(chat_event* event) {
+    if (!event) return;
+    free(event->detail);
+    free(event);
+}
+
+UINT64 chat_current_generation(void) {
+    return (UINT64)InterlockedCompareExchange64(&g_generation, 0, 0);
+}
+
+static UINT64 invalidate_generation(void) {
+    for (;;) {
+        LONGLONG current = InterlockedCompareExchange64(&g_generation, 0, 0);
+        LONGLONG next = (LONGLONG)chat_protocol_next_generation((UINT64)current);
+        if (InterlockedCompareExchange64(&g_generation, next, current) == current)
+            return (UINT64)next;
+    }
+}
+
+static void post_event(WPARAM kind, UINT64 generation, char* detail_or_null) {
     HWND hwnd;
     UINT msg;
+    chat_event* event = (chat_event*)malloc(sizeof(*event));
+    if (!event) { free(detail_or_null); return; }
+    event->generation = generation;
+    event->detail = detail_or_null;
     EnterCriticalSection(&g_cs);
     hwnd = g_hwnd;
     msg = g_msg_id;
     LeaveCriticalSection(&g_cs);
     if (!hwnd || !msg) {
-        free(detail_or_null);
+        chat_event_free(event);
         return;
     }
-    if (!PostMessageW(hwnd, msg, kind, (LPARAM)detail_or_null))
-        free(detail_or_null);
+    if (!PostMessageW(hwnd, msg, kind, (LPARAM)event))
+        chat_event_free(event);
 }
 
-static void close_handles_unlocked(void) {
+/* WinHttpWebSocketClose cancels a pending receive. It must run while g_cs
+   serializes it with sends, but it must not release the socket handle. */
+static void cancel_websocket_unlocked(HINTERNET websocket) {
+    if (websocket)
+        WinHttpWebSocketClose(websocket, CHAT_CLOSE_STATUS, NULL, 0);
+}
+
+/* A receive worker owns its exact websocket handle until it has returned.
+   Call only after that worker has been joined or observed signaled. */
+static void destroy_connection_handles_unlocked(void) {
     if (g_websocket) {
-        WinHttpWebSocketClose(g_websocket, 1000, NULL, 0);
         WinHttpCloseHandle(g_websocket);
         g_websocket = NULL;
     }
@@ -115,7 +167,9 @@ static void close_handles_unlocked(void) {
         g_session = NULL;
     }
     g_ready = 0;
+    g_attached = 0;
     g_chat_id[0] = '\0';
+    g_attach_id[0] = '\0';
     SecureZeroMemory(g_token, sizeof(g_token));
 }
 
@@ -123,6 +177,9 @@ static void reap_finished_threads_unlocked(void) {
     if (g_thread && WaitForSingleObject(g_thread, 0) == WAIT_OBJECT_0) {
         CloseHandle(g_thread);
         g_thread = NULL;
+        /* recv_thread cleared g_ready only if this was its generation. */
+        if (!InterlockedCompareExchange(&g_ready, 0, 0))
+            destroy_connection_handles_unlocked();
     }
     if (g_connect_thread && WaitForSingleObject(g_connect_thread, 0) == WAIT_OBJECT_0) {
         CloseHandle(g_connect_thread);
@@ -313,13 +370,24 @@ static int ws_connect(int port, const char* path, const char* token,
         return -1;
     }
 
+    {
+        DWORD close_timeout = CHAT_CLOSE_TIMEOUT_MS;
+        if (!WinHttpSetOption(ws, WINHTTP_OPTION_WEB_SOCKET_CLOSE_TIMEOUT,
+                &close_timeout, sizeof(close_timeout))) {
+            WinHttpCloseHandle(ws);
+            WinHttpCloseHandle(conn);
+            WinHttpCloseHandle(session);
+            return -1;
+        }
+    }
+
     *session_out = session;
     *connect_out = conn;
     *websocket_out = ws;
     return 0;
 }
 
-static void handle_json_frame(const char* json, size_t len) {
+static void handle_json_frame(UINT64 generation, const char* json, size_t len) {
     char* buf = (char*)malloc(len + 1);
     if (!buf) return;
     memcpy(buf, json, len);
@@ -343,17 +411,27 @@ static void handle_json_frame(const char* json, size_t len) {
 
     if (strcmp(event, "ready") == 0) {
         cJSON* cid = cJSON_GetObjectItem(root, "chat_id");
-        EnterCriticalSection(&g_cs);
         if (cid && cJSON_IsString(cid) && cid->valuestring)
-            chat_copy_str(g_chat_id, sizeof(g_chat_id), cid->valuestring);
+            post_event(CHAT_EVT_READY, generation, chat_strdup(cid->valuestring));
+    } else if (strcmp(event, "attached") == 0) {
+        cJSON* cid = cJSON_GetObjectItem(root, "chat_id");
+        int match = 0;
+        char resolved_id[sizeof(g_attach_id)];
+        const char* attached_id = cid && cJSON_IsString(cid) ? cid->valuestring : NULL;
+        EnterCriticalSection(&g_cs);
+        if (chat_protocol_resolve_attached(g_attach_id, attached_id, cid != NULL,
+                resolved_id, sizeof(resolved_id))) {
+            chat_copy_str(g_chat_id, sizeof(g_chat_id), resolved_id);
+            InterlockedExchange(&g_attached, 1);
+            match = 1;
+        }
         LeaveCriticalSection(&g_cs);
-        /* CONNECTED was already posted when the socket came up. */
-        post_event(CHAT_EVT_READY, NULL);
+        if (match) post_event(CHAT_EVT_ATTACHED, generation, chat_strdup(resolved_id));
     } else if (strcmp(event, "delta") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
         if (!text) text = cJSON_GetObjectItem(root, "content");
         if (text && cJSON_IsString(text) && text->valuestring)
-            post_event(CHAT_EVT_DELTA, chat_strdup(text->valuestring));
+            post_event(CHAT_EVT_DELTA, generation, chat_strdup(text->valuestring));
     } else if (strcmp(event, "message") == 0) {
         cJSON* kind = cJSON_GetObjectItem(root, "kind");
         const char* kind_name = (kind && cJSON_IsString(kind)) ? kind->valuestring : NULL;
@@ -364,17 +442,17 @@ static void handle_json_frame(const char* json, size_t len) {
             cJSON* text = cJSON_GetObjectItem(root, "text");
             if (!text) text = cJSON_GetObjectItem(root, "content");
             if (text && cJSON_IsString(text) && text->valuestring)
-                post_event(CHAT_EVT_MESSAGE, chat_strdup(text->valuestring));
+                post_event(CHAT_EVT_MESSAGE, generation, chat_strdup(text->valuestring));
         }
     } else if (strcmp(event, "stream_end") == 0 || strcmp(event, "done") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
         if (!text) text = cJSON_GetObjectItem(root, "content");
-        post_event(CHAT_EVT_STREAM_END,
+        post_event(CHAT_EVT_STREAM_END, generation,
             text && cJSON_IsString(text) && text->valuestring ? chat_strdup(text->valuestring) : NULL);
         if (strcmp(event, "done") == 0)
-            post_event(CHAT_EVT_TURN_END, NULL);
+            post_event(CHAT_EVT_TURN_END, generation, NULL);
     } else if (strcmp(event, "turn_end") == 0) {
-        post_event(CHAT_EVT_TURN_END, NULL);
+        post_event(CHAT_EVT_TURN_END, generation, NULL);
     } else if (strcmp(event, "error") == 0) {
         cJSON* detail = cJSON_GetObjectItem(root, "detail");
         if (!detail) detail = cJSON_GetObjectItem(root, "message");
@@ -382,24 +460,24 @@ static void handle_json_frame(const char* json, size_t len) {
         if (!detail) detail = cJSON_GetObjectItem(root, "text");
         const char* msg = (detail && cJSON_IsString(detail) && detail->valuestring)
             ? detail->valuestring : "error";
-        post_event(CHAT_EVT_ERROR, chat_strdup(msg));
+        post_event(CHAT_EVT_ERROR, generation, chat_strdup(msg));
     }
 
     cJSON_Delete(root);
 }
 
 static DWORD WINAPI recv_thread(LPVOID param) {
-    (void)param;
+    recv_context* context = (recv_context*)param;
+    HINTERNET ws = context->websocket;
+    UINT64 generation = context->generation;
+    free(context);
     char* frame = NULL;
     size_t acc = 0;
     size_t frame_capacity = 0;
     const char* receive_error = NULL;
+    int peer_closed = 0;
 
     while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
-        HINTERNET ws;
-        EnterCriticalSection(&g_cs);
-        ws = g_websocket;
-        LeaveCriticalSection(&g_cs);
         if (!ws) break;
 
         if (acc == frame_capacity) {
@@ -432,8 +510,10 @@ static DWORD WINAPI recv_thread(LPVOID param) {
             break;
         }
 
-        if (btype == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE)
+        if (btype == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+            peer_closed = 1;
             break;
+        }
 
         if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
             btype == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
@@ -448,7 +528,7 @@ static DWORD WINAPI recv_thread(LPVOID param) {
 
             if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
                 btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
-                handle_json_frame(frame, acc);
+                handle_json_frame(generation, frame, acc);
                 acc = 0;
             }
         }
@@ -456,25 +536,31 @@ static DWORD WINAPI recv_thread(LPVOID param) {
 
     free(frame);
     if (receive_error)
-        post_event(CHAT_EVT_ERROR, chat_strdup(receive_error));
+        post_event(CHAT_EVT_ERROR, generation, chat_strdup(receive_error));
 
     EnterCriticalSection(&g_cs);
-    /* Only tear down if we still own the live socket (avoid closing a
-       newer generation installed by a subsequent connect). */
-    if (g_websocket) {
-        close_handles_unlocked();
+    /* A peer close must be acknowledged. Keep the handle alive for the
+       lifecycle owner, which destroys it only after this thread is signaled. */
+    if (g_websocket == ws) {
+        if (peer_closed)
+            cancel_websocket_unlocked(ws);
+        InterlockedExchange(&g_ready, 0);
+        InterlockedExchange(&g_attached, 0);
+        g_chat_id[0] = '\0';
+        g_attach_id[0] = '\0';
     }
     LeaveCriticalSection(&g_cs);
 
-    InterlockedExchange(&g_ready, 0);
     /* Do NOT clear g_connecting here — that flag is owned by
        chat_connect / connect_thread for the duration of a connect attempt. */
-    post_event(CHAT_EVT_DISCONNECTED, NULL);
+    post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
     return 0;
 }
 
 static DWORD WINAPI connect_thread(LPVOID param) {
-    (void)param;
+    connect_context* context = (connect_context*)param;
+    UINT64 generation = context->generation;
+    free(context);
     int port;
     char secret[128];
     char token[512];
@@ -516,15 +602,15 @@ static DWORD WINAPI connect_thread(LPVOID param) {
         SecureZeroMemory(secret, sizeof(secret));
         SecureZeroMemory(token, sizeof(token));
         InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_ERROR, chat_strdup("WebSocket connect failed"));
-        post_event(CHAT_EVT_DISCONNECTED, NULL);
+        post_event(CHAT_EVT_ERROR, generation, chat_strdup("WebSocket connect failed"));
+        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
         return 0;
     }
 
     EnterCriticalSection(&g_cs);
     if (InterlockedCompareExchange(&g_stop, 0, 0) || g_thread) {
         if (websocket) {
-            WinHttpWebSocketClose(websocket, 1000, NULL, 0);
+            cancel_websocket_unlocked(websocket);
             WinHttpCloseHandle(websocket);
         }
         if (connect)
@@ -535,51 +621,56 @@ static DWORD WINAPI connect_thread(LPVOID param) {
         SecureZeroMemory(secret, sizeof(secret));
         SecureZeroMemory(token, sizeof(token));
         InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_DISCONNECTED, NULL);
+        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
         return 0;
     }
 
-    close_handles_unlocked();
+    destroy_connection_handles_unlocked();
     g_session = session;
     g_connect = connect;
     g_websocket = websocket;
     chat_copy_str(g_ws_path, sizeof(g_ws_path), ws_path);
+    /* Publish readiness before the worker can observe an immediate peer close. */
+    InterlockedExchange(&g_ready, 1);
 
-    HANDLE th = CreateThread(NULL, 0, recv_thread, NULL, 0, NULL);
+    recv_context* recv = (recv_context*)malloc(sizeof(*recv));
+    if (recv) { recv->websocket = websocket; recv->generation = generation; }
+    HANDLE th = recv ? CreateThread(NULL, 0, recv_thread, recv, 0, NULL) : NULL;
     if (!th) {
-        close_handles_unlocked();
+        free(recv);
+        destroy_connection_handles_unlocked();
         LeaveCriticalSection(&g_cs);
         SecureZeroMemory(secret, sizeof(secret));
         SecureZeroMemory(token, sizeof(token));
         InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_ERROR, chat_strdup("Failed to start receive thread"));
-        post_event(CHAT_EVT_DISCONNECTED, NULL);
+        post_event(CHAT_EVT_ERROR, generation, chat_strdup("Failed to start receive thread"));
+        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
         return 0;
     }
 
     g_thread = th;
-    /* Socket is up; chat_id may still be empty until server "ready".
-       chat_send uses legacy {content} until chat_id is set. */
-    g_ready = 1;
+    /* Socket is up; a READY frame must still offer a session for attachment. */
     LeaveCriticalSection(&g_cs);
 
     InterlockedExchange(&g_connecting, 0);
     SecureZeroMemory(secret, sizeof(secret));
     SecureZeroMemory(token, sizeof(token));
-    post_event(CHAT_EVT_CONNECTED, NULL);
+    post_event(CHAT_EVT_CONNECTED, generation, NULL);
     return 0;
 }
 
-static void chat_disconnect_internal(void) {
+static void chat_disconnect_internal(int invalidate_events) {
     HANDLE th_recv = NULL;
     HANDLE th_conn = NULL;
 
+    if (invalidate_events)
+        invalidate_generation();
     InterlockedExchange(&g_stop, 1);
 
     EnterCriticalSection(&g_cs);
-    if (g_websocket)
-        WinHttpWebSocketClose(g_websocket, 1000, NULL, 0);
-    close_handles_unlocked();
+    /* Clear readiness before cancelling Receive; g_cs also serializes Send. */
+    InterlockedExchange(&g_ready, 0);
+    cancel_websocket_unlocked(g_websocket);
     th_recv = g_thread;
     g_thread = NULL;
     th_conn = g_connect_thread;
@@ -594,6 +685,11 @@ static void chat_disconnect_internal(void) {
         WaitForSingleObject(th_conn, INFINITE);
         CloseHandle(th_conn);
     }
+
+    EnterCriticalSection(&g_cs);
+    /* recv_thread has returned, so no WinHTTP receive can use these handles. */
+    destroy_connection_handles_unlocked();
+    LeaveCriticalSection(&g_cs);
 
     InterlockedExchange(&g_connecting, 0);
     InterlockedExchange(&g_ready, 0);
@@ -618,7 +714,7 @@ static DWORD WINAPI lifecycle_thread(LPVOID param) {
             LeaveCriticalSection(&g_cs);
 
             AcquireSRWLockExclusive(&g_disconnect_lock);
-            chat_disconnect_internal();
+            chat_disconnect_internal(0);
             ReleaseSRWLockExclusive(&g_disconnect_lock);
 
             EnterCriticalSection(&g_cs);
@@ -631,7 +727,7 @@ static DWORD WINAPI lifecycle_thread(LPVOID param) {
                 g_lifecycle_busy = 0;
                 SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
                 LeaveCriticalSection(&g_cs);
-                post_event(CHAT_EVT_DISCONNECT_DONE, NULL);
+                post_event(CHAT_EVT_DISCONNECT_DONE, chat_current_generation(), NULL);
                 return 0;
             }
             if (request == CHAT_LIFECYCLE_DISCONNECT) {
@@ -639,7 +735,7 @@ static DWORD WINAPI lifecycle_thread(LPVOID param) {
                 g_lifecycle_busy = 0;
                 SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
                 LeaveCriticalSection(&g_cs);
-                post_event(CHAT_EVT_DISCONNECT_DONE, NULL);
+                post_event(CHAT_EVT_DISCONNECT_DONE, chat_current_generation(), NULL);
                 break;
             }
             LeaveCriticalSection(&g_cs);
@@ -650,16 +746,17 @@ static DWORD WINAPI lifecycle_thread(LPVOID param) {
                 g_lifecycle_request = CHAT_LIFECYCLE_NONE;
                 LeaveCriticalSection(&g_cs);
 
+                UINT64 replacement_generation = invalidate_generation();
                 /* Queue completion before any replacement worker can report
                    CONNECTED or READY. */
-                post_event(CHAT_EVT_DISCONNECT_DONE, NULL);
+                post_event(CHAT_EVT_DISCONNECT_DONE, replacement_generation, NULL);
 
                 AcquireSRWLockExclusive(&g_disconnect_lock);
                 EnterCriticalSection(&g_cs);
                 start_reconnect = !g_shutting_down &&
                     g_lifecycle_request == CHAT_LIFECYCLE_NONE;
                 if (start_reconnect)
-                    chat_connect_locked();
+                    chat_connect_locked(replacement_generation);
                 if (start_reconnect)
                     g_lifecycle_busy = 0;
                 LeaveCriticalSection(&g_cs);
@@ -717,7 +814,8 @@ void chat_set_endpoint(int webui_port, const char* bootstrap_secret) {
         g_cs_inited = 1;
     }
     EnterCriticalSection(&g_cs);
-    g_webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
+    webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
+    g_webui_port = webui_port;
     SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
     if (bootstrap_secret)
         chat_copy_str(g_bootstrap_secret, sizeof(g_bootstrap_secret), bootstrap_secret);
@@ -726,16 +824,23 @@ void chat_set_endpoint(int webui_port, const char* bootstrap_secret) {
     LeaveCriticalSection(&g_cs);
 }
 
-static int chat_connect_locked(void) {
+static int chat_connect_locked(UINT64 generation) {
+    connect_context* context;
+    if (!chat_lifecycle_operational_unlocked())
+        return -1;
     if (InterlockedCompareExchange(&g_ready, 0, 0))
         return 0;
     if (InterlockedCompareExchange(&g_connecting, 1, 0) != 0)
         return 0;
 
     InterlockedExchange(&g_stop, 0);
+    context = (connect_context*)malloc(sizeof(*context));
+    if (!context) { InterlockedExchange(&g_connecting, 0); return -1; }
+    context->generation = generation;
 
-    HANDLE th = CreateThread(NULL, 0, connect_thread, NULL, 0, NULL);
+    HANDLE th = CreateThread(NULL, 0, connect_thread, context, 0, NULL);
     if (!th) {
+        free(context);
         InterlockedExchange(&g_connecting, 0);
         return -1;
     }
@@ -751,7 +856,7 @@ int chat_connect(void) {
     AcquireSRWLockExclusive(&g_disconnect_lock);
     EnterCriticalSection(&g_cs);
     reap_finished_threads_unlocked();
-    if (g_shutting_down || g_lifecycle_busy) {
+    if (!chat_lifecycle_operational_unlocked() || g_lifecycle_busy) {
         LeaveCriticalSection(&g_cs);
         ReleaseSRWLockExclusive(&g_disconnect_lock);
         return -1;
@@ -761,7 +866,7 @@ int chat_connect(void) {
         ReleaseSRWLockExclusive(&g_disconnect_lock);
         return 0;
     }
-    result = chat_connect_locked();
+    result = chat_connect_locked(invalidate_generation());
     LeaveCriticalSection(&g_cs);
     ReleaseSRWLockExclusive(&g_disconnect_lock);
     return result;
@@ -770,7 +875,7 @@ int chat_connect(void) {
 void chat_disconnect(void) {
     if (!g_cs_inited) return;
     AcquireSRWLockExclusive(&g_disconnect_lock);
-    chat_disconnect_internal();
+    chat_disconnect_internal(1);
     EnterCriticalSection(&g_cs);
     SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
     LeaveCriticalSection(&g_cs);
@@ -778,10 +883,12 @@ void chat_disconnect(void) {
 }
 
 void chat_disconnect_async(void) {
+    if (g_cs_inited) invalidate_generation();
     chat_request_lifecycle(CHAT_LIFECYCLE_DISCONNECT);
 }
 
 void chat_reconnect_async(void) {
+    if (g_cs_inited) invalidate_generation();
     chat_request_lifecycle(CHAT_LIFECYCLE_RECONNECT);
 }
 
@@ -792,18 +899,60 @@ int chat_is_connected(void) {
 /* Socket up is enough to send; typed chat_id preferred when available.
    UI should still prefer CHAT_EVT_READY for canSend when chat_id matters. */
 int chat_is_ready(void) {
-    return InterlockedCompareExchange(&g_ready, 0, 0) ? 1 : 0;
+    return InterlockedCompareExchange(&g_ready, 0, 0) &&
+        InterlockedCompareExchange(&g_attached, 0, 0) ? 1 : 0;
+}
+
+int chat_needs_connect(void) {
+    int operational;
+    if (!g_cs_inited) return 0;
+    EnterCriticalSection(&g_cs);
+    operational = chat_lifecycle_operational_unlocked();
+    LeaveCriticalSection(&g_cs);
+    return operational && !InterlockedCompareExchange(&g_ready, 0, 0) &&
+        !InterlockedCompareExchange(&g_connecting, 0, 0);
+}
+
+int chat_attach(const char* chat_id) {
+    cJSON* root;
+    char* payload;
+    HINTERNET ws;
+    DWORD err;
+    if (!chat_history_is_valid_chat_id(chat_id)) return -1;
+    EnterCriticalSection(&g_cs);
+    if (!InterlockedCompareExchange(&g_ready, 0, 0) || !g_websocket ||
+        InterlockedCompareExchange(&g_stop, 0, 0)) { LeaveCriticalSection(&g_cs); return -1; }
+    InterlockedExchange(&g_attached, 0);
+    chat_copy_str(g_attach_id, sizeof(g_attach_id), chat_id);
+    ws = g_websocket;
+    root = cJSON_CreateObject();
+    if (!root || !cJSON_AddStringToObject(root, "type", "attach") ||
+        !cJSON_AddStringToObject(root, "chat_id", chat_id)) {
+        cJSON_Delete(root); LeaveCriticalSection(&g_cs); return -1;
+    }
+    payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
+    if (!payload) { LeaveCriticalSection(&g_cs); return -1; }
+    err = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+        payload, (DWORD)strlen(payload));
+    free(payload);
+    LeaveCriticalSection(&g_cs);
+    return err == ERROR_SUCCESS ? 0 : -1;
 }
 
 int chat_send(const char* utf8_text) {
     if (!utf8_text || !utf8_text[0]) return -1;
-    if (!chat_is_ready()) return -1;
 
     char chat_id[128];
     HINTERNET ws;
     DWORD err;
 
     EnterCriticalSection(&g_cs);
+    /* Disconnect clears ready before it cancels ws under this same lock. */
+    if (!InterlockedCompareExchange(&g_ready, 0, 0) ||
+        InterlockedCompareExchange(&g_stop, 0, 0)) {
+        LeaveCriticalSection(&g_cs);
+        return -1;
+    }
     chat_copy_str(chat_id, sizeof(chat_id), g_chat_id);
     ws = g_websocket;
     if (!ws) {
@@ -817,15 +966,10 @@ int chat_send(const char* utf8_text) {
         return -1;
     }
 
-    if (chat_id[0]) {
-        if (!cJSON_AddStringToObject(root, "type", "message") ||
-            !cJSON_AddStringToObject(root, "chat_id", chat_id) ||
-            !cJSON_AddStringToObject(root, "content", utf8_text)) {
-            cJSON_Delete(root);
-            LeaveCriticalSection(&g_cs);
-            return -1;
-        }
-    } else if (!cJSON_AddStringToObject(root, "content", utf8_text)) {
+    if (!InterlockedCompareExchange(&g_attached, 0, 0) || !chat_history_is_valid_chat_id(chat_id) ||
+        !cJSON_AddStringToObject(root, "type", "message") ||
+        !cJSON_AddStringToObject(root, "chat_id", chat_id) ||
+        !cJSON_AddStringToObject(root, "content", utf8_text)) {
         cJSON_Delete(root);
         LeaveCriticalSection(&g_cs);
         return -1;
@@ -869,7 +1013,7 @@ void chat_shutdown(void) {
         CloseHandle(lifecycle_event);
     } else {
         AcquireSRWLockExclusive(&g_disconnect_lock);
-        chat_disconnect_internal();
+        chat_disconnect_internal(1);
         ReleaseSRWLockExclusive(&g_disconnect_lock);
         if (lifecycle_event)
             CloseHandle(lifecycle_event);

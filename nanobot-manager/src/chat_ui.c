@@ -1,6 +1,7 @@
 #include "chat_ui.h"
 #include "chat.h"
 #include "chat_history.h"
+#include "chat_protocol.h"
 #include "cJSON.h"
 
 #include <stdio.h>
@@ -12,6 +13,7 @@ static int (*g_is_zh)(void) = NULL;
 static int (*g_health_fn)(void) = NULL;
 static int g_webui_port = 8765;
 static cJSON* g_messages = NULL;
+static chat_history_document g_history_document;
 static int g_msg_next_id = 1;
 static int g_chat_streaming = 0;
 typedef enum {
@@ -26,6 +28,19 @@ static unsigned long g_saved_revision = 0;
 static wchar_t g_history_path[MAX_PATH] = {0};
 static int g_history_read_error = 0;
 static cJSON* g_new_history_backup = NULL;
+static cJSON* g_fresh_messages = NULL;
+static int g_fresh_pending = 0;
+static int g_attach_pending = 0;
+static ULONGLONG g_attach_deadline = 0;
+static int g_auto_connect_blocked = 0;
+static UiWidget g_chat_scroll = 0;
+static int g_messages_ui_dirty = 0;
+
+#define CHAT_ATTACH_TIMEOUT_MS 10000ULL
+#define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
+
+static void restore_new_history_backup(void);
+static void terminal_failure(const char* zh, const char* en, const char* detail);
 
 static void page_set_utf8(const char* name, const char* utf8) {
     if (!g_page || !name) return;
@@ -44,13 +59,25 @@ static void ensure_messages(void) {
 
 static void push_messages_ui(void) {
     char* json;
+    int follow = 0;
     if (!g_page) return;
+    if (g_chat_scroll) {
+        float y = ui_scroll_get_y(g_chat_scroll);
+        float max_y = ui_scroll_get_max_y(g_chat_scroll);
+        follow = max_y <= 0.0f || max_y - y <= CHAT_FOLLOW_THRESHOLD_DIP;
+    }
     ensure_messages();
     json = cJSON_PrintUnformatted(g_messages);
     if (json) {
         ui_page_set_json(g_page, "messages", json);
+        if (follow) ui_scroll_to_end(g_chat_scroll);
+        g_messages_ui_dirty = 0;
         free(json);
     }
+}
+
+static void flush_messages_ui(void) {
+    if (g_messages_ui_dirty) push_messages_ui();
 }
 
 static void mark_dirty(void) {
@@ -67,10 +94,24 @@ static void save_if_dirty(void) {
     DWORD error;
     if (!g_history_path[0] || g_history_read_error ||
         g_turn_state == CHAT_TURN_NEW_WAIT_ACK || g_saved_revision == g_revision) return;
-    if (chat_history_save(g_history_path, g_messages, &error) == 0)
+    g_history_document.messages = g_messages;
+    if (g_history_document.version == 2 && chat_history_save(g_history_path, &g_history_document, &error) == 0)
         g_saved_revision = g_revision;
     else
         save_failure_status();
+}
+
+static int persist_binding(int resume_safe) {
+    DWORD error;
+    g_history_document.messages = g_messages;
+    g_history_document.resume_safe = resume_safe ? 1 : 0;
+    if (!g_history_path[0] || g_history_read_error || g_history_document.version != 2 ||
+        chat_history_save(g_history_path, &g_history_document, &error) != 0) {
+        save_failure_status();
+        return 0;
+    }
+    g_saved_revision = g_revision;
+    return 1;
 }
 
 static void assign_ui_ids(void) {
@@ -94,13 +135,53 @@ static void assign_ui_ids(void) {
     }
 }
 
-static void replace_history_messages(cJSON* messages) {
+/* g_messages is the sole owner. The document only borrows it while saving. */
+static int replace_history_messages(cJSON* messages) {
+    if (!messages) return 0;
+    g_history_document.messages = NULL;
     cJSON_Delete(g_messages);
     g_messages = messages;
+    g_history_document.messages = g_messages;
     assign_ui_ids();
     g_revision = 0;
     g_saved_revision = 0;
     push_messages_ui();
+    return 1;
+}
+
+static void discard_fresh_session(void) {
+    cJSON_Delete(g_fresh_messages);
+    g_fresh_messages = NULL;
+    g_fresh_pending = 0;
+}
+
+static int prepare_fresh_session(void) {
+    DWORD error = ERROR_SUCCESS;
+    cJSON* fresh = cJSON_CreateArray();
+    if (!fresh) {
+        chat_ui_status_i18n("无法创建新聊天记录，未连接", "Could not create new chat history; not connecting");
+        return 0;
+    }
+    if (g_history_document.version != 0 && g_history_path[0]) {
+        wchar_t archive_path[MAX_PATH + 64];
+        if (chat_history_copy_to_archive(g_history_path, archive_path, _countof(archive_path), &error) != 0) {
+            cJSON_Delete(fresh);
+            chat_ui_status_i18n("无法备份旧聊天记录，未连接", "Could not archive old chat history; not connecting");
+            return 0;
+        }
+    }
+    discard_fresh_session();
+    g_fresh_messages = fresh;
+    g_fresh_pending = 1;
+    return 1;
+}
+
+static void install_loaded_history(chat_history_document* loaded) {
+    g_history_document.messages = NULL;
+    chat_history_document_free(&g_history_document);
+    g_history_document = *loaded;
+    chat_history_document_init(loaded);
+    replace_history_messages(g_history_document.messages);
 }
 
 static void invalid_history_backed_up_status(void) {
@@ -108,13 +189,14 @@ static void invalid_history_backed_up_status(void) {
 }
 
 static int recover_history_before_send(void) {
-    cJSON* loaded = NULL;
+    chat_history_document loaded;
     DWORD error = ERROR_SUCCESS;
     chat_history_load_result result;
     if (!g_history_read_error) return 1;
+    chat_history_document_init(&loaded);
     result = chat_history_load(g_history_path, &loaded, &error);
     if (result == CHAT_HISTORY_LOAD_OK) {
-        replace_history_messages(loaded);
+        install_loaded_history(&loaded);
         g_history_read_error = 0;
         return 1;
     }
@@ -123,12 +205,17 @@ static int recover_history_before_send(void) {
         return 1;
     }
     if (result == CHAT_HISTORY_LOAD_INVALID && chat_history_quarantine_invalid(g_history_path, &error) == 0) {
-        replace_history_messages(cJSON_CreateArray());
+        cJSON* fresh = cJSON_CreateArray();
+        if (!fresh) {
+            chat_ui_status_i18n("无法创建新聊天记录，未发送消息", "Could not create new chat history; message was not sent");
+            return 0;
+        }
+        replace_history_messages(fresh);
         g_history_read_error = 0;
         invalid_history_backed_up_status();
         return 1;
     }
-    cJSON_Delete(loaded);
+    chat_history_document_free(&loaded);
     chat_ui_status_i18n("聊天记录暂时不可用，未发送消息", "Chat history is temporarily unavailable; message was not sent");
     return 0;
 }
@@ -191,7 +278,7 @@ static int append_delta(const char* chunk) {
         return 0;
     }
     mark_dirty();
-    push_messages_ui();
+    g_messages_ui_dirty = 1;
     return 1;
 }
 
@@ -239,6 +326,59 @@ static void set_can_send(int enabled) {
     if (g_page) ui_page_set_bool(g_page, "canSend", enabled ? 1 : 0);
 }
 
+static int can_send_now(void) {
+    return g_turn_state == CHAT_TURN_IDLE && chat_is_ready() &&
+        (!g_health_fn || g_health_fn());
+}
+
+static int can_retry_now(void) {
+    return chat_protocol_retry_allowed(g_auto_connect_blocked,
+        g_turn_state == CHAT_TURN_IDLE, !g_health_fn || g_health_fn(),
+        chat_is_connected(), !chat_needs_connect(), g_attach_pending);
+}
+
+static void attach_after_ready(const char* offered_id) {
+    const char* wanted = offered_id;
+    if (!chat_history_is_valid_chat_id(offered_id)) {
+        terminal_failure("服务器会话无效", "Server offered an invalid chat session", NULL);
+        return;
+    }
+    if (chat_history_document_can_resume(&g_history_document, g_webui_port))
+        wanted = g_history_document.chat_id;
+    else if (!prepare_fresh_session()) {
+        terminal_failure("无法准备新的聊天记录", "Could not prepare new chat history", NULL);
+        return;
+    }
+    if (chat_attach(wanted) != 0) {
+        terminal_failure("无法附加聊天会话", "Could not attach chat session", NULL);
+        return;
+    }
+    g_attach_pending = 1;
+    g_attach_deadline = GetTickCount64() + CHAT_ATTACH_TIMEOUT_MS;
+    set_can_send(0);
+    chat_ui_status_i18n("正在恢复会话…", "Restoring session…");
+}
+
+static void terminal_failure(const char* zh, const char* en, const char* detail) {
+    int had_fresh = g_fresh_pending;
+    flush_messages_ui();
+    g_attach_pending = 0;
+    g_attach_deadline = 0;
+    g_chat_streaming = 0;
+    restore_new_history_backup();
+    discard_fresh_session();
+    g_turn_state = CHAT_TURN_IDLE;
+    /* Only an attempted message makes the binding unsafe. Attachment and
+       connection failures preserve a previously safe resume point. */
+    if (chat_protocol_should_persist_unsafe(had_fresh, g_history_document.resume_safe))
+        persist_binding(0);
+    g_auto_connect_blocked = 1;
+    if (detail && detail[0]) chat_ui_status(detail);
+    else chat_ui_status_i18n(zh, en);
+    set_can_send(0);
+    chat_disconnect_async();
+}
+
 static void discard_new_history_backup(void) {
     cJSON_Delete(g_new_history_backup);
     g_new_history_backup = NULL;
@@ -248,9 +388,11 @@ static void restore_new_history_backup(void) {
     if (g_turn_state != CHAT_TURN_NEW_WAIT_ACK) return;
     g_turn_state = CHAT_TURN_IDLE;
     if (!g_new_history_backup) return;
+    g_history_document.messages = NULL;
     cJSON_Delete(g_messages);
     g_messages = g_new_history_backup;
     g_new_history_backup = NULL;
+    g_history_document.messages = g_messages;
     assign_ui_ids();
     mark_dirty();
     push_messages_ui();
@@ -263,8 +405,11 @@ void chat_ui_bind(UiPage page, int (*is_zh_fn)(void)) {
 }
 
 void chat_ui_set_gateway(int (*health_fn)(void), int webui_port) {
+    int next_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
     g_health_fn = health_fn;
-    g_webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
+    if (g_webui_port != next_port && g_history_document.version == 2)
+        set_can_send(0);
+    g_webui_port = next_port;
 }
 
 void chat_ui_status(const char* utf8) { page_set_utf8("chatStatus", utf8 ? utf8 : ""); }
@@ -274,18 +419,25 @@ void chat_ui_status_i18n(const char* zh, const char* en) {
 }
 
 void chat_ui_configure_history(const wchar_t* config_path) {
-    cJSON* loaded = NULL;
+    chat_history_document loaded;
     DWORD error = ERROR_SUCCESS;
     chat_history_load_result result;
     g_history_path[0] = L'\0';
     g_history_read_error = 0;
     if (chat_history_path_from_config(config_path, g_history_path, _countof(g_history_path)) != 0) return;
+    chat_history_document_init(&loaded);
     result = chat_history_load(g_history_path, &loaded, &error);
     if (result == CHAT_HISTORY_LOAD_OK) {
-        replace_history_messages(loaded);
+        install_loaded_history(&loaded);
     } else if (result == CHAT_HISTORY_LOAD_INVALID) {
         if (chat_history_quarantine_invalid(g_history_path, &error) == 0) {
-            replace_history_messages(cJSON_CreateArray());
+            cJSON* fresh = cJSON_CreateArray();
+            if (fresh) replace_history_messages(fresh);
+            else {
+                g_history_read_error = 1;
+                chat_ui_status_i18n("无法创建新聊天记录，原文件未被覆盖", "Could not create new chat history; existing file was not replaced");
+                return;
+            }
             invalid_history_backed_up_status();
         } else {
             g_history_read_error = 1;
@@ -299,6 +451,7 @@ void chat_ui_configure_history(const wchar_t* config_path) {
 
 void chat_ui_reset_idle(void) {
     discard_new_history_backup();
+    g_history_document.messages = NULL;
     cJSON_Delete(g_messages);
     g_messages = cJSON_CreateArray();
     g_msg_next_id = 1;
@@ -307,20 +460,26 @@ void chat_ui_reset_idle(void) {
     g_revision = 0;
     g_saved_revision = 0;
     if (g_page) {
-        ui_page_set_json(g_page, "messages", "[]");
+        push_messages_ui();
         ui_page_set_text(g_page, "draft", L"");
-        set_can_send(1);
+        set_can_send(0);
     }
     chat_ui_status_i18n("启动 nanobot 后即可聊天", "Start nanobot to chat");
 }
 
 void chat_ui_shutdown(void) {
+    flush_messages_ui();
     restore_new_history_backup();
     save_if_dirty();
     discard_new_history_backup();
+    discard_fresh_session();
+    g_history_document.messages = NULL;
     cJSON_Delete(g_messages);
+    chat_history_document_free(&g_history_document);
     g_messages = NULL;
     g_page = 0;
+    g_chat_scroll = 0;
+    g_messages_ui_dirty = 0;
     g_is_zh = NULL;
     g_health_fn = NULL;
     g_history_path[0] = L'\0';
@@ -329,32 +488,104 @@ void chat_ui_shutdown(void) {
 }
 
 void chat_ui_on_gateway_stopped(void) {
+    flush_messages_ui();
+    g_auto_connect_blocked = 0;
+    g_attach_pending = 0;
+    g_attach_deadline = 0;
     g_chat_streaming = 0;
     restore_new_history_backup();
     g_turn_state = CHAT_TURN_IDLE;
     save_if_dirty();
     chat_ui_status_i18n("启动 nanobot 后即可聊天", "Start nanobot to chat");
-    set_can_send(1);
+    set_can_send(0);
 }
 
-void chat_ui_on_event(WPARAM kind, char* detail) {
+void chat_ui_tick(ULONGLONG now) {
+    if (g_attach_pending && now >= g_attach_deadline)
+        terminal_failure("恢复会话超时", "Session restore timed out", NULL);
+}
+
+void chat_ui_publish_tick(void) {
+    flush_messages_ui();
+}
+
+int chat_ui_can_auto_connect(void) { return !g_auto_connect_blocked; }
+
+void chat_ui_on_event(WPARAM kind, chat_event* event) {
+    char* detail;
+    if (!event) return;
+    if (event->generation != chat_current_generation()) {
+        chat_event_free(event);
+        return;
+    }
+    detail = event->detail;
     switch ((int)kind) {
     case CHAT_EVT_CONNECTED:
-        chat_ui_status_i18n("已连接…", "Connected…");
-        set_can_send(g_turn_state == CHAT_TURN_IDLE && chat_is_ready());
+        /* CONNECTED can be queued behind ATTACHED; never regress a ready UI. */
+        if (!chat_is_ready()) {
+            chat_ui_status_i18n("已连接…", "Connected…");
+            set_can_send(0);
+        }
         break;
     case CHAT_EVT_READY:
-        chat_ui_status_i18n("已连接", "Connected");
-        set_can_send(g_turn_state == CHAT_TURN_IDLE);
+        attach_after_ready(detail);
+        break;
+    case CHAT_EVT_ATTACHED:
+        if (g_attach_pending && detail && chat_history_is_valid_chat_id(detail)) {
+            int fresh_committed = 0;
+            g_attach_pending = 0;
+            g_attach_deadline = 0;
+            if (g_fresh_pending) {
+                chat_history_document fresh_document;
+                cJSON* previous_messages = g_messages;
+                chat_history_document_init(&fresh_document);
+                fresh_document.version = 2;
+                fresh_document.webui_port = g_webui_port;
+                strcpy_s(fresh_document.chat_id, sizeof(fresh_document.chat_id), detail);
+                fresh_document.resume_safe = 1;
+                fresh_document.messages = g_fresh_messages;
+                if (!g_history_path[0] || g_history_read_error ||
+                    chat_history_save(g_history_path, &fresh_document, NULL) != 0) {
+                    terminal_failure("聊天记录保存失败", "Could not save chat history", NULL);
+                    break;
+                }
+                g_history_document.messages = NULL;
+                chat_history_document_free(&g_history_document);
+                g_history_document = fresh_document;
+                g_fresh_messages = NULL;
+                g_fresh_pending = 0;
+                g_messages = g_history_document.messages;
+                cJSON_Delete(previous_messages);
+                assign_ui_ids();
+                g_revision = g_saved_revision = 0;
+                push_messages_ui();
+                fresh_committed = 1;
+            }
+            g_history_document.version = 2;
+            g_history_document.webui_port = g_webui_port;
+            strcpy_s(g_history_document.chat_id, sizeof(g_history_document.chat_id), detail);
+            g_history_document.resume_safe = g_turn_state == CHAT_TURN_IDLE;
+            if (!fresh_committed && !persist_binding(g_history_document.resume_safe)) {
+                terminal_failure("聊天记录保存失败", "Could not save chat history", NULL);
+                break;
+            }
+            chat_ui_status_i18n("已连接", "Connected");
+            set_can_send(can_send_now());
+        }
         break;
     case CHAT_EVT_DISCONNECTED:
     case CHAT_EVT_DISCONNECT_DONE:
+        flush_messages_ui();
+        g_attach_pending = 0;
+        g_attach_deadline = 0;
+        if (g_turn_state != CHAT_TURN_IDLE) persist_binding(0);
         g_chat_streaming = 0;
         restore_new_history_backup();
         g_turn_state = CHAT_TURN_IDLE;
         save_if_dirty();
-        chat_ui_status_i18n("未连接", "Disconnected");
-        set_can_send(1);
+        if (!g_auto_connect_blocked)
+            chat_ui_status_i18n("未连接", "Disconnected");
+        set_can_send(can_retry_now());
         break;
     case CHAT_EVT_DELTA:
         if (g_turn_state == CHAT_TURN_NORMAL_WAIT_ACTIVITY)
@@ -368,21 +599,22 @@ void chat_ui_on_event(WPARAM kind, char* detail) {
                 g_chat_streaming = 0;
                 discard_new_history_backup();
                 g_turn_state = CHAT_TURN_IDLE;
-                save_if_dirty();
-                set_can_send(1);
+                persist_binding(1);
+                set_can_send(can_send_now());
             }
         } else if (g_turn_state == CHAT_TURN_NORMAL_WAIT_ACTIVITY) {
             if (detail && !set_last_assistant(detail, 0))
                 chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
             g_chat_streaming = 0;
             g_turn_state = CHAT_TURN_IDLE;
-            save_if_dirty();
-            set_can_send(1);
+            persist_binding(1);
+            set_can_send(can_send_now());
         } else if (g_turn_state == CHAT_TURN_NORMAL_ACTIVE) {
             if (detail && !set_last_assistant(detail, 0))
                 chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
             save_if_dirty();
         }
+        flush_messages_ui();
         break;
     case CHAT_EVT_STREAM_END:
         if (g_turn_state == CHAT_TURN_NORMAL_WAIT_ACTIVITY)
@@ -394,28 +626,24 @@ void chat_ui_on_event(WPARAM kind, char* detail) {
                 g_chat_streaming = 0;
             save_if_dirty();
         }
+        flush_messages_ui();
         break;
     case CHAT_EVT_TURN_END:
+        flush_messages_ui();
         if (g_turn_state != CHAT_TURN_NORMAL_ACTIVE)
             break;
         g_chat_streaming = 0;
         g_turn_state = CHAT_TURN_IDLE;
-        save_if_dirty();
-        set_can_send(1);
+        persist_binding(1);
+        set_can_send(can_send_now());
         break;
     case CHAT_EVT_ERROR:
-        g_chat_streaming = 0;
-        restore_new_history_backup();
-        g_turn_state = CHAT_TURN_IDLE;
-        save_if_dirty();
-        if (detail && detail[0]) chat_ui_status(detail);
-        else chat_ui_status_i18n("连接失败", "Connection failed");
-        set_can_send(1);
+        terminal_failure("连接失败", "Connection failed", detail);
         break;
     default:
         break;
     }
-    free(detail);
+    chat_event_free(event);
 }
 
 void chat_ui_on_send(int health_running) {
@@ -424,9 +652,17 @@ void chat_ui_on_send(int health_running) {
     const char* text;
     size_t text_length;
     int is_new;
+    int prior_resume_safe;
     cJSON* backup = NULL;
     cJSON* empty_history = NULL;
     if (!g_page || g_turn_state != CHAT_TURN_IDLE) return;
+    if (can_retry_now()) {
+        g_auto_connect_blocked = 0;
+        set_can_send(0);
+        chat_ui_status_i18n("正在连接…", "Connecting…");
+        chat_connect();
+        return;
+    }
     raw = ui_page_get_json(g_page, "draft");
     if (!raw) return;
     json = cJSON_Parse(raw);
@@ -451,6 +687,7 @@ void chat_ui_on_send(int health_running) {
     }
     if (!chat_is_ready()) {
         chat_ui_status_i18n("连接中…连接后请再次发送", "Connecting… send again when connected");
+        g_auto_connect_blocked = 0;
         chat_connect();
         cJSON_Delete(json);
         return;
@@ -468,9 +705,20 @@ void chat_ui_on_send(int health_running) {
             return;
         }
     }
+    /* Allocate /new compensation before making the on-disk binding unsafe. */
+    prior_resume_safe = g_history_document.resume_safe;
+    if (!persist_binding(0)) {
+        cJSON_Delete(backup);
+        cJSON_Delete(empty_history);
+        g_history_document.resume_safe = prior_resume_safe;
+        chat_ui_status_i18n("聊天记录保存失败，未发送消息", "Could not save chat history; message was not sent");
+        cJSON_Delete(json);
+        return;
+    }
     if (chat_send(is_new ? "/new" : text) != 0) {
         cJSON_Delete(backup);
         cJSON_Delete(empty_history);
+        persist_binding(prior_resume_safe);
         chat_ui_status_i18n("发送失败", "Send failed");
         cJSON_Delete(json);
         return;
@@ -481,8 +729,10 @@ void chat_ui_on_send(int health_running) {
     if (is_new) {
         discard_new_history_backup();
         g_new_history_backup = backup;
+        g_history_document.messages = NULL;
         cJSON_Delete(g_messages);
         g_messages = empty_history;
+        g_history_document.messages = g_messages;
         g_msg_next_id = 1;
         mark_dirty();
         push_messages_ui();
@@ -494,14 +744,33 @@ void chat_ui_on_send(int health_running) {
     cJSON_Delete(json);
 }
 
-static void on_send_click(UiWidget widget, void* userdata) {
+static void on_send(UiWidget widget, void* userdata) {
     (void)widget;
     (void)userdata;
-    chat_ui_on_send(g_health_fn ? g_health_fn() : 0);
+    if (can_send_now() || can_retry_now()) chat_ui_on_send(g_health_fn ? g_health_fn() : 0);
 }
 
 void chat_ui_mount_send(UiPage page, UiWidget widget, void* userdata) {
     (void)page;
     (void)userdata;
-    ui_widget_on_click(widget, on_send_click, NULL);
+    ui_widget_on_click(widget, on_send, NULL);
+}
+
+void chat_ui_mount_input(UiPage page, UiWidget widget, void* userdata) {
+    (void)page;
+    (void)userdata;
+    ui_text_input_on_submit(widget, on_send, NULL);
+}
+
+void chat_ui_mount_scroll(UiPage page, UiWidget widget, void* userdata) {
+    (void)page;
+    (void)userdata;
+    g_chat_scroll = widget;
+    ui_scroll_to_end(widget);
+}
+
+void chat_ui_unmount_scroll(UiPage page, UiWidget widget, void* userdata) {
+    (void)page;
+    (void)userdata;
+    if (g_chat_scroll == widget) g_chat_scroll = 0;
 }
