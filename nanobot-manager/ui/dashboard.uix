@@ -314,6 +314,14 @@ export default {
   }
 
   .msg-text {
+    /* block, not the label default inline. An inline wrap label reports a
+       single-line height (SizeHint -> HeightForWidth(fixedW=0) skips the
+       multi-line branch) while OnDraw wraps to N lines at the bubble's
+       max-width:85%, so multi-line bot replies overlap. block stretches the
+       label to the bubble's resolved width, making measure and draw agree.
+       Shrink-to-fit is preserved: the bubble's own width still comes from the
+       label's intrinsic SizeHint width, clamped by max-width. */
+    display: block;
     font-size: 13px;
     color: inherit;
   }
