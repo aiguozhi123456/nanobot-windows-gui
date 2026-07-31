@@ -75,3 +75,26 @@ The wide brand lockup that combines the robot head with the product name; suited
 
 ### App Icon Resource
 The multi-size Windows icon asset embedded into the manager executable and reused by the tray, shell properties, and installer UI so all of those surfaces share one brand mark.
+
+## Dual-Repo & Submodule
+
+### Core UI Submodule
+The git submodule that embeds the shared native UI framework under `core-ui/` so the manager can load UIX pages and call Core UI APIs without owning the framework's history.
+
+The parent product records only a Submodule Pin for that tree; framework commits, tags, and public API changes live in the core-ui repository and must be published there before the parent depends on them.
+
+### Submodule Pin
+The gitlink SHA the parent repository records for the Core UI Submodule checkout — the single commit object that clones and CI must resolve.
+
+A Submodule Pin is independent of the Submodule Remote URL: retargeting where git fetches does not move the pin, and bumping the pin does not change the remote.
+
+### Submodule Remote URL
+The fetch/push location configured for the Core UI Submodule (via `.gitmodules` and the submodule's `origin`), independent of which Submodule Pin the parent currently records.
+
+Changing only the Submodule Remote URL does not change framework content; clones still need the pin's commit object to exist at that remote.
+
+### Dual-Repo Feature Landing
+The ordered practice of shipping a Core UI capability first in the framework repository, then consuming it in the parent product by bumping the Submodule Pin and wiring manager code to the new APIs.
+
+Landing only parent product changes while leaving framework commits unpushed, or treating `core-ui/` edits as monorepo product source, leaves other clones unable to resolve the Submodule Pin.
+

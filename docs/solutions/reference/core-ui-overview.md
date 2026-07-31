@@ -384,6 +384,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 ## Related
 
 - `docs/solutions/reference/nanobot-gateway-overview.md` — companion reference：nanobot 上游网关整体画像
+- `docs/solutions/architecture-patterns/dual-repo-core-ui-submodule-workflow.md` — 父仓 pin / 子模块 remote / 双仓落地顺序（与能力画像互补）
 - `docs/solutions/architecture-patterns/native-websocket-chat-integration.md` — chat 集成的三层架构（用到 `v-for` / `v-model` / `ScrollView`）
 - `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — `ui_page_get_json` 读回模式（Apply 按钮）与 `ui_text_input_on_changed` 缺失的影响
 - `AGENTS.md` — core-ui API 使用约定（"prefer `core-ui/docs/uix-ai-guide.md` 及 `core-ui/include/ui_core.h`"）
