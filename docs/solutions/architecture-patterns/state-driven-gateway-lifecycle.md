@@ -1,7 +1,7 @@
 ---
 title: "State-Driven Gateway Lifecycle Management on Windows"
 date: 2026-07-13
-last_updated: 2026-07-14
+last_updated: 2026-07-31
 category: architecture-patterns
 module: nanobot-manager/process
 problem_type: architecture_pattern
@@ -191,6 +191,14 @@ Health is sampled state. `health_worker` runs `nanobot_detect_running_port` off 
 
 Do not poll process death as though it were health, synchronously query HTTP health from UI callbacks, or infer service readiness merely because a process handle remains unsignaled.
 
+### First-iteration bypass for user-initiated probes
+
+The polling-state guard in `health_worker` (`main.cpp`) returns early when state is not in `{STARTING, RUNNING, RESOLVING}`. That guard exists to keep a worker that is mid-shutdown from posting `running = 1` and undoing `stop_worker`, but it makes a user click on the refresh button during `IDLE` or `DEAD` a silent no-op — the worker probes, the gen check passes, then the state guard bails before `PostMessageW`.
+
+Resolution (M8): the worker widens its allow-list on the **first iteration only** to also accept `IDLE`/`DEAD`. Subsequent iterations and any `STOPPING` transition still bail before post, so steady-state strictness and the in-progress-stop invariant are preserved. The click handler calls the existing `kick_health_worker`; the new gen bumps the M7 generation counter, so a click that supersedes a boot-phase worker does not double-post — the old worker exits at the gen check, the new worker posts once, then continues under the standard guard. The reactive bool `canRefresh` (`set_status` in `main.cpp`, `dashboard.uix`) is wired so the button is visibly disabled during `STARTING`/`STOPPING`, making the no-op visible instead of looking like a broken control.
+
+Full symptom and resolution: [Refresh button does nothing in IDLE](../ui-bugs/refresh-button-silent-in-idle.md).
+
 ### Serialize lifecycle state and marshal UI updates
 
 The lifecycle is explicit in `nm_state`: unresolved, resolving, idle, starting, running, stopping, and terminal unavailability (`DEAD`). Process state lives behind one critical section; callers use snapshots and accessors rather than raw cross-thread globals.
@@ -286,3 +294,4 @@ Do not add the full pattern to an in-process component with no independent lifec
 - [Native WebSocket Chat Integration](native-websocket-chat-integration.md) — related worker-to-UI messaging, generation, and resource-close discipline for chat transport.
 - [Testing and CI Setup](../infrastructure/testing-and-ci-setup.md) — CTest wiring and the boundary between native unit coverage and manual process/WinHTTP integration verification.
 - [Configuration System](config-system.md) — manager-owned non-sensitive configuration and legacy JSON migration behavior; its older plaintext `webui_auth` examples require refresh.
+- [Refresh button does nothing in IDLE](../ui-bugs/refresh-button-silent-in-idle.md) — the `health_worker` M8 first-iteration bypass that lets a user click deliver a probe result from `IDLE`/`DEAD` without breaking the `STOPPING` guard.
