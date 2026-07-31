@@ -123,3 +123,15 @@ The framework's binding of its text-measurement context to the active renderer, 
 
 Layout triggered outside that scope runs with no measure context, so text measurement silently degrades: multi-line text reports a single-line height and caret geometry reports zero advance. Event callbacks must therefore only request a layout (mark it dirty) and let the next frame's scoped layout pass perform it, never invoke layout synchronously. This is the same unbound-measure hazard named under IME Caret Position.
 
+## Window Management
+
+### System Tray
+The Windows notification area that hosts the manager's icon when the main window is hidden, allowing the app to stay resident without a visible taskbar presence.
+
+The user interacts with the tray icon through double-click (summon) or the right-click context menu (show / quit). Closing the main window while tray mode is active routes that close into a hide rather than an exit, so the process continues running until the user explicitly quits from the tray menu.
+
+### Global Hotkey Summon
+A registered system-wide keyboard shortcut (Ctrl+Shift+N) that brings the manager window to the foreground from any application.
+
+Because Windows enforces a foreground-lock that silently rejects `SetForegroundWindow` from background threads, the implementation must use `AttachThreadInput` to temporarily share the input queue with the foreground thread before activating. The hotkey is registered against the window HWND after creation and unregistered before destruction; if another application already owns the key combo, registration fails silently with no crash or popup.
+
