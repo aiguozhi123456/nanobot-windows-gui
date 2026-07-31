@@ -31,11 +31,13 @@ static int       g_tray_icon_owned = 0;
 static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
 static int       g_hotkey_registered = 0;
+static int       g_focus_chat_pending = 0;
 static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
+#define TIMER_FOCUS_CHAT 1005
 #define CHAT_UI_FRAME_MS 33
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
@@ -57,6 +59,7 @@ static int       g_effective_health_port = 18790;
 static void tray_remove(void);
 static int has_arg(LPCWSTR cmd, const wchar_t* arg);
 static int can_edit_gateway_port(void);
+static VOID CALLBACK on_timer_focus_chat(HWND, UINT, UINT_PTR, DWORD);
 
 static void show_main_window(void) {
     if (!g_win) return;
@@ -88,13 +91,14 @@ static void show_main_window(void) {
 
     ui_window_show(g_win);
 
-    /* Give keyboard focus to the chat input so the user can start typing
-     * immediately after the window surfaces (tray double-click, hotkey). */
-    {
-        UiWidget root = ui_page_root(g_page);
-        UiWidget input = ui_widget_find_by_id(root, "chat_input");
-        if (input)
-            ui_window_focus_widget(g_win, input);
+    /* Always land on the chat page and focus the input so the user can
+     * start typing immediately after the window surfaces (tray double-
+     * click, hotkey toggle).  The v-if remount needs a frame, so the
+     * actual focus is deferred to a one-shot timer. */
+    ui_page_set_text(g_page, "page", L"chat");
+    if (!g_focus_chat_pending) {
+        g_focus_chat_pending = 1;
+        SetTimer(g_hwnd, TIMER_FOCUS_CHAT, 50, on_timer_focus_chat);
     }
 }
 
@@ -270,6 +274,18 @@ static void set_status(const char* status, const char* text, const char* sub) {
 static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)id; (void)tick;
     chat_ui_publish_tick();
+}
+
+/* One-shot: after the page reactive variable flips to "chat", the v-if
+ * remount needs a frame to materialize chat_input in the widget tree. */
+static VOID CALLBACK on_timer_focus_chat(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    g_focus_chat_pending = 0;
+    if (!g_win || !g_page) return;
+    UiWidget root = ui_page_root(g_page);
+    UiWidget input = ui_widget_find_by_id(root, "chat_input");
+    if (input)
+        ui_window_focus_widget(g_win, input);
 }
 
 static int can_edit_gateway_port(void) {
@@ -1837,6 +1853,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_chat_ui_timer) {
         KillTimer(hwnd, TIMER_CHAT_UI);
         g_chat_ui_timer = 0;
+    }
+    if (g_focus_chat_pending) {
+        KillTimer(hwnd, TIMER_FOCUS_CHAT);
+        g_focus_chat_pending = 0;
     }
     chat_ui_shutdown();
     ui_page_destroy(g_page);
