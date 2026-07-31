@@ -838,7 +838,14 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
     }
     if (msg == WM_HOTKEY && wp == ID_HOTKEY_SUMMON) {
-        show_main_window();
+        /* Toggle: only hide when the window is fully visible (not minimized).
+         * If minimized, restore it so the hotkey always surfaces the UI. */
+        if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) {
+            ui_window_hide(g_win);
+            ShowWindow(g_hwnd, SW_HIDE);
+        } else {
+            show_main_window();
+        }
         return 0;
     }
     if (msg == WM_COMMAND) {
@@ -1610,7 +1617,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_tray=最小化到托盘\n"
             "setting_tray_sub=关闭窗口时隐藏到系统托盘\n"
             "setting_hotkey=快捷键呼出\n"
-            "setting_hotkey_sub=按 Ctrl+Shift+N 显示窗口\n"
+            "setting_hotkey_sub=显示或隐藏窗口 (Ctrl+Shift+N)\n"
             "setting_path=nanobot 路径\n"
             "setting_path_change=更改\n"
             "setting_theme=主题\n"
@@ -1646,7 +1653,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_tray=Minimize to tray\n"
             "setting_tray_sub=Hide to system tray on close\n"
             "setting_hotkey=Summon hotkey\n"
-            "setting_hotkey_sub=Press Ctrl+Shift+N to show the window\n"
+            "setting_hotkey_sub=Show or hide window (Ctrl+Shift+N)\n"
             "setting_path=nanobot path\n"
             "setting_path_change=Change\n"
             "setting_theme=Theme\n"
