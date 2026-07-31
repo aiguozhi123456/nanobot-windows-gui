@@ -87,6 +87,15 @@ static void show_main_window(void) {
     }
 
     ui_window_show(g_win);
+
+    /* Give keyboard focus to the chat input so the user can start typing
+     * immediately after the window surfaces (tray double-click, hotkey). */
+    {
+        UiWidget root = ui_page_root(g_page);
+        UiWidget input = ui_widget_find_by_id(root, "chat_input");
+        if (input)
+            ui_window_focus_widget(g_win, input);
+    }
 }
 
 static void tray_show_menu(HWND hwnd) {
