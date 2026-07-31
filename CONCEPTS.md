@@ -98,3 +98,21 @@ The ordered practice of shipping a Core UI capability first in the framework rep
 
 Landing only parent product changes while leaving framework commits unpushed, or treating `core-ui/` edits as monorepo product source, leaves other clones unable to resolve the Submodule Pin.
 
+## Core UI Input & IME
+
+### Custom-Drawn Text Input
+A Core UI single- or multi-line text field whose caret, selection, and glyphs are painted by the framework (Direct2D) rather than hosted as a system edit control.
+
+Because the OS does not own the caret geometry, anything that must track the caret — including Input Method composition chrome — needs explicit framework reporting; successful character commit alone does not imply that chrome is positioned correctly.
+
+### IME Caret Position
+The caret origin the framework reports to the platform input method so composition and candidate windows attach near the visible insertion point.
+
+For a Custom-Drawn Text Input the position is derived from the same layout the control uses to draw the caret, then converted to client or screen coordinates; a measure path that is not bound to the active renderer can silently report zero text advance and place chrome at the field origin or the window corner.
+
+### Composition Window
+The platform input-method UI that shows in-progress composition (for example pinyin preedit) while the user is still choosing characters.
+
+### Candidate Window
+The platform input-method UI that lists conversion candidates; it should follow the IME Caret Position rather than defaulting to the client origin when the host is a Custom-Drawn Text Input.
+

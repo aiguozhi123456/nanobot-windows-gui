@@ -348,6 +348,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 | 1.7.0 渲染线程迁移 | 是干净基线，未来 overlay / submenu 服务可能在此上演进 |
 | 无 `ui_text_input_on_changed` | 文本 / 数字 input 须用 Apply 按钮读回（已是 manager 的既定模式） |
 | 无 `type="password"` 渲染 | input factory 落到普通 `TextInput`，无掩码；`webui_auth` 明文显示（框架限制） |
+| 自绘 TextInput 的 IME 候选位置 | 须 `ImmSetCompositionWindow` / `IMR_QUERYCHARPOSITION` 报 caret；仅 `WM_CHAR` 能上屏不够。见 `docs/solutions/ui-bugs/ime-candidate-window-top-left-custom-textinput.md` |
 
 ## Reference Index
 
