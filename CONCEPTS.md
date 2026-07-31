@@ -116,3 +116,10 @@ The platform input-method UI that shows in-progress composition (for example pin
 ### Candidate Window
 The platform input-method UI that lists conversion candidates; it should follow the IME Caret Position rather than defaulting to the client origin when the host is a Custom-Drawn Text Input.
 
+## Core UI Layout & Text Measurement
+
+### Measure Context Scope
+The framework's binding of its text-measurement context to the active renderer, established only during a scoped layout pass and required for any text measurement — wrap height or caret advance — to be correct.
+
+Layout triggered outside that scope runs with no measure context, so text measurement silently degrades: multi-line text reports a single-line height and caret geometry reports zero advance. Event callbacks must therefore only request a layout (mark it dirty) and let the next frame's scoped layout pass perform it, never invoke layout synchronously. This is the same unbound-measure hazard named under IME Caret Position.
+
