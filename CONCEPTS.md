@@ -64,3 +64,14 @@ An unreadable existing history is never treated as permission to overwrite it. A
 A display item representing one user or assistant message in Chat History.
 
 An assistant bubble may be built from partial response events and then normalized by a complete response; transient rendering identity is not part of durable Chat History.
+
+## Branding & Packaging
+
+### Nanobot Mark
+The square robot-head brand glyph used for small system chrome — Windows app icon, tray, taskbar, and installer — as opposed to the wide wordmark that pairs the glyph with product lettering.
+
+### Nanobot Wordmark
+The wide brand lockup that combines the robot head with the product name; suited to README, marketing, and wide UI surfaces, not to 16–32 px Windows chrome.
+
+### App Icon Resource
+The multi-size Windows icon asset embedded into the manager executable and reused by the tray, shell properties, and installer UI so all of those surfaces share one brand mark.
