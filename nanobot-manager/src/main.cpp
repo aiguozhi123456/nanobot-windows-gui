@@ -197,13 +197,18 @@ static void set_status(const char* status, const char* text, const char* sub) {
     if (strcmp(status, "running") == 0) {
         ui_page_set_bool(g_page, "canStart", 0);
         ui_page_set_bool(g_page, "canStop", 1);
+        ui_page_set_bool(g_page, "canRefresh", 1);
     } else if (strcmp(status, "starting") == 0 || strcmp(status, "stopping") == 0) {
-        /* M5: "stopping" disables both buttons -- same as "starting". */
+        /* M5: "stopping" disables both buttons -- same as "starting".
+         * M8: also disable refresh during transitions -- the worker guard
+         * would no-op a click here anyway, but a disabled button is clearer. */
         ui_page_set_bool(g_page, "canStart", 0);
         ui_page_set_bool(g_page, "canStop", 0);
+        ui_page_set_bool(g_page, "canRefresh", 0);
     } else {
         ui_page_set_bool(g_page, "canStart", 1);
         ui_page_set_bool(g_page, "canStop", 0);
+        ui_page_set_bool(g_page, "canRefresh", 1);
     }
     ui_page_set_bool(g_page, "canEditGatewayPort", can_edit_gateway_port());
 }
@@ -430,7 +435,7 @@ typedef struct { HWND hwnd; LONG gen; int configured_port; } health_ctx;
 typedef struct { int running; int actual_port; } health_result_payload;
 
 static DWORD WINAPI health_worker(LPVOID param) {
-    health_ctx* c = (health_ctx*)param;
+health_ctx* c = (health_ctx*)param;
     HWND hwnd = c->hwnd;
     LONG my_gen = c->gen;
     int configured_port = c->configured_port;
@@ -439,6 +444,15 @@ static DWORD WINAPI health_worker(LPVOID param) {
     static const int cadence[] = {1000,1000,1500,2000,2000,3000,3000,5000,5000,5000};
     const int boot_count = (int)(sizeof(cadence) / sizeof(cadence[0]));
     int i = 0;
+    /* M8: first-iteration bypass for user-initiated refresh (btn_refresh
+     * kicked while the worker is NOT yet polling, e.g. state=IDLE/DEAD).
+     * The default polling guard bails BEFORE posting when state is not
+     * STARTING/RUNNING/RESOLVING; that guard is correct for stopping
+     * transitions (a stale worker must not inject "running=1" after stop)
+     * but it makes a user click during IDLE a silent no-op. The bypass is
+     * restricted to IDLE/DEAD on the FIRST iteration only, so a refresh
+     * during STOPPING still bails and cannot undo an in-progress stop. */
+    int first_iteration = 1;
 
     for (;;) {
         int actual_port = 0;
@@ -449,12 +463,23 @@ static DWORD WINAPI health_worker(LPVOID param) {
          * tolerance, but the ordering should be correct. */
         if (InterlockedCompareExchange(&g_health_gen, my_gen, my_gen) != my_gen)
             return 0;
-        /* Stop/dead happened on the UI thread? RESOLVING is allowed so the
-         * detect-only startup path (M2 leaves RESOLVING until the first health
-         * result) can post; apply_health_result then settles to RUNNING/IDLE. */
+        /* Polling-state guard: RESOLVING is allowed so the detect-only startup
+         * path (M2 leaves RESOLVING until the first health result) can post;
+         * apply_health_result then settles to RUNNING/IDLE. First iteration
+         * from IDLE/DEAD bypasses the guard so btn_refresh delivers one result
+         * (see M8 above). All other first-iteration entries (STARTING/RUNNING/
+         * RESOLVING/STOPPING) and every subsequent iteration use the same
+         * allow-list as before. */
         nm_state s = nm_state_get();
-        if (s != NM_STATE_STARTING && s != NM_STATE_RUNNING && s != NM_STATE_RESOLVING)
-            return 0;
+        int allow_post;
+        if (first_iteration) {
+            first_iteration = 0;
+            allow_post = (s == NM_STATE_IDLE || s == NM_STATE_DEAD)
+                || (s == NM_STATE_STARTING || s == NM_STATE_RUNNING || s == NM_STATE_RESOLVING);
+        } else {
+            allow_post = (s == NM_STATE_STARTING || s == NM_STATE_RUNNING || s == NM_STATE_RESOLVING);
+        }
+        if (!allow_post) return 0;
 
         health_result_payload* result = (health_result_payload*)malloc(sizeof(*result));
         if (!result) return 0;
@@ -813,6 +838,11 @@ static void on_stop(UiWidget w, void* ud) {
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     CreateThread(NULL, 0, stop_worker, (LPVOID)hwnd, 0, NULL);
+}
+
+static void on_refresh(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    kick_health_worker((HWND)ui_window_hwnd(g_win));
 }
 
 static void on_autostart_toggle(UiWidget w, int val, void* ud) {
@@ -1195,6 +1225,12 @@ static void on_btn_stop_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_stop, NULL);
 }
 
+static void on_btn_refresh_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_page_set_bool(g_page, "canRefresh", 1);
+    ui_widget_on_click(w, on_refresh, NULL);
+}
+
 static void on_toggle_mount(UiPage p, UiWidget w, void* ud) {
     (void)p; (void)ud;
     ui_toggle_on_changed(w, on_autostart_toggle, NULL);
@@ -1503,6 +1539,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "metric_uptime=运行时间\n"
             "btn_start=启动\n"
             "btn_stop=停止\n"
+            "btn_refresh=刷新\n"
             "settings_general=通用\n"
             "settings_appearance=外观\n"
             "setting_autostart=开机自启\n"
@@ -1536,6 +1573,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "metric_uptime=Uptime\n"
             "btn_start=Start\n"
             "btn_stop=Stop\n"
+            "btn_refresh=Refresh\n"
             "settings_general=General\n"
             "settings_appearance=Appearance\n"
             "setting_autostart=Auto-start on boot\n"
@@ -1644,6 +1682,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
+    ui_page_on_widget_mount(g_page, "btn_refresh", on_btn_refresh_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_autostart", on_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);

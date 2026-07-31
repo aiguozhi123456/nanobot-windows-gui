@@ -10,6 +10,7 @@ export default {
       statusSub: "nanobot is not running",
       canStart: true,
       canStop: false,
+      canRefresh: true,
       port: "18790",
       pid: "-",
       uptime: "00:00",
@@ -231,6 +232,22 @@ export default {
   }
 
   .btn-stop-disabled {
+    background: var(--disabled-bg);
+    color: var(--disabled-text);
+    cursor: default;
+  }
+
+  .btn-refresh {
+    background: var(--bg-2);
+    color: var(--fg-2);
+  }
+
+  .btn-refresh:hover {
+    background: var(--btn-hover);
+  }
+
+  .btn-refresh:disabled,
+  .btn-refresh:disabled:hover {
     background: var(--disabled-bg);
     color: var(--disabled-text);
     cursor: default;
@@ -718,6 +735,12 @@ export default {
                 <path fill="currentColor" d="M6 6h12v12H6z"/>
               </svg>
               <label class="btn-label">{{ $t('btn_stop') }}</label>
+            </div>
+            <div id="btn_refresh" class="btn btn-refresh" :enabled="canRefresh">
+              <svg width="12" height="12" viewBox="0 0 24 24">
+                <path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 107.75 10h-2.1A6 6 0 1112 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/>
+              </svg>
+              <label class="btn-label">{{ $t('btn_refresh') }}</label>
             </div>
           </div>
         </div>
