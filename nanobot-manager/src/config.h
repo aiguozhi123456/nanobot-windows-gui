@@ -11,6 +11,7 @@ typedef struct {
     char* nanobot_path;
     int autostart_nanobot;
     int stay_in_tray;
+    int hotkey_enabled;     /* global Ctrl+Shift+N summon hotkey, default on */
     int health_check_port;
     int theme_mode;
     char language[8];

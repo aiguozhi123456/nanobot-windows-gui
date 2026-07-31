@@ -30,6 +30,7 @@ static int       g_tray_added = 0;
 static int       g_tray_icon_owned = 0;
 static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
+static int       g_hotkey_registered = 0;
 static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
 
@@ -38,6 +39,12 @@ static int       g_effective_health_port = 18790;
 #define CHAT_UI_FRAME_MS 33
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
+
+/* Global summon hotkey: Ctrl+Shift+N. Registered against g_hwnd; WM_HOTKEY is
+ * routed to subclass_proc by core-ui's ui_run() pump alongside WM_TRAY_ICON. */
+#define ID_HOTKEY_SUMMON 0xB000
+#define HOTKEY_MODS (MOD_CONTROL | MOD_SHIFT)
+#define HOTKEY_VK   'N'
 
 #define WM_ASYNC_STOP_DONE      (WM_APP + 2)
 #define WM_TRAY_ICON            (WM_APP + 3)
@@ -73,6 +80,20 @@ static void tray_show_menu(HWND hwnd) {
         pt.x, pt.y, 0, hwnd, NULL);
     DestroyMenu(menu);
     PostMessageW(hwnd, WM_NULL, 0, 0);
+}
+
+static void hotkey_register(HWND hwnd) {
+    if (g_hotkey_registered || !hwnd) return;
+    if (RegisterHotKey(hwnd, ID_HOTKEY_SUMMON, HOTKEY_MODS, HOTKEY_VK))
+        g_hotkey_registered = 1;
+    /* If another app already owns Ctrl+Shift+N the call fails silently:
+     * g_hotkey_registered stays 0, the toggle stays on, no crash/no popup. */
+}
+
+static void hotkey_unregister(void) {
+    if (g_hotkey_registered && g_hwnd)
+        UnregisterHotKey(g_hwnd, ID_HOTKEY_SUMMON);
+    g_hotkey_registered = 0;
 }
 
 static void tray_add(HWND hwnd) {
@@ -792,6 +813,10 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
             return 0;
         }
     }
+    if (msg == WM_HOTKEY && wp == ID_HOTKEY_SUMMON) {
+        show_main_window();
+        return 0;
+    }
     if (msg == WM_COMMAND) {
         switch (LOWORD(wp)) {
         case ID_TRAY_SHOW:
@@ -1278,6 +1303,20 @@ static void on_tray_toggle_mount(UiPage p, UiWidget w, void* ud) {
     ui_toggle_on_changed(w, on_tray_toggle, NULL);
 }
 
+static void on_hotkey_toggle(UiWidget w, int val, void* ud) {
+    (void)w; (void)ud;
+    g_cfg.hotkey_enabled = val;
+    config_save(&g_cfg);
+    ui_page_set_bool(g_page, "hotkeyEnabled", val);
+    if (val) hotkey_register(g_hwnd);
+    else     hotkey_unregister();
+}
+
+static void on_hotkey_toggle_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_toggle_on_changed(w, on_hotkey_toggle, NULL);
+}
+
 static void apply_lang(const char* loc) {
     strncpy(g_cfg.language, loc, sizeof(g_cfg.language) - 1);
     config_save(&g_cfg);
@@ -1546,6 +1585,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_autostart_sub=Windows 启动时自动运行\n"
             "setting_tray=最小化到托盘\n"
             "setting_tray_sub=关闭窗口时隐藏到系统托盘\n"
+            "setting_hotkey=快捷键呼出\n"
+            "setting_hotkey_sub=按 Ctrl+Shift+N 显示窗口\n"
             "setting_path=nanobot 路径\n"
             "setting_path_change=更改\n"
             "setting_theme=主题\n"
@@ -1580,6 +1621,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_autostart_sub=Launch when Windows starts\n"
             "setting_tray=Minimize to tray\n"
             "setting_tray_sub=Hide to system tray on close\n"
+            "setting_hotkey=Summon hotkey\n"
+            "setting_hotkey_sub=Press Ctrl+Shift+N to show the window\n"
             "setting_path=nanobot path\n"
             "setting_path_change=Change\n"
             "setting_theme=Theme\n"
@@ -1636,6 +1679,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     /* canStart/canStop are set by set_status_i18n("starting",...) above to 0/0 */
     ui_page_set_bool(g_page, "autostart", autostart_is_enabled());
     ui_page_set_bool(g_page, "stayInTray", g_cfg.stay_in_tray);
+    ui_page_set_bool(g_page, "hotkeyEnabled", g_cfg.hotkey_enabled);
 
     wchar_t port_w[16];
     g_effective_health_port = g_cfg.health_check_port;
@@ -1685,6 +1729,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_refresh", on_btn_refresh_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_autostart", on_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
+    ui_page_on_widget_mount(g_page, "toggle_hotkey", on_hotkey_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_apply_network", on_btn_apply_network_mount, NULL);
@@ -1717,6 +1762,8 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     if (g_tray_enabled_effective)
         tray_add(hwnd);
+    if (g_cfg.hotkey_enabled)
+        hotkey_register(hwnd);
 
     set_chat_endpoint_from_credential(0);
     chat_init(hwnd, WM_CHAT_EVENT);
@@ -1745,6 +1792,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     stop_uptime_timer();
     tray_remove();
+    hotkey_unregister();
     RemoveWindowSubclass(hwnd, subclass_proc, 0);
     if (g_chat_ui_timer) {
         KillTimer(hwnd, TIMER_CHAT_UI);

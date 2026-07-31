@@ -16,6 +16,7 @@ export default {
       uptime: "00:00",
       autostart: false,
       stayInTray: false,
+      hotkeyEnabled: true,
       nanobotPath: "",
       webuiPort: "8765",
       healthPort: "18790",
@@ -762,6 +763,14 @@ export default {
               <label class="setting-sub">{{ $t('setting_tray_sub') }}</label>
             </div>
             <toggle id="toggle_tray" v-model="stayInTray"/>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_hotkey') }}</label>
+              <label class="setting-sub">{{ $t('setting_hotkey_sub') }}</label>
+            </div>
+            <toggle id="toggle_hotkey" v-model="hotkeyEnabled"/>
           </div>
 
           <div class="path-row">

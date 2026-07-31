@@ -11,6 +11,7 @@ static int configs_equal(const app_config* left, const app_config* right) {
     return strcmp(left_path, right_path) == 0 &&
         left->autostart_nanobot == right->autostart_nanobot &&
         left->stay_in_tray == right->stay_in_tray &&
+        left->hotkey_enabled == right->hotkey_enabled &&
         left->health_check_port == right->health_check_port &&
         left->theme_mode == right->theme_mode &&
         strcmp(left->language, right->language) == 0 &&
@@ -19,7 +20,7 @@ static int configs_equal(const app_config* left, const app_config* right) {
 
 static const char* FULL_JSON =
     "{\"nanobot_path\":\"C:\\\\tools\\\\nanobot.exe\","
-    "\"autostart_nanobot\":true,\"stay_in_tray\":true,"
+    "\"autostart_nanobot\":true,\"stay_in_tray\":true,\"hotkey_enabled\":false,"
     "\"health_check_port\":19000,\"theme_mode\":2,"
     "\"language\":\"en\",\"webui_port\":9000,"
     "\"webui_auth\":\"nbwt_abcdef\"}";
@@ -30,6 +31,7 @@ static void test_defaults(void) {
     TEST_CHECK(cfg.nanobot_path == NULL);
     TEST_CHECK(cfg.autostart_nanobot == 0);
     TEST_CHECK(cfg.stay_in_tray == 0);
+    TEST_CHECK(cfg.hotkey_enabled == 1);
     TEST_CHECK(cfg.health_check_port == 18790);
     TEST_CHECK(cfg.webui_port == 8765);
     TEST_CHECK(cfg.theme_mode == 0);
@@ -42,7 +44,7 @@ static void test_parse_full(void) {
     config_apply_defaults(&cfg);
     TEST_CHECK(config_parse_json(&cfg, FULL_JSON) == 0);
     TEST_CHECK(cfg.nanobot_path && strcmp(cfg.nanobot_path, "C:\\tools\\nanobot.exe") == 0);
-    TEST_CHECK(cfg.autostart_nanobot == 1 && cfg.stay_in_tray == 1);
+    TEST_CHECK(cfg.autostart_nanobot == 1 && cfg.stay_in_tray == 1 && cfg.hotkey_enabled == 0);
     TEST_CHECK(cfg.health_check_port == 19000 && cfg.webui_port == 9000);
     TEST_CHECK(cfg.theme_mode == 2 && strcmp(cfg.language, "en") == 0);
     config_free(&cfg);

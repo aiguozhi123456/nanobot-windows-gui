@@ -152,6 +152,7 @@ void config_apply_defaults(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 18790;
     cfg->theme_mode = 0;
+    cfg->hotkey_enabled = 1;
     cfg->webui_port = 8765;
     strcpy(cfg->language, "zh");
 }
@@ -186,6 +187,8 @@ int config_parse_json(app_config* cfg, const char* json) {
     if (item && cJSON_IsBool(item)) cfg->autostart_nanobot = item->valueint;
     item = cJSON_GetObjectItem(root, "stay_in_tray");
     if (item && cJSON_IsBool(item)) cfg->stay_in_tray = item->valueint;
+    item = cJSON_GetObjectItem(root, "hotkey_enabled");
+    if (item && cJSON_IsBool(item)) cfg->hotkey_enabled = item->valueint;
     item = cJSON_GetObjectItem(root, "health_check_port");
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint > 0 && item->valueint <= 65535)
         cfg->health_check_port = item->valueint;
@@ -245,6 +248,7 @@ char* config_serialize_json(const app_config* cfg) {
     else cJSON_AddNullToObject(root, "nanobot_path");
     cJSON_AddBoolToObject(root, "autostart_nanobot", cfg->autostart_nanobot);
     cJSON_AddBoolToObject(root, "stay_in_tray", cfg->stay_in_tray);
+    cJSON_AddBoolToObject(root, "hotkey_enabled", cfg->hotkey_enabled);
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
     cJSON_AddStringToObject(root, "language", cfg->language);
