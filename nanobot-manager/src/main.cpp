@@ -60,9 +60,33 @@ static int can_edit_gateway_port(void);
 
 static void show_main_window(void) {
     if (!g_win) return;
-    ui_window_show(g_win);
-    ShowWindow(g_hwnd, SW_SHOWNORMAL);
+
+    /* SW_RESTORE restores a minimized window to its previous size/position,
+     * and also shows a hidden one — more reliable than SW_SHOWNORMAL. */
+    ShowWindow(g_hwnd, SW_RESTORE);
+
+    /* SetForegroundWindow is silently ignored when our thread doesn't own
+     * the foreground (common when activated from a tray notification or
+     * global hotkey).  AttachThreadInput temporarily shares the input
+     * queue with the foreground thread so the call succeeds. */
+    HWND fg = GetForegroundWindow();
+    int attached = 0;
+    if (fg && fg != g_hwnd) {
+        DWORD fg_tid = GetWindowThreadProcessId(fg, NULL);
+        if (fg_tid != GetCurrentThreadId()) {
+            AttachThreadInput(GetCurrentThreadId(), fg_tid, TRUE);
+            attached = 1;
+        }
+    }
     SetForegroundWindow(g_hwnd);
+    SetActiveWindow(g_hwnd);
+    if (attached) {
+        AttachThreadInput(GetCurrentThreadId(),
+                          GetWindowThreadProcessId(GetForegroundWindow(), NULL),
+                          FALSE);
+    }
+
+    ui_window_show(g_win);
 }
 
 static void tray_show_menu(HWND hwnd) {
