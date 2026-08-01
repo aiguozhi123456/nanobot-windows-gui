@@ -10,13 +10,17 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 - 实时健康检查（WinHTTP `GET /health`）
 - 自动检测 `nanobot.exe`（pip 入口点）或回退到 Python + 模块方式
 - 原生 WebSocket 聊天客户端，流式显示 delta/message，连接 gateway WebUI 端口
+- 本地持久化对话历史，管理器重启后恢复
+- 全局快捷键 **Ctrl+Shift+N**，在任意应用中显示/隐藏窗口（可在设置中开关）
+- 手动刷新状态按钮，按需重新检测 gateway 状态
 - 开机自启（注册表 `HKCU\...\Run`）
 - 静默自启模式（`--autostart`），用于无人值守启动
 - 最小化到系统托盘（设置开关）
+- 便携模式（在 exe 同目录放置 `portable.flag`），配置就近保存
 - 中英双语界面，运行时切换
-- 主题：跟随系统 / 深色 / 浅色
-- 可配置 Gateway 健康端口与 Manager WebUI 端口，认证密钥保存到 Credential Manager
-- NSIS 安装包，猫表情图标，中英文双语安装向导
+- 主题：跟随系统 / 深色 / 浅色（跟随系统时读取 Windows 个性化设置）
+- 可配置 Gateway 健康端口与 Manager WebUI 端口，认证密钥保存到 Credential Manager（绝不写入 `config.json`）
+- NSIS 安装包，nanobot mark 图标，中英文双语安装向导
 
 ## 依赖
 
@@ -31,7 +35,7 @@ cd nanobot-manager
 scripts\build.bat
 ```
 
-构建产物在 `nanobot-manager\build\Release\` 下。
+构建产物在 `nanobot-manager\build\Release\nanobot-manager.exe` 下。
 
 > 构建使用 CMake + MSVC。`core-ui` 作为 git submodule 自动参与构建。
 
@@ -61,6 +65,11 @@ nanobot-manager.exe --delete-credential  删除当前用户保存的引导认证
 nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
 ```
 
+应用运行中：
+
+- **Ctrl+Shift+N** —— 在任意应用中显示或隐藏窗口（可在“设置”中开关）。
+- 关闭管理器**不会**停止 gateway —— 关闭/最小化到托盘时 nanobot 继续运行，方便后台任务持续。需要停止 gateway 请在面板中显式操作。
+
 ## 配置
 
 安装版将 `config.json` 保存到 `%LOCALAPPDATA%\nanobot-manager\config.json`。带有同目录 `portable.flag` 的便携版，以及独立复制的 exe，均在 exe 同目录保存：
@@ -70,6 +79,7 @@ nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
   "nanobot_path": null,
   "autostart_nanobot": false,
   "stay_in_tray": false,
+  "hotkey_enabled": true,
   "health_check_port": 18790,
   "webui_port": 8765,
   "theme_mode": 0,
@@ -82,6 +92,7 @@ nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
 | `nanobot_path` | string \| null | null | 覆盖自动检测的命令路径 |
 | `autostart_nanobot` | bool | false | 管理器启动时是否自动启动 nanobot |
 | `stay_in_tray` | bool | false | 最小化到系统托盘而非退出 |
+| `hotkey_enabled` | bool | true | 启用 Ctrl+Shift+N 全局显示/隐藏快捷键 |
 | `health_check_port` | int | 18790 | 下次由 Manager 启动 Gateway 时使用的 `/health` 配置端口；发现已运行 Gateway 时界面显示其实际端口 |
 | `webui_port` | int | 8765 | 仅 Manager 聊天/WebSocket 的连接覆盖，独立于 Gateway 端口 |
 | 引导认证密钥 | Credential Manager | 未设置 | 可选 gateway `tokenIssueSecret`；绝不写入 `config.json`（旧版 `webui_auth` 启动时迁移） |
@@ -97,27 +108,30 @@ nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
 ```
 nanobot-manager/
 ├── CMakeLists.txt          # 构建配置
-├── assets/app.ico          # 应用图标（猫表情）
+├── assets/app.ico          # 应用图标（nanobot mark）
 ├── installer/installer.nsi # NSIS 安装脚本
 ├── scripts/
 │   ├── build.bat           # 一键构建脚本
 │   └── package.bat         # 构建 + 打包安装程序
 ├── src/
-│   ├── main.cpp            # 入口、UI 回调、托盘、主题/语言、健康定时器、聊天接线
-│   ├── process.c/h         # 进程管理 + WinHTTP 健康检查
-│   ├── config.c/h          # JSON 配置（cJSON）读写
+│   ├── main.cpp            # 入口、UI 回调、托盘、快捷键、主题/语言、健康定时器、聊天接线
+│   ├── process.c/h         # 进程管理 + WinHTTP 健康检查 + uptime
+│   ├── config.c/h          # JSON 配置（cJSON）读写（原子写入）+ 旧版密钥迁移
+│   ├── credential.c/h      # 引导认证密钥的 Windows Credential Manager 存储
 │   ├── autostart.c/h       # 注册表自启（`HKCU\...\Run`）
 │   ├── chat.c/h            # WinHTTP WebSocket 聊天客户端（连接/发送/流式接收）
+│   ├── chat_protocol.c/h   # WebSocket JSON 帧协议（纯逻辑，已单测）
+│   ├── chat_history.c/h    # 本地对话历史持久化（已单测）
 │   ├── chat_ui.c/h         # 聊天 UI 状态 + 消息数组管理
 │   ├── resources.rc        # Windows 资源文件（应用图标）
-│   └── version.h.in        # 版本模板
+│   └── version.h.in        # 版本模板（configure_file 输入）
 └── ui/
     └── dashboard.uix       # Core UI 布局
 ```
 
 ## 测试
 
-单元测试使用内置的 C 测试框架，通过 CTest 运行。覆盖 config JSON 的迁移/校验、使用每进程测试 target 的 Credential Manager 存取删除，以及开机自启注册表逻辑。
+单元测试使用内置的 C 测试框架（`tests/nm_test.h`），通过 CTest 运行。覆盖 config JSON 的迁移/校验、使用每进程测试 target 的 Credential Manager 存取删除、进程辅助逻辑（PID 复用保护、uptime 计算）、开机自启注册表逻辑、聊天历史持久化，以及聊天 WebSocket 帧协议。
 
 带测试构建（默认开启）：
 

@@ -1,6 +1,7 @@
 ---
 title: "Unit-test framework, CTest wiring, and CI for a Win32 GUI app"
 date: 2026-07-11
+last_updated: 2026-08-01
 category: infrastructure
 module: nanobot-manager/tests
 problem_type: tooling_setup
@@ -11,7 +12,8 @@ applies_when:
   - "Wiring a self-contained C test framework into CMake + CTest"
   - "Setting up GitHub Actions CI for a Windows MSVC / CMake project with a git submodule and FetchContent deps"
   - "Testing a module that mutates the real Windows registry (HKCU) without leaving side effects"
-tags: [unit-testing, ctest, cmake, github-actions, ci, msvc, win32, registry, testing]
+  - "Testing a module that wraps Windows Credential Manager without touching the product credential"
+tags: [unit-testing, ctest, cmake, github-actions, ci, msvc, win32, registry, credential-manager, testing]
 ---
 
 # Unit-test framework, CTest wiring, and CI for a Win32 GUI app
@@ -20,21 +22,26 @@ tags: [unit-testing, ctest, cmake, github-actions, ci, msvc, win32, registry, te
 
 `nanobot-manager` is a Win32 GUI app (`WinMain`, `/SUBSYSTEM:WINDOWS`) built with CMake + MSVC, the `core-ui` submodule (which pulls QuickJS-NG), and cJSON via `FetchContent`. It had **no** test suite — `AGENTS.md` stated "verification = build + manual run." Most of the code is side-effect-heavy (process spawn, WinHTTP, registry, UI), which is why it stayed untested.
 
-This documents how a pragmatic unit-test layer + CTest + GitHub Actions CI were added: which modules are testable, the framework choice, the CMake wiring, the registry-safe test pattern, and three real defects the effort surfaced.
+This documents how a pragmatic unit-test layer + CTest + GitHub Actions CI were added: which modules are testable, the framework choice, the CMake wiring, the registry- and credential-safe test patterns, and real defects the effort surfaced.
 
 ## Guidance
 
-### Pick the cleanly testable surface, leave the rest
+### Pick the cleanly testable surface, then grow it
+
+The suite started with two modules and has since grown to six test executables. The testability picture is now:
 
 | Module | Testable? | Why |
 |---|---|---|
-| `config.c` | ✅ yes | Pure JSON parse/validate/serialize once the core is extracted (see `architecture-patterns/config-system.md`). No I/O in the tested functions. |
-| `autostart.c` | ✅ yes (with care) | Three functions over `HKCU\...\Run`. Round-trip is testable against the real registry if you save/restore the original value. |
-| `process.c` | ❌ no (for now) | `WinHTTP /health`, `CreateProcess`, toolhelp snapshots, `NtQueryInformationProcess`. Mocking a local HTTP server is possible but high-effort; deferred. |
-| `chat.c` | ❌ no (for now) | WinHTTP WebSocket + connect/recv threads. The JSON frame-parsing logic is embedded in the recv loop; extracting it is a larger refactor. Deferred. |
+| `config.c` | ✅ `test_config` | Pure JSON parse/validate/serialize once the core is extracted (see `architecture-patterns/config-system.md`). No I/O in the tested functions; also asserts the legacy secret is never serialized. |
+| `autostart.c` | ✅ `test_autostart` | Three functions over `HKCU\...\Run`. Round-trip is testable against the real registry if you save/restore the original value. |
+| `credential.c` | ✅ `test_credential` | Wraps Windows Credential Manager. Testable against the real Cred API using a **process-unique target name** so it never touches the product's `nanobot-manager/bootstrap-secret/v1`. |
+| `process.c` | ✅ `test_process` | The pure-logic helpers (PID-reuse guards, `FILETIME` comparisons, port parsing, uptime math) are unit-testable; the network/spawn side is still exercised manually. (Originally deferred — the extractable helpers were carved out later.) |
+| `chat_history.c` | ✅ `test_chat_history` | Local history persistence (append/trim/resume, size caps). File-format logic without the transport. |
+| `chat_protocol.c` | ✅ `test_chat_protocol` | The WebSocket JSON frame protocol, decoded independently of WinHTTP. Compiles `chat_history.c` alongside it. |
+| `chat.c` (transport) | ❌ no | WinHTTP WebSocket + connect/recv threads. The JSON frame-parsing logic now lives in `chat_protocol.c` (tested); the threaded transport remains manual. |
 | `main.cpp` | ❌ no | `WinMain`, tray, UI callbacks, message loop. Integration-test territory, not unit. |
 
-The ROI was config + autostart. Do not force unit tests onto network/process code just to raise coverage — the maintenance cost exceeds the value.
+The ROI pattern: extract pure logic into a sibling file (`chat_protocol.c`, `chat_history.c`) and test *that*, leaving the I/O-heavy parent (`chat.c`) for manual verification. Six executables now, grown incrementally as logic was carved out — not a big-bang effort.
 
 ### Use a self-contained framework instead of vendoring one
 
@@ -72,15 +79,29 @@ endif()
 function(nm_add_test name)
     add_executable(${name} ${name}.c ${ARGN})          # ARGN = module .c source(s)
     target_link_libraries(${name} PRIVATE nm_test)
+    target_compile_definitions(${name} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(${name} PRIVATE /utf-8 /EHsc)
     set_target_properties(${name} PROPERTIES WIN32_EXECUTABLE FALSE)  # console, not GUI
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
 nm_add_test(test_config ${CMAKE_SOURCE_DIR}/src/config.c)
-target_link_libraries(test_config PRIVATE cjson)      # cJSON is a project-wide FetchContent target
+target_link_libraries(test_config PRIVATE cjson shell32 ole32 advapi32)
+
+nm_add_test(test_credential ${CMAKE_SOURCE_DIR}/src/credential.c)
+target_link_libraries(test_credential PRIVATE advapi32)
+
+nm_add_test(test_process ${CMAKE_SOURCE_DIR}/src/process.c)
+target_link_libraries(test_process PRIVATE cjson winhttp shell32 ole32 advapi32)
 
 nm_add_test(test_autostart ${CMAKE_SOURCE_DIR}/src/autostart.c)
 target_link_libraries(test_autostart PRIVATE advapi32)
+
+nm_add_test(test_chat_history ${CMAKE_SOURCE_DIR}/src/chat_history.c)
+target_link_libraries(test_chat_history PRIVATE cjson)
+
+nm_add_test(test_chat_protocol ${CMAKE_SOURCE_DIR}/src/chat_protocol.c ${CMAKE_SOURCE_DIR}/src/chat_history.c)
+target_link_libraries(test_chat_protocol PRIVATE cjson)
 ```
 
 Two non-obvious points:
@@ -116,6 +137,12 @@ snapshot_restore(&snap);          // RegSetValueExW back, or delete if originall
 ```
 
 **Crucially, the test body never aborts on a failed `TEST_CHECK`.** `nm_test.h` latches the failure and continues, so `snapshot_restore` always runs even if an assertion failed mid-test. A framework that `assert()`-aborts on failure would leak the test value into the user's real Run key.
+
+### Testing Credential Manager without touching the product secret (credential)
+
+`test_credential` exercises the real `Cred*W` API, but against a **process-unique target name** (derived from PID / a counter) rather than the product target `nanobot-manager/bootstrap-secret/v1`. This mirrors the registry save/restore discipline: test the exact production code path, but never touch the real user-owned data. The test writes, reads back, and deletes its own throwaway credential on each run, and the non-aborting framework guarantees the delete runs even if an assertion fails.
+
+The reason this matters over mocking: the `credential_store` write-verify-rollback logic (see [`credential-manager-secret-storage.md`](../architecture-patterns/credential-manager-secret-storage.md)) is the whole point — it can only be validated against the real Cred API. A mock would test nothing. Using a unique target name gives you the real-API fidelity without the risk of clobbering the user's actual bootstrap secret.
 
 ### CI: reuse scripts\build.bat, then ctest
 
@@ -182,14 +209,16 @@ scripts\build.bat
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Current suite: `test_config` (13 cases) + `test_autostart` (registry round-trip), ~1 s total.
+Current suite: `test_config`, `test_credential`, `test_process`, `test_autostart`, `test_chat_history`, `test_chat_protocol` — six console executables under `tests/`, all wired through `nm_add_test`. Runs in well under a second.
 
 ## Related
 
 - `nanobot-manager/tests/nm_test.h` — the self-contained framework.
-- `nanobot-manager/tests/test_config.c` / `test_autostart.c` — the test cases.
-- `nanobot-manager/tests/CMakeLists.txt` — `nm_add_test` + per-test wiring.
+- `nanobot-manager/tests/test_config.c` / `test_credential.c` / `test_process.c` / `test_autostart.c` / `test_chat_history.c` / `test_chat_protocol.c` — the test cases.
+- `nanobot-manager/tests/CMakeLists.txt` — `nm_add_test` + per-test wiring (six executables).
 - `nanobot-manager/CMakeLists.txt` — `BUILD_TESTING` gate + `enable_testing()`.
 - `.github/workflows/ci.yml` — the CI workflow.
 - `docs/solutions/architecture-patterns/config-system.md` — the config testability refactor that made `test_config` possible.
-- `AGENTS.md` — build commands and the (now updated) verification story.
+- `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — the credential write-verify-rollback logic that `test_credential` validates against a process-unique target.
+- `docs/solutions/build-errors/vs2026-bundled-cmake-and-cmake4-policy.md` — the build toolchain (VS 2026 / bundled CMake / CMake 4.x policy) that CI reuses via `scripts\build.bat`.
+- `AGENTS.md` — build commands and the verification story.

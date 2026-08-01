@@ -1,6 +1,7 @@
 ---
 title: "Dual-repo architecture: parent product pin vs core-ui submodule"
 date: 2026-07-31
+last_updated: 2026-08-01
 category: architecture-patterns
 module: submodule/core-ui
 problem_type: architecture_pattern
@@ -34,11 +35,14 @@ tags:
 
 Parent records only a **gitlink SHA** (pin) for `core-ui`. Framework commits live in the core-ui repository. Product work that needs new Core UI APIs must land in core-ui first, then bump the pin in the parent.
 
-This session retargeted the submodule remote from `ghboke/core-ui` to `https://github.com/aiguozhi123456/core-ui`, kept pin `f0a9537` (`feat(ui): add submit and scroll APIs for native chat`), and cleaned feature branches after merge. Parent history of note:
+> **The pin moves over time.** The concrete SHAs below are historical examples from when this workflow was first documented (the remote-retarget + submit/scroll-API session). Don't treat them as the current pin — verify with `git ls-tree HEAD core-ui` (currently `b594ec0` at last update). The **workflow** is what's durable; the example SHAs are illustrative.
+
+The original session retargeted the submodule remote from `ghboke/core-ui` to `https://github.com/aiguozhi123456/core-ui`, kept the pin at the submit/scroll-APIs commit (`f0a9537` at the time), and cleaned feature branches after merge. Parent history of note:
 
 - `06f26cb` — bump pin to `e0298ca` (v1.7.0)
 - `0045496` — pin `e0298ca`→`f0a9537` while hardening chat (uses submit/scroll APIs)
 - `33b2cd6` — `.gitmodules` URL change only
+- Later: pin advanced through the IME-caret (`442461d`) and chat-bubble-scroll-layout (`b594ec0`) framework fixes to reach the current pin.
 
 ## Guidance
 
@@ -155,7 +159,7 @@ git -C core-ui branch -d feat/chat-input-scroll-apis
 # git push origin --delete <branch> when remote still has them
 ```
 
-Session outcome pattern: parent and core-ui both at `f0a9537`; `chore/core-ui-remote` and `feat/chat-input-scroll-apis` removed after merge to respective mains.
+Session outcome pattern: parent and core-ui HEAD both pointed at the same SHA (the submit/scroll-APIs commit at the time); the `chore/core-ui-remote` and `feat/chat-input-scroll-apis` feature branches were removed after merge to their respective mains. The same end state applies after any pin bump: `git ls-tree HEAD core-ui` (parent pin) must equal `git -C core-ui rev-parse HEAD` (submodule HEAD).
 
 ## Why This Matters
 

@@ -135,3 +135,9 @@ A registered system-wide keyboard shortcut (Ctrl+Shift+N) that brings the manage
 
 Because Windows enforces a foreground-lock that silently rejects `SetForegroundWindow` from background threads, the implementation must use `AttachThreadInput` to temporarily share the input queue with the foreground thread before activating. The hotkey is registered against the window HWND after creation and unregistered before destruction; if another application already owns the key combo, registration fails silently with no crash or popup.
 
+### System Theme
+The user's chosen Windows light/dark personalization for applications, which the manager mirrors when its theme mode is set to "follow system."
+
+Windows exposes this state only as a registry value, not through a theme API, so the manager reads it at startup before the first paint and again when the user picks the "system" option. The concrete theme must be resolved before the window is created, or the wrong theme flashes for one frame; a hard-coded theme attribute on the UI template silently overrides whatever the manager decides and must not be present.
+
+

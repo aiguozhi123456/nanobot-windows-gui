@@ -1,6 +1,7 @@
 ---
 title: "Config module: a testable pure-logic core behind filesystem I/O"
 date: 2026-07-11
+last_updated: 2026-08-01
 category: architecture-patterns
 module: nanobot-manager/config
 problem_type: module_architecture
@@ -10,7 +11,7 @@ applies_when:
   - "Reading/writing a JSON config file (cJSON) next to the executable in a Win32 app"
   - "Wanting unit tests for config parsing/validation without running beside the real exe or touching disk"
   - "Separating filesystem I/O from parse/serialize/validation logic so the logic is testable in isolation"
-tags: [config, cJSON, json, testability, unit-testing, refactor, win32, c]
+tags: [config, cJSON, json, testability, unit-testing, refactor, win32, c, atomic-save]
 ---
 
 # Config module: a testable pure-logic core behind filesystem I/O
@@ -21,16 +22,21 @@ tags: [config, cJSON, json, testability, unit-testing, refactor, win32, c]
 
 ```c
 typedef struct {
-    char* nanobot_path;        // heap-allocated, NULL when unset
+    char* nanobot_path;
     int   autostart_nanobot;
     int   stay_in_tray;
-    int   health_check_port;   // default 18790
-    int   theme_mode;          // 0=system 1=dark 2=light
-    char  language[8];         // "zh" / "en", default "zh"
-    int   webui_port;          // default 8765
-    char  webui_auth[128];     // optional tokenIssueSecret, default ""
+    int   hotkey_enabled;            /* global Ctrl+Shift+N summon hotkey, default on */
+    int   health_check_port;         /* default 18790 */
+    int   theme_mode;                /* 0=system 1=dark 2=light */
+    char  language[8];               /* "zh" / "en", default "zh" */
+    int   webui_port;                /* default 8765 */
+    char  legacy_webui_auth[128];    /* transient old JSON secret; NEVER serialized */
+    int   legacy_migration_pending;  /* while set, config_save refuses (ERROR_BUSY) */
+    wchar_t legacy_source_path[MAX_PATH]; /* file containing the transient legacy secret */
 } app_config;
 ```
+
+> **Important — the secret is no longer a config field.** The gateway's `tokenIssueSecret` (formerly `webui_auth`) has moved to **Windows Credential Manager**. The struct keeps a `legacy_webui_auth` field for **migration only**: it is populated from an old `config.json` on load, migrated into Credential Manager (write-verify-rollback), then the plaintext is scrubbed — and `config_serialize_json` deliberately **omits** it, so the secret is never written back. A test asserts `strstr(json, "webui_auth") == NULL`. See [`credential-manager-secret-storage.md`](credential-manager-secret-storage.md) for the full migration architecture and the atomic-save pattern (`config_save` writes a temp file + `FlushFileBuffers` + `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)`).
 
 Originally `config_load` and `config_save` were monolithic: default-init, path resolution (`GetModuleFileNameA`), file open/read, `cJSON_Parse`, per-field overlay with validation, and JSON build/write were all interleaved in single functions. That meant the parse/validate/serialize logic could not be exercised without running the binary beside a real `config.json` — so it had no tests, and the module was effectively verified only by manual run.
 
@@ -68,8 +74,10 @@ Validation lives inline in `config_parse_json` and silently ignores out-of-range
 | `webui_port` | `> 0 && <= 65535` | ignored, default kept |
 | `theme_mode` | `>= 0 && <= 2` | ignored, default kept |
 | `language` | `char[8]`, truncated + NUL-terminated | safe truncation |
-| `webui_auth` | `char[128]`, truncated + NUL-terminated | safe truncation |
 | `nanobot_path` | non-empty string → `_strdup`; null/empty → NULL | no leak |
+| `hotkey_enabled` | bool | ignored if not boolean |
+
+The `legacy_webui_auth[128]` field is intentionally **absent** from this table: it is a transient migration input, not a validated/saved config field. It is populated from an old `config.json` only to be migrated into Credential Manager and then scrubbed. Do not add a validation row for it, and never add it to `config_serialize_json` — a test asserts it is absent from serialized output.
 
 Tests cover both boundaries (1 and 65535 accepted) and the out-of-range cases (0, -1, 70000 rejected). The truncation tests pass a value longer than the buffer and assert the result is exactly NUL-terminated at the cap — this is the guard against a future buffer overrun.
 
@@ -77,9 +85,11 @@ Tests cover both boundaries (1 and 65535 accepted) and the out-of-range cases (0
 
 `config_parse_json` frees an existing `nanobot_path` before `_strdup`-ing the new one. `config_load` runs on a freshly-defaulted struct (path == NULL) so this never fires in production, but it makes calling `config_parse_json` twice on the same struct safe — which is exactly what the round-trip test does (parse a fixture, serialize, parse again).
 
-### The round-trip is the contract
+### The round-trip is the contract — except for legacy fields
 
-`config_serialize_json` → `config_parse_json` must reproduce the original struct. Two round-trip tests pin this: one on a full fixture (every field overridden) and one on pure defaults. A `configs_equal` helper compares fields by value, treating `nanobot_path == NULL` and `nanobot_path == ""` as equal on both sides. If a field is ever added to `app_config`, the round-trip test forces the author to wire it through parse + serialize in lockstep or the test breaks loudly.
+`config_serialize_json` → `config_parse_json` must reproduce the original struct for every **serialized** field. Two round-trip tests pin this: one on a full fixture (every field overridden) and one on pure defaults. A `configs_equal` helper compares fields by value, treating `nanobot_path == NULL` and `nanobot_path == ""` as equal on both sides. If a serialized field is ever added to `app_config`, the round-trip test forces the author to wire it through parse + serialize in lockstep or the test breaks loudly.
+
+The deliberate exception is the legacy secret: `config_serialize_json` **omits** `legacy_webui_auth`, so it does not survive a round-trip — and that is the contract. A dedicated test asserts the serialized JSON contains no `webui_auth` key, so any future change that accidentally re-serializes the secret fails the suite immediately. If a field is migration-only, exclude it from serialization on purpose and test that exclusion.
 
 ## Why This Matters
 
@@ -148,15 +158,27 @@ static void test_roundtrip(void) {
 ### A truncation safety test
 
 ```c
-/* webui_auth is char[128]; overlong input must be capped + NUL-terminated. */
-config_parse_json(&cfg, long_auth_json);
-TEST_CHECK(cfg.webui_auth[sizeof(cfg.webui_auth) - 1] == '\0');
-TEST_CHECK(strlen(cfg.webui_auth) == sizeof(cfg.webui_auth) - 1);
+/* language is char[8]; overlong input must be capped + NUL-terminated. */
+config_parse_json(&cfg, long_language_json);
+TEST_CHECK(cfg.language[sizeof(cfg.language) - 1] == '\0');
+TEST_CHECK(strlen(cfg.language) == sizeof(cfg.language) - 1);
+```
+
+### The secret-never-serialized test
+
+```c
+/* config_serialize_json must NEVER emit the legacy webui_auth key. */
+config_apply_defaults(&cfg);
+/* (legacy_webui_auth would only be set by the migration path, never here) */
+char* json = config_serialize_json(&cfg);
+TEST_CHECK(strstr(json, "webui_auth") == NULL);
+free(json);
 ```
 
 ## Related
 
-- `nanobot-manager/src/config.c` / `config.h` — the module under test (apply_defaults / parse_json / serialize_json + load/save wrappers).
-- `nanobot-manager/tests/test_config.c` — 13 unit cases covering defaults, full/partial/invalid parse, port/theme validation, two round-trips, two truncations, null-vs-string path.
+- `nanobot-manager/src/config.c` / `config.h` — the module under test (apply_defaults / parse_json / serialize_json + atomic load/save wrappers).
+- `nanobot-manager/tests/test_config.c` — unit cases covering defaults, full/partial/invalid parse, port/theme validation, round-trips, truncations, null-vs-string path, and the secret-never-serialized assertion.
+- `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — why `legacy_webui_auth` is migration-only, the migrate-verify-delete flow, and the atomic `config_save` (temp + `FlushFileBuffers` + `MoveFileExW`) implementation.
 - `docs/solutions/infrastructure/testing-and-ci-setup.md` — the CMake test wiring, the self-contained `nm_test.h` framework, CTest, and CI; also the autostart registry round-trip pattern.
-- `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — how `webui_port` / `webui_auth` (defined here) are surfaced in the settings UI via the read-on-click Apply pattern.
+- `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — how `webui_port` / `health_check_port` (defined here) are surfaced in the settings UI via the read-on-click Apply pattern.

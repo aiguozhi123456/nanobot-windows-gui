@@ -1,6 +1,7 @@
 ---
 title: "Reading core-ui text/number input values from C via an Apply button and ui_page_get_json"
 date: 2026-07-11
+last_updated: 2026-08-01
 category: design-patterns
 module: nanobot-manager/settings
 problem_type: design_pattern
@@ -9,10 +10,11 @@ severity: low
 related_components:
   - nanobot-manager/ui
   - nanobot-manager/chat
+  - nanobot-manager/credential
 applies_when:
   - "Exposing an editable text or number setting in a core-ui page and persisting it from C"
   - "core-ui lacks a per-keystroke ui_text_input_on_changed C callback, so changes cannot be pushed live to C"
-  - "You need to read a TextInput value (port, secret, path) into C state for validation and config_save"
+  - "You need to read a TextInput value (port, path) into C state for validation and config_save"
   - "A toggle (ui_toggle_on_changed) applies per-change but a text/number input cannot"
 tags: [core-ui, settings, text-input, ui-page-get-json, apply-button, win32, cpp, read-on-click]
 ---
@@ -23,14 +25,9 @@ tags: [core-ui, settings, text-input, ui-page-get-json, apply-button, win32, cpp
 
 The nanobot-manager is a native Win32/C++ app built on the `core-ui` submodule — a reactive SFC framework with a Vue3-Options-API flavor (`data()` with reactive fields, `v-model` two-way binding, `$t('key')` i18n lookups). Its job is to manage a local Python LLM gateway (nanobot) and chat with it over a WebSocket endpoint on the gateway's WebUI port.
 
-Two gateway configuration fields were already fully plumbed in the backend:
+The settings page exposes the two gateway **port** fields (`health_check_port` default `18790`, `webui_port` default `8765`) as `v-model`'d `<input type="number">` rows, committed through a single **Apply button** that reads both inputs at once. The reusable insight is not the section itself but the *input-read mechanism* the Apply button forces you into — and the *apply-immediately* settings model it slots into.
 
-- `webui_port` (default `8765`) — the WebSocket port
-- `webui_auth` (default `""`) — the gateway's `tokenIssueSecret`, sent as the bootstrap handshake secret
-
-Both were defined in `config.h` (`app_config` struct), loaded/validated/saved in `config.c`, and consumed by the chat subsystem via `chat_set_endpoint(port, auth)` and `chat_ui_set_gateway(health_fn, port, auth)`. But they were **never exposed in the settings UI** — users could only change them by hand-editing `config.json`.
-
-This document covers the pattern used to surface those two fields in the settings page: a new "Network / 网络" section with a port input, an auth input, and an **Apply button**. The reusable insight is not the section itself but the *input-read mechanism* the Apply button forces you into — and the *apply-immediately* settings model it slots into.
+> **Migration note (2026-08-01):** This doc previously used a `webui_auth` text input as its flagship example. That field has been **removed from the UI and from `app_config` serialization** — the bootstrap secret now lives in **Windows Credential Manager**, surfaced via Manage/Clear buttons rather than a text input. The example below has been updated to reflect the current port-only Network section. For the secret-storage architecture (Credential Manager, migrate-verify-delete, atomic config save), see [`architecture-patterns/credential-manager-secret-storage.md`](../architecture-patterns/credential-manager-secret-storage.md). The generic `ui_page_get_json` read-on-click pattern documented here is unchanged and still load-bearing for both port inputs.
 
 ## Guidance
 
@@ -63,71 +60,61 @@ const char* text = (j && cJSON_IsString(j)) ? j->valuestring : NULL;
 
 ### An Apply button is the natural fit
 
-Because C can't react per-keystroke, the cleanest UX for a *discrete* value the user wants to commit deliberately (a port number, a secret) is a button that reads both inputs on click. This is exactly the Network section pattern:
+Because C can't react per-keystroke, the cleanest UX for a *discrete* value the user wants to commit deliberately (a port number) is a button that reads the inputs on click. This is exactly the Network section pattern:
 
-- Two reactive fields in `data()` (`ui/dashboard.uix`):
+- Reactive fields in `data()` (`ui/dashboard.uix`):
   ```js
+  healthPort: "18790",
   webuiPort: "8765",
-  webuiAuth: "",
   ```
-- Two `v-model` inputs plus an Apply button:
+- Two `v-model` number inputs plus an Apply button:
   ```html
+  <input id="health_port_input" v-model="healthPort" type="number" min="1" max="65535"
+         class="port-input" placeholder="18790"/>
   <input id="webui_port_input" v-model="webuiPort" type="number" min="1" max="65535"
          class="port-input" placeholder="8765"/>
-  <input id="webui_auth_input" v-model="webuiAuth" class="auth-input" placeholder="(optional)"/>
   ...
   <div id="btn_apply_network" class="apply-btn">
     <label class="apply-btn-label">{{ $t('setting_apply') }}</label>
   </div>
   ```
-- A click handler that reads both fields, validates, saves, and re-syncs (`src/main.cpp`):
+- A click handler that reads both ports, validates, saves atomically, and re-syncs (`src/main.cpp`):
 
 ```c
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
-    /* Read webuiPort — a v-model'd <input type="number"> may serialize as
-       a JSON string OR a JSON number; parse both. */
-    int new_port = 0;
-    char* raw_port = ui_page_get_json(g_page, "webuiPort");
-    if (raw_port) {
-        cJSON* jp = cJSON_Parse(raw_port);
-        if (jp && cJSON_IsString(jp))
-            new_port = atoi(jp->valuestring);
-        else if (jp && cJSON_IsNumber(jp))
-            new_port = jp->valueint;
-        cJSON_Delete(jp);
-        ui_page_free(raw_port);
-    }
-    if (new_port < 1 || new_port > 65535) {
-        /* Invalid: restore the current value and bail — don't save garbage. */
-        wchar_t wpw[16];
-        swprintf_s(wpw, _countof(wpw), L"%d",
-                   g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
-        ui_page_set_text(g_page, "webuiPort", wpw);
+    int new_health_port = 0, new_webui_port = 0;
+    /* read_port_input wraps ui_page_get_json + the dual-parse below and
+       restore-on-invalid. Returns 0 if either port failed validation. */
+    if (!read_port_input("healthPort", &new_health_port) ||
+        !read_port_input("webuiPort",  &new_webui_port)) {
+        restore_health_port_input(); restore_webui_port_input();
         return;
     }
-    /* Read webuiAuth (optional). */
-    char new_auth[128] = {0};
-    char* raw_auth = ui_page_get_json(g_page, "webuiAuth");
-    if (raw_auth) {
-        cJSON* ja = cJSON_Parse(raw_auth);
-        if (ja && cJSON_IsString(ja) && ja->valuestring) {
-            strncpy(new_auth, ja->valuestring, sizeof(new_auth) - 1);
-            new_auth[sizeof(new_auth) - 1] = '\0';
-        }
-        cJSON_Delete(ja);
-        ui_page_free(raw_auth);
+    /* The gateway health port cannot be changed while the gateway is running. */
+    if (new_health_port != g_cfg.health_check_port && !can_edit_gateway_port()) {
+        restore_health_port_input();
+        /* ...MessageBox: stop the gateway before changing its port... */
+        return;
     }
-    g_cfg.webui_port = new_port;
-    strncpy(g_cfg.webui_auth, new_auth, sizeof(g_cfg.webui_auth) - 1);
-    g_cfg.webui_auth[sizeof(g_cfg.webui_auth) - 1] = '\0';
-    config_save(&g_cfg);
-    /* Sync into the chat subsystem and reconnect. */
-    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port, g_cfg.webui_auth);
-    chat_set_endpoint(g_cfg.webui_port, g_cfg.webui_auth);
-    chat_connect();
+    /* Build a proposed config, save atomically, only then mutate g_cfg. */
+    app_config proposed = g_cfg;
+    proposed.health_check_port = new_health_port;
+    proposed.webui_port        = new_webui_port;
+    if (config_save(&proposed) != 0) {
+        /* ...MessageBox with config_get_last_error(); inputs kept, not saved... */
+        return;
+    }
+    g_cfg = proposed;
+    /* Re-sync the chat subsystem's WebUI target if it changed. */
+    if (webui_changed) {
+        chat_set_endpoint(g_cfg.webui_port, /*secret from Credential Manager*/);
+        chat_reconnect_async();
+    }
 }
 ```
+
+> The bootstrap secret is **not** read here — it lives in Windows Credential Manager and is managed through separate Manage/Clear buttons (`on_manage_credential` / `on_clear_credential` → `credential_*`). The Network Apply only commits the two ports. See [`credential-manager-secret-storage.md`](../architecture-patterns/credential-manager-secret-storage.md) for why the secret never enters a `v-model` field or `config.json`.
 
 ### Parse the port as string *or* number
 
@@ -159,50 +146,50 @@ Use `ui_page_on_widget_mount` rather than `ui_widget_find_by_id` because the set
 
 ### The settings page is apply-immediately
 
-Every other setting on the page — autostart toggle, tray toggle, theme, language, path — already mutates `g_cfg` and calls `config_save` *immediately* in its own mount hook / handler. There is no batch Save button. The Network section follows that same model: it just bundles two fields behind one Apply button because the port and the auth must be read *together* before reconnecting (reading and applying them separately would cause two reconnects and a half-applied state in between). This is the one place the page deviates from "one control, one immediate apply" — and the deviation is deliberate.
+Every other setting on the page — autostart toggle, tray toggle, hotkey toggle, theme, language, path — already mutates `g_cfg` and calls `config_save` *immediately* in its own mount hook / handler. There is no batch Save button. The Network section follows that same model: it just bundles the two ports behind one Apply button because the gateway health port and the WebUI port must be read *together* before committing (reading and applying them separately could leave a half-applied state in between, and changing the health port while the gateway is running must be rejected as one unit). This is the one place the page deviates from "one control, one immediate apply" — and the deviation is deliberate.
 
 ### Push initial values C→UI at startup
 
 Reactive fields have defaults in `data()`, but the source of truth at startup is `g_cfg`. Push the configured values into the fields alongside the rest of the settings init block:
 
 ```c
-/* WebUI port + auth initial values */
+/* Gateway + WebUI port initial values (numbers → wide) */
 {
-    wchar_t wpw[16];
+    wchar_t hpw[16], wpw[16];
+    swprintf_s(hpw, _countof(hpw), L"%d",
+               g_cfg.health_check_port > 0 ? g_cfg.health_check_port : 18790);
     swprintf_s(wpw, _countof(wpw), L"%d",
                g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
-    ui_page_set_text(g_page, "webuiPort", wpw);
-    page_set("webuiAuth", g_cfg.webui_auth[0] ? g_cfg.webui_auth : "");
+    ui_page_set_text(g_page, "healthPort", hpw);
+    ui_page_set_text(g_page, "webuiPort",  wpw);
 }
 ```
 
-`ui_page_set_text` takes a `wchar_t*`; the `page_set` helper is the UTF-8→wide wrapper used elsewhere in the file. Use wide-string formatting for numbers, `page_set` for UTF-8 strings.
+`ui_page_set_text` takes a `wchar_t*`; format numbers wide with `swprintf_s`. The credential status (`hasCredential` / `credentialStatus`) is pushed separately from the Credential Manager read — it is a boolean + label, never the secret itself.
 
 ### i18n: inline UTF-8 byte-escaped strings in main.cpp
 
-UI copy lives in **two** places and both must change together. The `.uix` references keys via `$t('settings_network')`, `$t('setting_webui_port')`, `$t('setting_webui_auth')`, `$t('setting_apply')` (plus their `_sub` variants). The actual strings are defined in `main.cpp` in zh and en blocks, with Chinese embedded as `\xXX` UTF-8 byte-escaped literals (project convention — not external `.lang` files):
+UI copy lives in **two** places and both must change together. The `.uix` references keys via `$t('settings_network')`, `$t('setting_gateway_port')`, `$t('setting_webui_port')`, `$t('setting_apply')` (plus their `_sub` variants). The actual strings are defined in `main.cpp` in zh and en blocks, with Chinese embedded as raw UTF-8 (or `\xXX` byte-escaped UTF-8 in older entries — project convention, not external `.lang` files):
 
 ```c
-/* zh block — Chinese as byte-escaped UTF-8 */
+/* zh block */
 "settings_network=\xe7\xbd\x91\xe7\xbb\x9c\n"
+"setting_gateway_port=Gateway \xe7\xab\xaf\xe5\x8f\xa3\n"
 "setting_webui_port=WebUI \xe7\xab\xaf\xe5\x8f\xa3\n"
+"setting_apply=\xe5\xba\x94\xe7\x94\xa8\n"
 ...
 /* en block */
 "settings_network=Network\n"
+"setting_gateway_port=Gateway Port\n"
 "setting_webui_port=WebUI Port\n"
-"setting_webui_auth=Auth Secret\n"
 "setting_apply=Apply\n"
 ```
 
-These are loaded via `ui_page_load_language_string`. Adding a visible label means editing both files.
+These are loaded via `ui_page_load_language_string`. Adding a visible label means editing both files (and both languages — see [`conventions/i18n-embedded-literals-not-lang-files.md`](../conventions/i18n-embedded-literals-not-lang-files.md)).
 
 ### Known limitation: no password masking
 
-`core-ui` does not implement `type="password"` — its input factory falls through to a plain `TextInput` with no masked draw path. The auth secret is rendered in plaintext. This is a framework limitation, not a choice in this code. Flag it wherever a secret input is added; do not assume `type="password"` will hide the value.
-
-### No backend changes were needed
-
-`config.c` and `chat.c` already fully supported both fields. The entire change was UI markup + CSS in `dashboard.uix` and i18n + wiring in `main.cpp`. When a backend is already correct, the work of "exposing" a setting is purely the read-on-click pattern above.
+`core-ui` does not implement `type="password"` — its input factory falls through to a plain `TextInput` with no masked draw path. This is exactly **why the bootstrap secret is not a text input at all**: it lives in Windows Credential Manager and is managed via Manage/Clear buttons, so the value is never rendered in the page. Don't add a secret as a `v-model` text input expecting `type="password"` to mask it; route it through Credential Manager instead.
 
 ## Why This Matters
 
@@ -222,9 +209,9 @@ With no `ui_text_input_on_changed` callback, the only ways to observe a text inp
 
 The rest of the app pushes C→UI values via `ui_page_set_text`; there's no toast/snackbar infrastructure. Restoring the last good value into the input on validation failure is consistent with that model, needs no new UI, and gives immediate feedback ("my edit reverted, so it was rejected"). A separate error label would require new markup, a new reactive field, and i18n strings for the error text.
 
-### Why this was a UI-only change
+### Why the port Apply is UI-only (but the secret migration wasn't)
 
-Both fields were already in the `app_config` struct, already persisted, already consumed by the chat client. The cost of "make this configurable from the UI" was zero backend work — which is the payoff of having plumbed config through to its consumers first. When you find yourself adding a UI for an existing field, the read-on-click Apply pattern is the whole job.
+The two **port** fields were already in the `app_config` struct, already persisted, already consumed. Surfacing them was pure UI + wiring — which is the payoff of having plumbed config through to its consumers first. The **secret**, by contrast, was a real backend change: it moved out of `app_config`/`config.json` entirely into Credential Manager, with a migrate-verify-delete path and an elevated scrub helper. The lesson is the split itself: ports are config (apply-on-click via this pattern), secrets are credentials (Credential Manager + buttons, not a text input).
 
 ## When to Apply
 
@@ -291,12 +278,12 @@ if (n < 1 || n > 65535) {
 
 ```js
 // data()
+healthPort: "18790",
 webuiPort: "8765",
-webuiAuth: "",
 ```
 ```html
+<input v-model="healthPort" type="number" min="1" max="65535" class="port-input"/>
 <input v-model="webuiPort" type="number" min="1" max="65535" class="port-input"/>
-<input v-model="webuiAuth" class="auth-input" placeholder="(optional)"/>
 <div id="btn_apply_network" class="apply-btn">
   <label class="apply-btn-label">{{ $t('setting_apply') }}</label>
 </div>
@@ -306,19 +293,23 @@ webuiAuth: "",
 
 ```c
 {
-    wchar_t wpw[16];
+    wchar_t hpw[16], wpw[16];
+    swprintf_s(hpw, _countof(hpw), L"%d",
+               g_cfg.health_check_port > 0 ? g_cfg.health_check_port : 18790);
     swprintf_s(wpw, _countof(wpw), L"%d",
                g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
-    ui_page_set_text(g_page, "webuiPort", wpw);          /* number → wide */
-    page_set("webuiAuth", g_cfg.webui_auth[0] ? g_cfg.webui_auth : ""); /* utf8 → wide */
+    ui_page_set_text(g_page, "healthPort", hpw);          /* number → wide */
+    ui_page_set_text(g_page, "webuiPort",  wpw);          /* number → wide */
 }
 ```
 
 ## Related
 
-- `docs/solutions/architecture-patterns/native-websocket-chat-integration.md` — the chat subsystem that *consumes* `webui_port`/`webui_auth` via `chat_set_endpoint` / `chat_ui_set_gateway`; the `ui_page_get_json` read pattern originates there (the draft input read at `chat_ui.c:208`).
-- `nanobot-manager/src/config.h` — `app_config` struct (`webui_port`, `webui_auth[128]`); already load/save/free in `config.c`.
-- `nanobot-manager/src/main.cpp` — `on_apply_network` handler, `on_btn_apply_network_mount` trampoline, mount registration, i18n zh/en blocks, and the startup value-push block. Also `page_set` / `page_set_int` helpers.
+- `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — **why the bootstrap secret is not a text input**: it lives in Windows Credential Manager with migrate-verify-delete and an elevated scrub helper. Read this before adding any secret field.
+- `docs/solutions/architecture-patterns/native-websocket-chat-integration.md` — the chat subsystem that *consumes* `webui_port` via `chat_set_endpoint` / `chat_ui_set_gateway`; the `ui_page_get_json` read pattern originates there (the draft input read at `chat_ui.c:208`).
+- `docs/solutions/conventions/i18n-embedded-literals-not-lang-files.md` — the project's i18n convention (embedded literals in `main.cpp`, not `.lang` files) referenced by the i18n guidance above.
+- `nanobot-manager/src/config.h` — `app_config` struct (`webui_port`, `health_check_port`); the legacy `legacy_webui_auth` field is migration-only and never serialized.
+- `nanobot-manager/src/main.cpp` — `on_apply_network` handler, `read_port_input` / `restore_*_port_input` helpers, the credential Manage/Clear handlers, i18n zh/en blocks, and the startup value-push block. Also `page_set` / `page_set_int` helpers.
 - `nanobot-manager/src/chat_ui.c` — the original `ui_page_get_json` + `ui_page_free` read-on-action pattern (the send handler reading `draft`).
-- `nanobot-manager/ui/dashboard.uix` — the Network settings section markup and CSS (`.setting-col`, `.port-input`, `.auth-input`, `.apply-row`, `.apply-btn`).
+- `nanobot-manager/ui/dashboard.uix` — the Network settings section markup and CSS (`.setting-col`, `.port-input`, `.apply-row`, `.apply-btn`).
 - `core-ui/docs/uix-ai-guide.md` — core-ui SFC reference (`data()`, `v-model`, `$t()`); `core-ui/include/ui_core.h` is the authoritative source for the missing `ui_text_input_on_changed` and the `type="password"` limitation.

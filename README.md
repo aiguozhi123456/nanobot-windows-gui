@@ -10,13 +10,17 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 - Real-time health check via WinHTTP (`GET /health`)
 - Auto-detect `nanobot.exe` (pip console script) or fall back to Python + module
 - Native WebSocket chat client with streaming UI (delta/message) connected to the gateway WebUI port
+- Conversation history persisted locally across manager restarts
+- Global hotkey **Ctrl+Shift+N** to show/hide the window from any application (toggleable)
+- Manual refresh-status button to re-check gateway state on demand
 - Boot auto-start via registry (`HKCU\...\Run`)
 - Silent auto-start mode (`--autostart`) for unattended launches
 - Minimize to system tray with settings toggle
+- Portable mode (place a `portable.flag` next to the executable) to keep config alongside it
 - Bilingual UI (Chinese / English) with runtime switching
-- Theme modes: system / dark / light
-- Configurable Gateway health and Manager WebUI ports; bootstrap secret in Credential Manager
-- NSIS installer with cat emoji icon, bilingual (Chinese/English) setup wizard
+- Theme modes: system / dark / light (follows the Windows personalization setting)
+- Configurable Gateway health and Manager WebUI ports; bootstrap secret stored in Windows Credential Manager (never written to `config.json`)
+- NSIS installer with the nanobot mark icon, bilingual (Chinese/English) setup wizard
 
 ## Requirements
 
@@ -61,6 +65,11 @@ nanobot-manager.exe --delete-credential  Remove this user's saved bootstrap secr
 nanobot-manager.exe --scrub-adjacent-legacy-auth  Internal elevated cleanup command
 ```
 
+Inside the running app:
+
+- **Ctrl+Shift+N** — show or hide the window from any application (toggleable in Settings).
+- The manager does **not** stop the gateway when you close it — closing the manager (or quitting to tray) leaves nanobot running so background work continues. Stop the gateway explicitly from the dashboard when you want it down.
+
 ## Configuration
 
 Installed builds store `config.json` in `%LOCALAPPDATA%\nanobot-manager\config.json`.
@@ -71,6 +80,7 @@ Portable builds (an adjacent `portable.flag`) and independent executable copies 
   "nanobot_path": null,
   "autostart_nanobot": false,
   "stay_in_tray": false,
+  "hotkey_enabled": true,
   "health_check_port": 18790,
   "webui_port": 8765,
   "theme_mode": 0,
@@ -83,6 +93,7 @@ Portable builds (an adjacent `portable.flag`) and independent executable copies 
 | `nanobot_path` | string \| null | null | Override auto-detected command path |
 | `autostart_nanobot` | bool | false | Launch nanobot when the manager starts |
 | `stay_in_tray` | bool | false | Minimize to system tray instead of exiting |
+| `hotkey_enabled` | bool | true | Enable the Ctrl+Shift+N global show/hide hotkey |
 | `health_check_port` | int | 18790 | Configured Gateway `/health` port for the next manager launch; a detected running Gateway displays its actual port |
 | `webui_port` | int | 8765 | Manager-only chat/WebSocket connection override, independent of the Gateway port |
 | bootstrap secret | Credential Manager | unset | Optional gateway `tokenIssueSecret`; never serialized to `config.json` (legacy `webui_auth` migrates on startup) |
@@ -98,27 +109,30 @@ On first startup after an upgrade from a legacy version, the manager migrates `w
 ```
 nanobot-manager/
 ├── CMakeLists.txt          # Build configuration
-├── assets/app.ico          # Application icon (cat emoji)
+├── assets/app.ico          # Application icon (nanobot mark)
 ├── installer/installer.nsi # NSIS installer script
 ├── scripts/
 │   ├── build.bat           # One-click build script
 │   └── package.bat         # Build + package installer
 ├── src/
-│   ├── main.cpp            # Entry point, UI callbacks, tray, theme/locale, health timers, chat wiring
-│   ├── process.c/h         # Process management + WinHTTP health check
-│   ├── config.c/h          # JSON config (cJSON) load/save
+│   ├── main.cpp            # Entry point, UI callbacks, tray, hotkey, theme/locale, health timers, chat wiring
+│   ├── process.c/h         # Process management + WinHTTP health check + uptime
+│   ├── config.c/h          # JSON config (cJSON) load/save (atomic) + legacy secret migration
+│   ├── credential.c/h      # Windows Credential Manager storage for the bootstrap secret
 │   ├── autostart.c/h       # Registry auto-start (`HKCU\...\Run`)
 │   ├── chat.c/h            # WinHTTP WebSocket chat client (connect/send/stream)
+│   ├── chat_protocol.c/h   # WebSocket JSON frame protocol (pure-logic, unit-tested)
+│   ├── chat_history.c/h    # Local conversation history persistence (unit-tested)
 │   ├── chat_ui.c/h         # Chat UI state + message array management
 │   ├── resources.rc        # Windows resource (app icon)
-│   └── version.h.in        # Version template
+│   └── version.h.in        # Version template (configure_file input)
 └── ui/
     └── dashboard.uix       # Core UI layout
 ```
 
 ## Testing
 
-Unit tests use a self-contained C test framework and run under CTest. They cover config JSON migration/validation, Credential Manager store-load-delete on a per-process test target, and autostart registry logic.
+Unit tests use a self-contained C test framework (`tests/nm_test.h`) and run under CTest. The suite covers config JSON migration/validation, Credential Manager store-load-delete on a per-process test target, process-helper logic (PID-reuse guards, uptime math), autostart registry logic, chat history persistence, and the chat WebSocket frame protocol.
 
 Build with tests (on by default):
 
