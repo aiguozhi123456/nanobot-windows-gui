@@ -209,7 +209,11 @@ static output_result output_has_background_token(const wchar_t* path) {
         }
         previous = (char)byte;
     }
-    if (ferror(file) || fclose(file) != 0) return OUTPUT_READ_FAILED;
+    /* Always close before deciding: the short-circuit `ferror() || fclose()`
+     * form skips fclose() on a read error, leaking the FILE handle. */
+    int read_err = ferror(file);
+    if (fclose(file) != 0) read_err = 1;
+    if (read_err) return OUTPUT_READ_FAILED;
     return found ? OUTPUT_HAS_TOKEN : OUTPUT_NO_TOKEN;
 }
 

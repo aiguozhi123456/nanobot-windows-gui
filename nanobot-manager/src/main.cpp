@@ -188,16 +188,16 @@ static int health_running_thunk(void) {
 }
 
 static void page_set(const char* name, const char* utf8) {
+    if (!utf8 || !utf8[0]) return;
+    /* Convert the whole NUL-terminated UTF-8 string into a capped wide buffer.
+     * cbMultiByte MUST be -1 (a byte count, not the wchar sizing count) so the
+     * NUL terminator is written by the API and multibyte sequences decode fully.
+     * The 1024-wchar destination cap prevents overflow; on ERROR_INSUFFICIENT
+     * BUFFER (>1023 wchars) the API returns 0 and we leave the field as-is --
+     * status text is always short, so that path is not hit in practice. */
     wchar_t w[1024];
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
-    if (len <= 0) return;
-    if (len > 1024) len = 1024;
-    /* Convert only len-1 chars (leave room for the NUL) so the buffer is always
-     * fully written; a bare clamp to 1024 could pass an insufficient size to
-     * MultiByteToWideChar, which returns 0 and leaves the buffer untouched. */
-    int written = MultiByteToWideChar(CP_UTF8, 0, utf8, len - 1, w, len - 1);
+    int written = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, 1024);
     if (written <= 0) return;
-    w[written] = L'\0';
     ui_page_set_text(g_page, name, w);
 }
 

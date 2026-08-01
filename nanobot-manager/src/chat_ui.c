@@ -45,18 +45,17 @@ static void terminal_failure(const char* zh, const char* en, const char* detail)
 static void page_set_utf8(const char* name, const char* utf8) {
     if (!g_page || !name) return;
     const char* src = utf8 ? utf8 : "";
+    if (!src[0]) { ui_page_set_text(g_page, name, L""); return; }
+    /* Convert the whole NUL-terminated UTF-8 string into a capped wide buffer.
+     * cbMultiByte MUST be -1 (byte count, not the wchar sizing count) so the NUL
+     * terminator is written by the API and multibyte sequences decode fully.
+     * The 1024-wchar cap prevents overflow; on a too-long input the API returns
+     * 0 and we leave the field unchanged. This path is reachable from a long
+     * server error detail via chat_ui_status, so it must never expose
+     * uninitialized stack. */
     wchar_t w[1024];
-    int len = MultiByteToWideChar(CP_UTF8, 0, src, -1, NULL, 0);
-    if (len <= 0) return;
-    if (len > 1024) len = 1024;
-    /* Convert only len-1 chars (leave room for the NUL). Passing the clamped
-     * size with cbMultiByte=-1 can hit ERROR_INSUFFICIENT_BUFFER, which returns
-     * 0 and leaves `w` untouched -- then `w[len-1]=0` would expose uninitialized
-     * stack to the UI. This path is reachable from a long server error detail
-     * routed through chat_ui_status, so it must be robust. */
-    int written = MultiByteToWideChar(CP_UTF8, 0, src, len - 1, w, len - 1);
+    int written = MultiByteToWideChar(CP_UTF8, 0, src, -1, w, 1024);
     if (written <= 0) return;
-    w[written] = L'\0';
     ui_page_set_text(g_page, name, w);
 }
 

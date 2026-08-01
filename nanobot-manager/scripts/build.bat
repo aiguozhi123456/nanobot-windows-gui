@@ -4,7 +4,7 @@ setlocal enabledelayedexpansion
 cd /d "%~dp0\.."
 
 if not exist "CMakeLists.txt" (
-    echo ERROR: build.bat must resolve to the manager root \(found no CMakeLists.txt\)
+    echo ERROR: build.bat must resolve to the manager root - no CMakeLists.txt found
     exit /b 1
 )
 
