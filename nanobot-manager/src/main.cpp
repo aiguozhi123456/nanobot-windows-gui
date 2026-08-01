@@ -192,8 +192,12 @@ static void page_set(const char* name, const char* utf8) {
     int len = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, NULL, 0);
     if (len <= 0) return;
     if (len > 1024) len = 1024;
-    MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, len);
-    w[len - 1] = L'\0';
+    /* Convert only len-1 chars (leave room for the NUL) so the buffer is always
+     * fully written; a bare clamp to 1024 could pass an insufficient size to
+     * MultiByteToWideChar, which returns 0 and leaves the buffer untouched. */
+    int written = MultiByteToWideChar(CP_UTF8, 0, utf8, len - 1, w, len - 1);
+    if (written <= 0) return;
+    w[written] = L'\0';
     ui_page_set_text(g_page, name, w);
 }
 
@@ -277,10 +281,14 @@ static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
 }
 
 /* One-shot: after the page reactive variable flips to "chat", the v-if
- * remount needs a frame to materialize chat_input in the widget tree. */
+ * remount needs a frame to materialize chat_input in the widget tree.
+ * SetTimer creates a REPEATING timer, so KillTimer here makes it one-shot.
+ * Without this the timer fired every 50ms for the whole session, repeatedly
+ * yanking focus back to chat_input and burning CPU on the UI thread. */
 static VOID CALLBACK on_timer_focus_chat(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
-    (void)hwnd; (void)msg; (void)id; (void)tick;
+    (void)msg; (void)tick;
     g_focus_chat_pending = 0;
+    KillTimer(hwnd, id);
     if (!g_win || !g_page) return;
     UiWidget root = ui_page_root(g_page);
     UiWidget input = ui_widget_find_by_id(root, "chat_input");
@@ -702,9 +710,9 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
     ui_page_set_bool(g_page, "canStart",  p->found ? 1 : 0);
 
     if (p->exe) {
-        wchar_t wpath[MAX_PATH];
-        MultiByteToWideChar(CP_UTF8, 0, p->exe, -1, wpath, MAX_PATH);
-        ui_page_set_text(g_page, "nanobotPath", wpath);
+        wchar_t wpath[MAX_PATH] = {0};
+        if (MultiByteToWideChar(CP_UTF8, 0, p->exe, -1, wpath, MAX_PATH) > 0)
+            ui_page_set_text(g_page, "nanobotPath", wpath);
     }
 
     if (!p->found) {
@@ -946,7 +954,8 @@ static void on_change_path(UiWidget w, void* ud) {
 
     wchar_t file[MAX_PATH] = {0};
     if (g_cfg.nanobot_path && g_cfg.nanobot_path[0]) {
-        MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, file, MAX_PATH);
+        if (MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, file, MAX_PATH) <= 0)
+            file[0] = L'\0';
     }
 
     OPENFILENAMEW ofn;
@@ -1107,7 +1116,13 @@ static int prompt_for_credential(HWND owner, char secret[128]) {
         wc.lpfnWndProc = credential_prompt_proc; wc.hInstance = GetModuleHandleW(NULL);
         wc.lpszClassName = L"nanobotManagerCredentialPrompt"; wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
         prompt_class = RegisterClassW(&wc);
-        if (!prompt_class && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
+        if (!prompt_class) {
+            if (GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return 0;
+            /* Class is already registered (e.g. by an earlier instance in the
+             * same process); latch a sentinel so we don't re-attempt the call
+             * on every open. */
+            prompt_class = (ATOM)1;
+        }
     }
     credential_prompt prompt; ZeroMemory(&prompt, sizeof(prompt));
     HWND dialog = CreateWindowExW(WS_EX_DLGMODALFRAME, L"nanobotManagerCredentialPrompt", is_zh() ? L"管理认证密钥" : L"Manage bootstrap secret", WS_CAPTION | WS_POPUP | WS_SYSMENU, CW_USEDEFAULT, CW_USEDEFAULT, 330, 145, owner, NULL, GetModuleHandleW(NULL), &prompt);
@@ -1258,6 +1273,10 @@ static migration_result migrate_legacy_credential(void) {
 }
 
 static void apply_theme(int mode) {
+    /* Clamp to the documented set (0=system, 1=dark, 2=light). g_cfg.theme_mode
+     * is read straight from JSON; an out-of-range value would index past the
+     * labels[] array below. */
+    if (mode < 0 || mode > 2) mode = 0;
     g_theme_mode = mode;
     g_cfg.theme_mode = mode;
     if (mode == 1)
@@ -1744,9 +1763,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_set_text(g_page, "healthPort", port_w);
 
     if (g_cfg.nanobot_path && g_cfg.nanobot_path[0]) {
-        wchar_t wpath[MAX_PATH];
-        MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, wpath, MAX_PATH);
-        ui_page_set_text(g_page, "nanobotPath", wpath);
+        wchar_t wpath[MAX_PATH] = {0};
+        if (MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, wpath, MAX_PATH) > 0)
+            ui_page_set_text(g_page, "nanobotPath", wpath);
     } else {
         page_set("nanobotPath", is_zh() ? "自动检测" : "Auto-detect");
     }

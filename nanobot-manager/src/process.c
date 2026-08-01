@@ -88,7 +88,10 @@ static wchar_t* build_command_line(const wchar_t* exe, const wchar_t* arguments)
     if (exe_len > (SIZE_MAX - arg_len - 5) / sizeof(wchar_t)) return NULL;
     wchar_t* command = (wchar_t*)malloc((exe_len + arg_len + 5) * sizeof(*command));
     if (!command) return NULL;
-    if (swprintf_s(command, exe_len + arg_len + 5, L"\"%s\"%s", exe, arguments) < 0) {
+    /* Note: the space between the closing quote and `arguments` is required --
+     * callers pass the raw args WITHOUT a leading space. The buffer math above
+     * (+5) accounts for `"`, `"`, the space, and a margin. */
+    if (swprintf_s(command, exe_len + arg_len + 5, L"\"%s\" %s", exe, arguments) < 0) {
         free(command);
         return NULL;
     }
@@ -224,7 +227,7 @@ static probe_result run_probe(const char* exe, int is_python) {
     output_path[0] = L'\0';
     wchar_t* wide_exe = utf8_to_wide_alloc(exe);
     wchar_t* cmdline = build_command_line(wide_exe,
-        is_python ? L" -m nanobot gateway --help" : L" gateway --help");
+        is_python ? L"-m nanobot gateway --help" : L"gateway --help");
     if (!wide_exe || !cmdline) {
         free(wide_exe);
         free(cmdline);
@@ -1067,7 +1070,11 @@ int nanobot_read_gateway_state(nm_gateway_state* out) {
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
     fseek(f, 0, SEEK_SET);
-    if (len <= 0) { fclose(f); return 0; }
+    /* The gateway state file is a tiny JSON document. Cap the allocation so a
+     * corrupt/hostile file (e.g. a symlink to something huge placed under the
+     * user profile) cannot trigger an unbounded malloc. 1 MiB is far above any
+     * legitimate gateway.json and still trivially affordable. */
+    if (len <= 0 || len > (1L << 20)) { fclose(f); return 0; }
 
     char* buf = (char*)malloc((size_t)len + 1);
     if (!buf) { fclose(f); return -1; }
@@ -1236,8 +1243,8 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
      * writes the state file, and exits fast. */
     wchar_t arguments[96];
     swprintf_s(arguments, _countof(arguments),
-        is_python ? L" -m nanobot gateway --background --port %d"
-                  : L" gateway --background --port %d", health_port);
+        is_python ? L"-m nanobot gateway --background --port %d"
+                  : L"gateway --background --port %d", health_port);
     wchar_t* cmdline = build_command_line(wide_exe, arguments);
     if (!cmdline) { free(workdir); free(wide_exe); return ERROR_NOT_ENOUGH_MEMORY; }
 
@@ -1482,15 +1489,20 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
      * Close any previously-stored handle first to avoid a leak on re-start.
      * C2: route through nm_state_close_handle so an armed RegisterWait (e.g.
      * streak-DEAD before WM_CHILD_EXITED fired) is drained BEFORE the close --
-     * the old CloseHandle(prev) on an armed handle was a UAF-on-callback hole. */
+     * the old CloseHandle(prev) on an armed handle was a UAF-on-callback hole.
+     *
+     * Publish ordering: capture create_ft BEFORE mutating shared state, then
+     * close the old handle, publish the new handle/pid, and only THEN write
+     * create_ft. Writing create_ft earlier left a window where a concurrent
+     * snapshot paired the OLD handle with the NEW creation time, defeating the
+     * PID-reuse guards in nanobot_stop. */
     FILETIME create_ft, exit_ft, kern_ft, user_ft;
     ZeroMemory(&create_ft, sizeof(create_ft));
-    if (GetProcessTimes(h, &create_ft, &exit_ft, &kern_ft, &user_ft)) {
-        nm_state_set_create_ft(&create_ft);
-    } else {
-        nm_state_set_create_ft(&create_ft);  /* zeroed => reuse guard inert */
+    int got_create_ft = GetProcessTimes(h, &create_ft, &exit_ft, &kern_ft, &user_ft);
+    if (!got_create_ft) {
         process_log("nanobot_start: GetProcessTimes failed err=%d",
             (int)GetLastError());
+        /* create_ft stays zeroed => reuse guard inert (by design). */
     }
 
     nm_state_close_handle();           /* C2: unwatch + close prev (if any)        */
@@ -1498,6 +1510,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     nm_state_set_handle(h);
     nm_state_set_pid(gs.pid);
     nm_state_set_start_tick(GetTickCount64());
+    nm_state_set_create_ft(&create_ft);  /* publish AFTER the new handle/pid */
     nm_state_set_resolved_exe(exe);             /* cached for P4's stop-CLI spawn */
     nm_state_set_resolved_is_python(is_python);
 
@@ -1696,8 +1709,8 @@ int nanobot_stop(void) {
 
     wchar_t* wide_exe = utf8_to_wide_alloc(resolved_exe);
     wchar_t* cmdline = build_command_line(wide_exe,
-        resolved_is_python ? L" -m nanobot gateway stop --timeout 20"
-                           : L" gateway stop --timeout 20");
+        resolved_is_python ? L"-m nanobot gateway stop --timeout 20"
+                           : L"gateway stop --timeout 20");
 
     STARTUPINFOW si;
     PROCESS_INFORMATION stop_pi;

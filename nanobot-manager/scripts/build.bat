@@ -3,6 +3,22 @@ setlocal enabledelayedexpansion
 
 cd /d "%~dp0\.."
 
+if not exist "CMakeLists.txt" (
+    echo ERROR: build.bat must resolve to the manager root \(found no CMakeLists.txt\)
+    exit /b 1
+)
+
+rem core-ui is a git submodule; a fresh clone has an empty dir until this runs.
+rem Configure fails confusingly ("could not find core-ui/CMakeLists.txt") without it.
+if not exist "..\core-ui\CMakeLists.txt" (
+    echo Initializing core-ui submodule ...
+    git submodule update --init --recursive
+    if errorlevel 1 (
+        echo ERROR: git submodule init failed. Run "git submodule update --init --recursive" manually.
+        exit /b 1
+    )
+)
+
 for /f "usebackq tokens=*" %%i in (
     `"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath`
 ) do set "VS_PATH=%%i"

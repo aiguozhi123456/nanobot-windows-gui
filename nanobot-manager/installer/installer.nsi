@@ -89,7 +89,7 @@ Section "MainSection" SEC01
     File "..\assets\app.ico"
 
     SetOutPath "$INSTDIR\ui"
-    File /nonfatal "..\ui\*.*"
+    File /nonfatal /r "..\ui\*.*"
 
     CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\nanobot-manager.exe"

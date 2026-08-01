@@ -44,12 +44,19 @@ static void terminal_failure(const char* zh, const char* en, const char* detail)
 
 static void page_set_utf8(const char* name, const char* utf8) {
     if (!g_page || !name) return;
+    const char* src = utf8 ? utf8 : "";
     wchar_t w[1024];
-    int len = MultiByteToWideChar(CP_UTF8, 0, utf8 ? utf8 : "", -1, NULL, 0);
+    int len = MultiByteToWideChar(CP_UTF8, 0, src, -1, NULL, 0);
     if (len <= 0) return;
     if (len > 1024) len = 1024;
-    MultiByteToWideChar(CP_UTF8, 0, utf8 ? utf8 : "", -1, w, len);
-    w[len - 1] = L'\0';
+    /* Convert only len-1 chars (leave room for the NUL). Passing the clamped
+     * size with cbMultiByte=-1 can hit ERROR_INSUFFICIENT_BUFFER, which returns
+     * 0 and leaves `w` untouched -- then `w[len-1]=0` would expose uninitialized
+     * stack to the UI. This path is reachable from a long server error detail
+     * routed through chat_ui_status, so it must be robust. */
+    int written = MultiByteToWideChar(CP_UTF8, 0, src, len - 1, w, len - 1);
+    if (written <= 0) return;
+    w[written] = L'\0';
     ui_page_set_text(g_page, name, w);
 }
 

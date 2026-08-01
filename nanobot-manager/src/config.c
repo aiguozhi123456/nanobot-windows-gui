@@ -196,9 +196,9 @@ int config_parse_json(app_config* cfg, const char* json) {
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 2)
         cfg->theme_mode = item->valueint;
     item = cJSON_GetObjectItem(root, "language");
-    if (item && cJSON_IsString(item) && item->valuestring[0]) {
-        strncpy(cfg->language, item->valuestring, sizeof(cfg->language) - 1);
-        cfg->language[sizeof(cfg->language) - 1] = '\0';
+    if (item && cJSON_IsString(item) && item->valuestring[0] &&
+        (strcmp(item->valuestring, "zh") == 0 || strcmp(item->valuestring, "en") == 0)) {
+        strcpy(cfg->language, item->valuestring);
     }
     item = cJSON_GetObjectItem(root, "webui_port");
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint > 0 && item->valueint <= 65535)
@@ -325,12 +325,54 @@ int config_should_scan_adjacent_legacy(int active_legacy_migration_pending) {
     return active_legacy_migration_pending == 0;
 }
 
+/* Remove orphaned config temp files left by a process that died between
+ * CreateFileW(CREATE_NEW) and the MoveFileExW rename. The atomic-save helpers
+ * name temps "<active>.<pid>.<tick>.<counter>.tmp"; each save picks a fresh
+ * suffix, so a crash strands one forever and they accumulate across runs. We
+ * sweep the config directory for files matching "<active_base>.*.tmp" and drop
+ * them. Best-effort: any failure is silent (the next save still works). */
+static void cleanup_orphaned_temps(void) {
+    wchar_t dir[MAX_PATH];
+    wchar_t base[MAX_PATH];
+    const wchar_t* fname;
+    wchar_t pattern[MAX_PATH * 2];
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+
+    if (!g_active_path[0]) return;
+    /* Split the active path into directory + file name. */
+    wcsncpy_s(dir, _countof(dir), g_active_path, _TRUNCATE);
+    wchar_t* slash = wcsrchr(dir, L'\\');
+    if (!slash) return;
+    fname = slash + 1;
+    if (!fname[0]) return;
+    /* base = active filename with its extension stripped (e.g. "config"). */
+    wcsncpy_s(base, _countof(base), fname, _TRUNCATE);
+    {
+        wchar_t* bdot = wcsrchr(base, L'.');
+        if (bdot) *bdot = L'\0';
+    }
+    *slash = L'\0';   /* dir now holds the directory only */
+
+    swprintf_s(pattern, _countof(pattern), L"%s\\%s.*.tmp", dir, base);
+    find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        wchar_t full[MAX_PATH * 2];
+        swprintf_s(full, _countof(full), L"%s\\%s", dir, fd.cFileName);
+        DeleteFileW(full);
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+}
+
 int config_load(app_config* cfg) {
     if (!cfg) return -1;
     config_apply_defaults(cfg);
     g_last_error = ERROR_SUCCESS;
     select_config_path();
     if (!g_active_path[0]) return -1;
+    cleanup_orphaned_temps();
     config_file_status active = read_config_file(cfg, g_active_path);
     if (active == CONFIG_FILE_VALID || active == CONFIG_FILE_INVALID) {
         if (cfg->legacy_migration_pending)

@@ -7,11 +7,16 @@ static const wchar_t REG_NAME[] = L"nanobot-manager";
 
 int autostart_enable(const char* exe_path) {
     HKEY hKey;
+    if (!exe_path || !exe_path[0]) return -1;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, REG_PATH, 0, KEY_SET_VALUE, &hKey) != ERROR_SUCCESS)
         return -1;
 
-    wchar_t wpath[MAX_PATH];
-    MultiByteToWideChar(CP_UTF8, 0, exe_path, -1, wpath, MAX_PATH);
+    wchar_t wpath[MAX_PATH] = {0};
+    int n = MultiByteToWideChar(CP_UTF8, 0, exe_path, -1, wpath, MAX_PATH);
+    if (n <= 0) {        /* path too long (>MAX_PATH-1) or invalid UTF-8 */
+        RegCloseKey(hKey);
+        return -1;
+    }
 
     wchar_t value[MAX_PATH + 32];
     swprintf_s(value, sizeof(value)/sizeof(wchar_t), L"\"%s\" --autostart", wpath);
