@@ -100,19 +100,47 @@ static wchar_t* build_command_line(const wchar_t* exe, const wchar_t* arguments)
 
 /* --- Pure candidate builder ------------------------------------------------ */
 
+/* The one-click installer's managed venv location. install.ps1 resolves the
+ * venv as %NANOBOT_VENV% when set (non-empty), else ~\.nanobot\venv -- mirror
+ * that exactly so we look where the installer actually put things. Returns 0
+ * when no usable path could be derived. */
+static int managed_venv_dir(wchar_t* out, size_t cap) {
+    if (!out || cap == 0) return 0;
+    out[0] = L'\0';
+    /* Unset / empty / longer than the buffer all fall through to the default
+     * (a too-long override is unusable for us either way). */
+    DWORD n = GetEnvironmentVariableW(L"NANOBOT_VENV", out, (DWORD)cap);
+    if (n > 0 && n < cap)
+        return 1;
+
+    PWSTR profile = NULL;
+    HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &profile);
+    if (FAILED(hr) || !profile) {
+        if (profile) CoTaskMemFree(profile);
+        return 0;
+    }
+    int written = swprintf_s(out, cap, L"%s\\.nanobot\\venv", profile);
+    CoTaskMemFree(profile);                 /* always free, even on truncation-fail */
+    return (written > 0) ? 1 : 0;
+}
+
 int nanobot_resolve_candidates(const app_config* cfg,
-                                char*** out_exes, int** out_is_python, int* out_count) {
+                                char*** out_exes, int** out_is_python,
+                                nm_source** out_sources, int* out_count) {
     if (out_count) *out_count = 0;
-    if (!out_exes || !out_is_python || !out_count)
+    if (!out_exes || !out_is_python || !out_sources || !out_count)
         return 0;
 
-    /* At most: 1 (config) + 1 (nanobot.exe) + 4 (py/python/python3/pythonw). */
-    const int CAP = 8;
-    char** exes  = (char**)calloc((size_t)CAP, sizeof(char*));
-    int*   is_py = (int*)calloc((size_t)CAP, sizeof(int));
-    if (!exes || !is_py) {
-        free(exes); free(is_py);
-        *out_exes = NULL; *out_is_python = NULL; *out_count = 0;
+    /* At most: 1 (config) + 1 (nanobot.exe on PATH) + 2 (managed venv) +
+     * 4 (py/python/python3/pythonw). CAP keeps a small margin on top. */
+    const int CAP = 10;
+    char**     exes    = (char**)calloc((size_t)CAP, sizeof(char*));
+    int*       is_py   = (int*)calloc((size_t)CAP, sizeof(int));
+    nm_source* sources = (nm_source*)calloc((size_t)CAP, sizeof(nm_source));
+    if (!exes || !is_py || !sources) {
+        free(exes); free(is_py); free(sources);
+        *out_exes = NULL; *out_is_python = NULL; *out_sources = NULL;
+        *out_count = 0;
         return 0;
     }
     int   count = 0;
@@ -131,6 +159,7 @@ int nanobot_resolve_candidates(const app_config* cfg,
                 if (configured_exe) {
                     exes[count] = configured_exe;
                     is_py[count] = (_stricmp(base, "nanobot.exe") != 0) ? 1 : 0;
+                    sources[count] = NM_SRC_CONFIG;
                     count++;
                 }
             }
@@ -144,11 +173,43 @@ int nanobot_resolve_candidates(const app_config* cfg,
         if (found_utf8) {
             exes[count] = found_utf8;
             is_py[count] = 0;
+            sources[count] = NM_SRC_PATH_NANOBOT;
             count++;
         }
     }
 
-    /* Tiers 3-4: py.exe (PEP 397 launcher) then python{,3,w}.exe on PATH. */
+    /* Tier 3: one-click installer's managed venv. install.ps1 never touches
+     * PATH, the registry, or shims, so SearchPathW cannot see it -- probe the
+     * canonical location directly. nanobot.exe (wheel console script) first,
+     * then python.exe -m nanobot (covers wheels without a console script; the
+     * gateway --help probe filters out venvs that lack the module). */
+    if (count < CAP) {
+        wchar_t venv[MAX_PATH];
+        if (managed_venv_dir(venv, _countof(venv))) {
+            static const wchar_t* const venv_exes[] = {
+                L"Scripts\\nanobot.exe", L"Scripts\\python.exe"
+            };
+            static const int venv_is_python[] = { 0, 1 };
+            for (int i = 0; i < 2 && count < CAP; i++) {
+                wchar_t candidate[MAX_PATH];
+                if (swprintf_s(candidate, _countof(candidate), L"%s\\%s",
+                               venv, venv_exes[i]) <= 0)
+                    continue;
+                DWORD attr = GetFileAttributesW(candidate);
+                if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
+                    continue;
+                char* candidate_utf8 = wide_to_utf8_alloc(candidate);
+                if (candidate_utf8) {
+                    exes[count] = candidate_utf8;
+                    is_py[count] = venv_is_python[i];
+                    sources[count] = NM_SRC_MANAGED_VENV;
+                    count++;
+                }
+            }
+        }
+    }
+
+    /* Tier 4: py.exe (PEP 397 launcher) then python{,3,w}.exe on PATH. */
     for (int i = 0; i < (int)_countof(g_python_exes) && count < CAP; i++) {
         wchar_t* name = utf8_to_wide_alloc(g_python_exes[i]);
         if (name && SearchPathW(NULL, name, NULL, _countof(found), found, NULL)) {
@@ -156,6 +217,7 @@ int nanobot_resolve_candidates(const app_config* cfg,
             if (found_utf8) {
                 exes[count] = found_utf8;
                 is_py[count] = 1;
+                sources[count] = NM_SRC_PYTHON;
                 count++;
             }
         }
@@ -164,17 +226,19 @@ int nanobot_resolve_candidates(const app_config* cfg,
 
     *out_exes = exes;
     *out_is_python = is_py;
+    *out_sources = sources;
     *out_count = count;
     return count;
 }
 
-void nm_candidates_free(char** exes, int* is_python, int count) {
+void nm_candidates_free(char** exes, int* is_python, nm_source* sources, int count) {
     if (exes) {
         for (int i = 0; i < count; i++)
             free(exes[i]);
         free(exes);
     }
     free(is_python);
+    free(sources);
 }
 
 /* --- Capability probe ------------------------------------------------------- */
@@ -347,26 +411,18 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
         }
     }
 
-    char** exes = NULL;
-    int*   is_py = NULL;
+    char**     exes = NULL;
+    int*       is_py = NULL;
+    nm_source* sources = NULL;
     int    count = 0;
     int    saw_incompatible = 0;
     int    saw_failed = 0;
-    nanobot_resolve_candidates(cfg, &exes, &is_py, &count);
+    nanobot_resolve_candidates(cfg, &exes, &is_py, &sources, &count);
 
     for (int i = 0; i < count; i++) {
         const char* exe = exes[i];
         int py = is_py[i];
-
-        /* Source attribution (diagnostic only). */
-        nm_source src;
-        if (cfg && cfg->nanobot_path && cfg->nanobot_path[0]
-            && _stricmp(exe, cfg->nanobot_path) == 0)
-            src = NM_SRC_CONFIG;
-        else if (!py)
-            src = NM_SRC_PATH_NANOBOT;
-        else
-            src = NM_SRC_PYTHON;
+        nm_source src = sources[i];   /* attribution from the candidate builder */
 
         if (!quick) {
             if (!probe_cache_hit(exe)) {
@@ -376,7 +432,7 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
                         out->exe = _strdup(exe); out->is_python = py; out->source = src;
                         out->status = probe == PROBE_INCOMPATIBLE
                             ? NM_RES_INCOMPATIBLE : NM_RES_PROBE_FAILED;
-                        nm_candidates_free(exes, is_py, count);
+                        nm_candidates_free(exes, is_py, sources, count);
                         return 0;
                     }
                     if (probe == PROBE_INCOMPATIBLE)
@@ -394,11 +450,11 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
         out->exe = _strdup(exe);
         out->is_python = py;
         out->source = src;
-        nm_candidates_free(exes, is_py, count);
+        nm_candidates_free(exes, is_py, sources, count);
         return 1;
     }
 
-    nm_candidates_free(exes, is_py, count);
+    nm_candidates_free(exes, is_py, sources, count);
     if (saw_incompatible)
         out->status = NM_RES_INCOMPATIBLE;
     else if (saw_failed)

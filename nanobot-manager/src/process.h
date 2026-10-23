@@ -14,6 +14,7 @@ typedef enum {
     NM_SRC_NONE = 0,
     NM_SRC_CONFIG,        /* cfg->nanobot_path, existence-validated               */
     NM_SRC_PATH_NANOBOT,  /* SearchPathW(NULL,L"nanobot.exe",...)                 */
+    NM_SRC_MANAGED_VENV,  /* one-click install: ~\.nanobot\venv (%NANOBOT_VENV%)  */
     NM_SRC_PYTHON,        /* py.exe / python{,3,w}.exe -m nanobot (probe-passed)  */
 } nm_source;
 
@@ -36,10 +37,13 @@ typedef struct {
 void nm_resolution_free(nm_resolution* r);   /* frees exe, zeroes struct        */
 
 /* Pure: build ordered candidate list. NO spawning. Uses GetFileAttributesW only.
+ * Order: config path -> nanobot.exe on PATH -> one-click managed venv
+ * (~\.nanobot\venv, or %NANOBOT_VENV%) -> py/python{,3,w}.exe on PATH.
  * Returns count; caller frees via nm_candidates_free. Testable in isolation. */
 int  nanobot_resolve_candidates(const app_config* cfg,
-                                char*** out_exes, int** out_is_python, int* out_count);
-void nm_candidates_free(char** exes, int* is_python, int count);
+                                char*** out_exes, int** out_is_python,
+                                nm_source** out_sources, int* out_count);
+void nm_candidates_free(char** exes, int* is_python, nm_source* sources, int count);
 
 /* Iterates candidates and, unless `quick`, probes `gateway --help` for the
  * standalone --background token. Explicit cfg->nanobot_path is an override:
