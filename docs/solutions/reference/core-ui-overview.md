@@ -1,6 +1,7 @@
 ---
 title: "core-ui Overview — UI 框架子模块的整体画像"
 date: 2026-07-11
+last_updated: 2026-10-24
 category: reference
 module: submodule/core-ui
 problem_type: reference_overview
@@ -18,7 +19,7 @@ tags: [core-ui, ui-framework, win32, direct2d, quickjs, uix, reactive, submodule
 
 ## Overview
 
-core-ui 是一个 Windows 原生桌面 UI 框架（作为本仓库的 git submodule 存在于 `core-ui/`）。其定位是 **"Electron 开发体验 + 原生性能 + Fluent 2 外观 + Vue 响应式模型"**。当前版本 **1.7.0 build 253**（1.7.0 把渲染提交迁移到独立渲染线程，作为干净基线）。
+core-ui 是一个 Windows 原生桌面 UI 框架（作为本仓库的 git submodule 存在于 `core-ui/`）。其定位是 **"Electron 开发体验 + 原生性能 + Fluent 2 外观 + Vue 响应式模型"**。当前 pin 为 fork `main` = upstream **v1.8.0 build 294** + manager 专有移植提交（chat scroll API，见 `CHANGELOG.md` 顶部）。1.7.0 把渲染提交迁移到独立渲染线程；v1.8.0 增收了 chips-input / OCR 划词组件 / HTML5 拖放 / widget 级 contextmenu 与 submit 回调 / TextArea 选区 / SVG 引擎与长列表性能一揽子工作。
 
 它在 nanobot-manager 中的角色：提供 `dashboard.uix`（SFC）的加载、响应式状态绑定、原生控件渲染、i18n、主题切换等全部 UI 能力。manager 通过动态链接 `core-ui.dll` + 外部 `.uix` 文件路径消费它（非单 exe 内嵌）。本文档为"更好地利用 core-ui"提供完整的能力地图与边界认知。
 
@@ -330,25 +331,31 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 
 | 能力 | 潜在用途 |
 |------|----------|
-| 声明式 `menu` | 右键菜单 / submenu |
+| 声明式 `menu` / `ui_widget_on_context_menu`（build 287） | 右键菜单 / submenu；逐行挂回调可绕开 `trigger` selector 的 v-if 时序坑 |
 | `ui_msgbox` | 模态确认框（如"确认停止 nanobot？"） |
 | `ui_toast` | 通知（如健康状态变化） |
 | `custom` 自绘 widget + `ui_draw_*` | 自定义可视化（如图表） |
-| `image_view_plus` / `gh_img_view` | 大图 / 图表显示 |
-| `ui_debug_*` 自动化 / IPC | UI 集成测试（本仓库刚加 CTest 单测，未来可用 core-ui 的 debug 注入） |
+| `image_view_plus` / `gh_img_view`（v1.8.0 加 checkerboard / shadow / fit-padding / DPI scale） | 大图 / 图表显示 |
+| `chips_input`（v1.8.0） | 芯片式输入：模板占位 + 已选芯片，适合模型/端口多选或过滤条件 |
+| `ocr_img_view` + `ocr_text_model`（v1.8.0） | 图片 + OCR 文本叠加划词选择、缩放/平移/旋转，-manager 暂无场景 |
+| HTML5 语义拖放（v1.8.0：`set_draggable` / `set_drop_target` / `on_drop` + `.uix` 的 `draggable`/`drop-target`/`@drop`） | 聊天输入框拖文件进来等 |
+| `ui_widget_on_submit`（build 287，TextInput/TextArea Enter） | 已用于 chat_input 替代 fork 版 `ui_text_input_on_submit` |
+| `ui_text_area_set/get_selection` + `on_selection_changed`（v1.8.0） | 聊天记录选中文本复制 / 代码块选择 |
+| `ui_asset_invalidate`（v1.8.0） | 图标热更新（无需重启换资源） |
+| `ui_debug_*` 自动化 / IPC | UI 集成测试（本仓库已加 CTest 单测，未来可用 core-ui 的 debug 注入） |
 | 单 exe 打包（`embed_text`） | 烤资源进 exe（目前用外部 `.uix` + 拷贝 dll） |
 
 ## Risks / Future Adaptation
 
 | 风险点 | 说明 |
 |--------|------|
-| 子模块 pin 独立 | core-ui 的 pin 与 manager 版本独立，可独立升级；升级时关注 `CHANGELOG.md` 的 API 签名变化（400+ 函数，命名稳定 `ui_<noun>_<verb>`） |
+| 子模块 pin 独立 | core-ui 的 pin 与 manager 版本独立，可独立升级；升级时关注 `CHANGELOG.md` 的 API 签名变化（400+ 函数，命名稳定 `ui_<noun>_<verb>`）。fork `main` = upstream v1.8.0 + chat scroll API 移植；旧 lineage 保留在 fork 的 `legacy-v1.7-fork` 分支 |
 | QuickJS 仅 Options API | 限制了组件复用：多页面须复制模板，或 C 端组合多 page |
 | "必须整体替换数组"约束 | 易踩；manager chat 消息用 `set_json` 整体推（正确） |
 | 1.7.0 渲染线程迁移 | 是干净基线，未来 overlay / submenu 服务可能在此上演进 |
-| 无 `ui_text_input_on_changed` | 文本 / 数字 input 须用 Apply 按钮读回（已是 manager 的既定模式） |
+| 无 `ui_text_input_on_changed` | 文本 / 数字 input 须用 Apply 按钮读回（已是 manager 的既定模式）。v1.8.0 起可用 `ui_widget_on_submit`（build 287）做 Enter 提交，但变更回调仍缺 |
 | 无 `type="password"` 渲染 | input factory 落到普通 `TextInput`，无掩码；`webui_auth` 明文显示（框架限制） |
-| 自绘 TextInput 的 IME 候选位置 | 须 `ImmSetCompositionWindow` / `IMR_QUERYCHARPOSITION` 报 caret；仅 `WM_CHAR` 能上屏不够。见 `docs/solutions/ui-bugs/ime-candidate-window-top-left-custom-textinput.md` |
+| 自绘 TextInput 的 IME 候选位置 | **已于 v1.8.0 在框架内修复**（`UpdateImeCompositionPos`）；历史分析见 `docs/solutions/ui-bugs/ime-candidate-window-top-left-custom-textinput.md` |
 
 ## Reference Index
 
@@ -371,7 +378,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 | `core-ui/docs/debug-simulation.md` | Debug / 自动化 |
 | `core-ui/CMakeLists.txt` | 构建配置 |
 | `core-ui/CHANGELOG.md` | 变更日志（升级时必读） |
-| `core-ui/VERSION/version.json` | 版本信息（当前 1.7.0 build 253） |
+| `core-ui/VERSION/version.json` | 版本信息（当前 1.8.0 build 294） |
 
 ### 本仓库 manager 侧
 

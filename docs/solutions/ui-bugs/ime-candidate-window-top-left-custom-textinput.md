@@ -24,6 +24,8 @@ tags:
 
 # Chinese IME composition/candidate window stuck at screen top-left on core-ui TextInput
 
+> **Status update (2026-10-24):** as of upstream core-ui v1.8.0 this is fixed in the framework itself — `UiWindowImpl::UpdateImeCompositionPos` resolves the focused widget's caret rect under an `ActiveMeasureContextScope` and pushes it to both `ImmSetCompositionWindow` and `ImmSetCandidateWindow`. The fork's original patch (`442461d`) was absorbed and dropped in the v1.8.0 rebase. The analysis below is still the correct mental model for any custom text control.
+
 ## Problem
 
 When typing Chinese with an IME into the nanobot-manager chat composer (`chat_input`), the IME composition and candidate windows appeared at the top-left of the screen instead of under the caret. The root cause was that core-ui’s custom-drawn `TextInputWidget` accepts text via `WM_CHAR` but never told Imm32 where the caret was.

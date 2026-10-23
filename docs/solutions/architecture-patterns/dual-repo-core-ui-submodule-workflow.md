@@ -1,7 +1,7 @@
 ---
 title: "Dual-repo architecture: parent product pin vs core-ui submodule"
 date: 2026-07-31
-last_updated: 2026-08-01
+last_updated: 2026-10-24
 category: architecture-patterns
 module: submodule/core-ui
 problem_type: architecture_pattern
@@ -35,14 +35,15 @@ tags:
 
 Parent records only a **gitlink SHA** (pin) for `core-ui`. Framework commits live in the core-ui repository. Product work that needs new Core UI APIs must land in core-ui first, then bump the pin in the parent.
 
-> **The pin moves over time.** The concrete SHAs below are historical examples from when this workflow was first documented (the remote-retarget + submit/scroll-API session). Don't treat them as the current pin — verify with `git ls-tree HEAD core-ui` (currently `b594ec0` at last update). The **workflow** is what's durable; the example SHAs are illustrative.
+> **The pin moves over time.** The concrete SHAs below are historical examples from when this workflow was first documented (the remote-retarget + submit/scroll-API session). Don't treat them as the current pin — verify with `git ls-tree HEAD core-ui` (currently `75aaaa8` = upstream v1.8.0 `126330e` + the chat-scroll port, at last update). The **workflow** is what's durable; the example SHAs are illustrative.
 
 The original session retargeted the submodule remote from `ghboke/core-ui` to `https://github.com/aiguozhi123456/core-ui`, kept the pin at the submit/scroll-APIs commit (`f0a9537` at the time), and cleaned feature branches after merge. Parent history of note:
 
 - `06f26cb` — bump pin to `e0298ca` (v1.7.0)
 - `0045496` — pin `e0298ca`→`f0a9537` while hardening chat (uses submit/scroll APIs)
 - `33b2cd6` — `.gitmodules` URL change only
-- Later: pin advanced through the IME-caret (`442461d`) and chat-bubble-scroll-layout (`b594ec0`) framework fixes to reach the current pin.
+- Later: pin advanced through the IME-caret (`442461d`) and chat-bubble-scroll-layout (`b594ec0`) framework fixes.
+- 2026-10: fork `main` **rebased onto upstream v1.8.0** (`126330e`) — the chat scroll APIs were re-ported as `75aaaa8` (submit API dropped: upstream build 287's `ui_widget_on_submit` supersedes it; IME + scroll-layout fixes absorbed upstream). Old lineage preserved on fork branch `legacy-v1.7-fork`. This is the "upstream moved a lot, cherry-pick your deltas" variant of workflow (b).
 
 ## Guidance
 

@@ -765,7 +765,7 @@ void chat_ui_mount_send(UiPage page, UiWidget widget, void* userdata) {
 void chat_ui_mount_input(UiPage page, UiWidget widget, void* userdata) {
     (void)page;
     (void)userdata;
-    ui_text_input_on_submit(widget, on_send, NULL);
+    ui_widget_on_submit(widget, on_send, NULL);
 }
 
 void chat_ui_mount_scroll(UiPage page, UiWidget widget, void* userdata) {

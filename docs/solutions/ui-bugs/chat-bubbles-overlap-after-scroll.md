@@ -26,6 +26,8 @@ tags:
 
 # Chat message bubbles overlap after scrolling (core-ui ScrollView relayout)
 
+> **Status update (2026-10-24):** upstream core-ui v1.8.0 (build 285) superseded this fix with a better one — mouse scrolling no longer triggers any relayout; `ScrollViewWidget::OnMouseWheel` / thumb drag now apply a pure offset via `ApplyScrollDelta_` (shifts subtree rects, no measure pass). The fork's `RequestLayout`-routing commit (`b594ec0`) was dropped in the v1.8.0 rebase for exactly this reason. The measure-scope root cause analysis below remains valid reading for any code that still calls `DoLayout()` outside `LayoutRoot()` (upstream `TabControl::OnMouseDown` and `Splitter::OnMouseMove` still do).
+
 ## Problem
 
 After scrolling the chat page, multi-line assistant message bubbles overlapped each other and became unreadable. Single-line user bubbles stayed correctly spaced; the corruption was confined to wrapped, multi-line content and only appeared once the user scrolled.
