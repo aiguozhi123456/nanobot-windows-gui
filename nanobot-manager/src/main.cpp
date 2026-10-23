@@ -54,6 +54,7 @@ static int       g_effective_health_port = 18790;
                                                 * when g_state.handle becomes signaled       */
 #define WM_ASYNC_HEALTH_RESULT  (WM_APP + 5)   /* LPARAM = health_result_payload* (handler frees)             */
 #define WM_ASYNC_RESOLVE_DONE   (WM_APP + 6)   /* WPARAM = start_intent(0/1), LPARAM = resolve_payload* (malloc'd; handler frees) */
+#define WM_INSTALLER_EXITED     (WM_APP + 7)   /* one-click installer window closed; re-run detection */
 #define WM_CHAT_EVENT           (WM_APP + 10)
 
 static void tray_remove(void);
@@ -788,6 +789,122 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
     free(p);
 }
 
+/* --- One-click nanobot installer button --------------------------------------
+ * Upstream's official Windows install is a PowerShell one-liner that creates
+ * an isolated venv at ~\.nanobot\venv (detected by the resolver's managed-venv
+ * tier). The button spawns a VISIBLE PowerShell window running that exact
+ * command -- the installer is interactive (it ends by launching the webui or
+ * the onboard wizard), so -NoExit keeps the console open until the user is
+ * done. When the window closes we re-run detection so the banner clears and
+ * Start becomes available. The command is shown verbatim in the confirmation
+ * dialog; nothing runs elevated or hidden. */
+#define NANOBOT_INSTALL_CMD \
+    L"irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex"
+
+static int    g_installing = 0;
+static HANDLE g_installer_process = NULL;   /* we own; closed after unwatch    */
+static HANDLE g_installer_wait = NULL;      /* RegisterWaitForSingleObject reg */
+
+struct installer_wait_ctx { HWND hwnd; UINT msg; };   /* heap; owned by callback */
+
+static VOID CALLBACK installer_wait_callback(PVOID param, BOOLEAN timeout) {
+    (void)timeout;                         /* INFINITE wait -- always FALSE    */
+    struct installer_wait_ctx* ctx = (struct installer_wait_ctx*)param;
+    if (!ctx) return;
+    PostMessageW(ctx->hwnd, ctx->msg, 0, 0);
+    free(ctx);                             /* single-fire => freed exactly once */
+}
+
+/* Drain any in-flight callback and drop the registration. MUST be called
+ * before CloseHandle on g_installer_process (same discipline as process.c's
+ * nanobot_unwatch_handle). */
+static void installer_unwatch(void) {
+    if (g_installer_wait) {
+        UnregisterWaitEx(g_installer_wait, INVALID_HANDLE_VALUE);
+        g_installer_wait = NULL;
+    }
+}
+
+static void on_install_nanobot(UiWidget w, void* ud) {
+    (void)w; (void)ud;
+    if (g_installing) return;
+
+    HWND owner = (HWND)ui_window_hwnd(g_win);
+    wchar_t message[640];
+    if (is_zh())
+        swprintf_s(message, _countof(message),
+            L"将打开 PowerShell 并运行 nanobot 官方一键安装命令：\n\n%s\n\n需要已安装 Python 3.11+。是否继续？",
+            NANOBOT_INSTALL_CMD);
+    else
+        swprintf_s(message, _countof(message),
+            L"This opens PowerShell and runs the official nanobot one-click installer:\n\n%s\n\nPython 3.11+ is required. Continue?",
+            NANOBOT_INSTALL_CMD);
+    if (MessageBoxW(owner, message,
+            is_zh() ? L"安装 nanobot" : L"Install nanobot",
+            MB_YESNO | MB_ICONINFORMATION) != IDYES)
+        return;
+
+    wchar_t ps[MAX_PATH];
+    if (!SearchPathW(NULL, L"powershell.exe", NULL, _countof(ps), ps, NULL)) {
+        MessageBoxW(owner,
+            is_zh() ? L"未找到 powershell.exe，无法启动安装。"
+                    : L"powershell.exe was not found; the installer cannot start.",
+            is_zh() ? L"安装失败" : L"Install failed", MB_OK | MB_ICONERROR);
+        return;
+    }
+
+    wchar_t cmdline[MAX_PATH + 512];
+    if (swprintf_s(cmdline, _countof(cmdline),
+            L"\"%s\" -NoExit -ExecutionPolicy Bypass -Command \"%s\"",
+            ps, NANOBOT_INSTALL_CMD) <= 0)
+        return;
+
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&si, sizeof(si));
+    ZeroMemory(&pi, sizeof(pi));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_SHOWNORMAL;
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+        wchar_t err[256];
+        swprintf_s(err, _countof(err),
+            is_zh() ? L"无法启动 PowerShell（错误 %lu）。"
+                    : L"Could not start PowerShell (error %lu).",
+            (unsigned long)GetLastError());
+        MessageBoxW(owner, err, is_zh() ? L"安装失败" : L"Install failed",
+            MB_OK | MB_ICONERROR);
+        return;
+    }
+    CloseHandle(pi.hThread);
+
+    /* Watch the installer window so detection re-runs when the user closes
+     * it. If registration fails, leave the button active and rely on the
+     * refresh button instead of latching a state nothing will clear. */
+    struct installer_wait_ctx* ctx = (struct installer_wait_ctx*)malloc(sizeof(*ctx));
+    HANDLE wait = NULL;
+    if (ctx) {
+        ctx->hwnd = owner;
+        ctx->msg  = WM_INSTALLER_EXITED;
+        if (RegisterWaitForSingleObject(&wait, pi.hProcess, installer_wait_callback,
+                                        ctx, INFINITE,
+                                        WT_EXECUTEONLYONCE | WT_EXECUTEINPERSISTENTTHREAD)) {
+            g_installer_wait = wait;
+            g_installer_process = pi.hProcess;
+            g_installing = 1;
+            ui_page_set_bool(g_page, "installing", 1);
+            return;
+        }
+        free(ctx);
+    }
+    CloseHandle(pi.hProcess);   /* no watch armed; refresh stays the fallback */
+}
+
+static void on_btn_install_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_install_nanobot, NULL);
+}
+
 static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR uid, DWORD_PTR ref) {
     (void)uid; (void)ref;
@@ -819,6 +936,20 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         s_health_fail_streak = 0;
         chat_disconnect_async();
         chat_ui_on_gateway_stopped();
+        return 0;
+    }
+    if (msg == WM_INSTALLER_EXITED) {
+        /* One-click installer window closed (script + wizard done). Re-run
+         * detection so the install banner clears once the venv is there.
+         * on_resolve_done discards the result if a live lifecycle is active. */
+        installer_unwatch();
+        if (g_installer_process) {
+            CloseHandle(g_installer_process);
+            g_installer_process = NULL;
+        }
+        g_installing = 0;
+        ui_page_set_bool(g_page, "installing", 0);
+        kick_resolve_worker(hwnd, 0);
         return 0;
     }
     if (msg == WM_CHILD_EXITED) {
@@ -1647,7 +1778,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "chat_placeholder=输入消息…\n"
             "chat_send=发送\n"
             "install_not_found=未找到 nanobot\n"
-            "install_hint=请安装：python -m pip install -U \"nanobot-ai>=0.2.2\"\n"
+            "install_hint=PowerShell 一键安装：irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex\n"
+            "install_action=一键安装\n"
+            "install_running=安装窗口已打开，关闭后将自动重新检测\n"
             "metric_port=Gateway 端口\n"
             "metric_pid=进程\n"
             "metric_uptime=运行时间\n"
@@ -1683,7 +1816,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "chat_placeholder=Type a message…\n"
             "chat_send=Send\n"
             "install_not_found=nanobot not found\n"
-            "install_hint=Please install: python -m pip install -U \"nanobot-ai>=0.2.2\"\n"
+            "install_hint=One-click install in PowerShell: irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex\n"
+            "install_action=Install nanobot\n"
+            "install_running=The install window is open; detection re-runs when it closes\n"
             "metric_port=Gateway Port\n"
             "metric_pid=PID\n"
             "metric_uptime=Uptime\n"
@@ -1802,6 +1937,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
     ui_page_on_widget_mount(g_page, "btn_refresh", on_btn_refresh_mount, NULL);
+    ui_page_on_widget_mount(g_page, "btn_install_nanobot", on_btn_install_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_autostart", on_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_tray", on_tray_toggle_mount, NULL);
     ui_page_on_widget_mount(g_page, "toggle_hotkey", on_hotkey_toggle_mount, NULL);
@@ -1856,6 +1992,14 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
      * decision is "leave running", so we do NOT call nanobot_stop() -- closing
      * an OpenProcess handle does NOT kill the process; the gateway keeps running. */
     nm_state_clear();
+
+    /* One-click installer window still open at exit: drop our watch + handle.
+     * Closing the handle does NOT kill the user's PowerShell window. */
+    installer_unwatch();
+    if (g_installer_process) {
+        CloseHandle(g_installer_process);
+        g_installer_process = NULL;
+    }
 
     /* Drain leftover WM_CHAT_EVENT payloads (malloc'd LPARAM) after shutdown. */
     {

@@ -14,8 +14,9 @@ SetCompressor /SOLID lzma
 
 Name "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "..\dist\nanobot-manager-setup.exe"
-InstallDir "$PROGRAMFILES64\${PRODUCT_NAME}"
-RequestExecutionLevel admin
+; Per-user install (matches nanobot's own install form): no UAC, no admin.
+InstallDir "$LOCALAPPDATA\Programs\${PRODUCT_NAME}"
+RequestExecutionLevel user
 
 !define MUI_ICON "..\assets\app.ico"
 !define MUI_UNICON "..\assets\app.ico"
@@ -36,6 +37,10 @@ RequestExecutionLevel admin
 
 Function .onInit
     !insertmacro MUI_LANGDLL_DISPLAY
+
+    ; Everything per-user: uninstall key (SHCTX -> HKCU), shortcuts, and by
+    ; default the install location. No elevation anywhere in this installer.
+    SetShellVarContext current
 
     StrCpy $R1 ""
 
@@ -65,19 +70,53 @@ Function .onInit
             ${EndIf}
         ${EndIf}
 
-        ${If} $R1 != ""
-            StrCpy $INSTDIR $R1
-        ${EndIf}
-
         MessageBox MB_YESNO|MB_ICONINFORMATION \
             "Detected v$R0 installed. Upgrade to v${PRODUCT_VERSION}?" \
-            IDYES kill_proc
+            IDYES upgrade
         Abort
     ${EndIf}
+    Goto done
 
-kill_proc:
+upgrade:
     nsExec::ExecToLog 'taskkill /IM "nanobot-manager.exe" /F'
     Sleep 500
+
+    ${If} $R1 != ""
+        ; Reuse the previous location only when it is writable without
+        ; elevation (per-user locations). Legacy Program Files installs
+        ; (admin-era setup) are not writable by this per-user installer.
+        ClearErrors
+        FileOpen $6 "$R1\~nmwrite.tmp" w
+        ${IfNot} ${Errors}
+            FileClose $6
+            Delete "$R1\~nmwrite.tmp"
+            StrCpy $INSTDIR $R1
+            Goto done
+        ${EndIf}
+    ${EndIf}
+
+    ; Legacy elevated install. This installer can neither replace nor remove
+    ; it silently, and sharing the HKCU uninstall key with a half-removed
+    ; install would orphan the old copy -- so the old uninstaller must run
+    ; first (it elevates itself). Fresh installs then go to the per-user dir.
+    ${If} ${FileExists} "$R1\uninstall.exe"
+        MessageBox MB_YESNO|MB_ICONINFORMATION \
+            "The previous installation (v$R0 at $R1) requires administrator rights to remove.$\r$\nRun its uninstaller now? Windows will ask for administrator confirmation; run this setup again afterwards." \
+            IDYES run_legacy IDNO legacy_manual
+        run_legacy:
+            ExecShell "runas" "$R1\uninstall.exe"
+            Abort
+        legacy_manual:
+            MessageBox MB_OK|MB_ICONINFORMATION \
+                "Please uninstall the previous version first (Settings > Apps, or run $R1\uninstall.exe), then run this setup again."
+            Abort
+    ${Else}
+        ; Stale registry entry with no uninstaller left behind: proceed with a
+        ; fresh per-user install (the -Post section rewrites the key anyway).
+        DetailPrint "Previous install at $R1 has no uninstaller; installing fresh to $INSTDIR"
+    ${EndIf}
+
+done:
 FunctionEnd
 
 Section "MainSection" SEC01
@@ -114,6 +153,10 @@ Section -Post
 SectionEnd
 
 Section Uninstall
+    ; Uninstaller runs as its own process: re-declare the per-user context
+    ; (SHCTX -> HKCU, per-user shortcuts) like .onInit does for the installer.
+    SetShellVarContext current
+
     nsExec::ExecToLog 'taskkill /IM "nanobot-manager.exe" /F'
     Sleep 500
 

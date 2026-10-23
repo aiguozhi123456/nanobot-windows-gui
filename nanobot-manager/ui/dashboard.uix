@@ -25,6 +25,7 @@ export default {
       hasCredential: false,
       theme: "system",
       installed: true,
+      installing: false,
       lang: "zh",
       messages: [],
       draft: "",
@@ -134,8 +135,45 @@ export default {
   }
 
   .install-hint-text {
+    /* block so the long one-liner wraps and measures multi-line (same
+       measure/draw agreement rule as .msg-text); center like the title. */
+    display: block;
+    text-align: center;
     font-size: 12px;
     color: var(--accent);
+  }
+
+  .install-btn {
+    margin-top: 6px;
+    padding: 6px 16px;
+    border-radius: 8px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background: var(--accent);
+    color: var(--fg-on-accent);
+    cursor: pointer;
+  }
+
+  .install-btn:hover {
+    opacity: 0.92;
+  }
+
+  .install-btn:disabled {
+    background: var(--disabled-bg);
+    color: var(--disabled-text);
+    opacity: 1;
+    cursor: default;
+  }
+
+  .install-btn:disabled .install-btn-label {
+    color: var(--disabled-text);
+  }
+
+  .install-btn-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-on-accent);
   }
 
   .hero {
@@ -695,7 +733,10 @@ export default {
         <div v-if="page=='dashboard'" class="page-scroll">
           <div v-if="!installed" class="install-hint">
             <label class="install-hint-title">{{ $t('install_not_found') }}</label>
-            <label class="install-hint-text">{{ $t('install_hint') }}</label>
+            <label class="install-hint-text">{{ installing ? $t('install_running') : $t('install_hint') }}</label>
+            <div id="btn_install_nanobot" class="install-btn" :enabled="!installing">
+              <label class="install-btn-label">{{ $t('install_action') }}</label>
+            </div>
           </div>
 
           <div class="hero">
@@ -874,7 +915,7 @@ export default {
           </div>
 
           <div class="settings-footer">
-            <label class="footer-ver" id="footer_version">v1.5.0</label>
+            <label class="footer-ver" id="footer_version">v1.6.0</label>
             <div id="btn_webui" class="footer-link">
               <label class="footer-link-text">{{ $t('open_webui') }}</label>
               <svg width="10" height="10" viewBox="0 0 24 24">
