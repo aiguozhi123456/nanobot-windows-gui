@@ -86,8 +86,9 @@ The OS APIs support the target's contract; they do not replace it. Process enume
 
 1. `app_config.nanobot_path`
 2. `nanobot.exe` on `PATH`
-3. `py.exe`
-4. `python.exe`, `python3.exe`, and `pythonw.exe`
+3. One-click installer's managed venv: `%NANOBOT_VENV%` or `%USERPROFILE%\.nanobot\venv` — `Scripts\nanobot.exe`, then `Scripts\python.exe` (the installer never touches PATH, so the canonical location is probed directly)
+4. `py.exe`
+5. `python.exe`, `python3.exe`, and `pythonw.exe`
 
 `nanobot_resolve` probes candidates against the capability the manager actually requires: `gateway --help` must exit successfully and contain a standalone `--background` token. This distinguishes not found, incompatible, and probe-failed outcomes before Start. A configured executable is an explicit override, so its failure does not silently select a different executable from `PATH`; successful probes are cached for the session while failures remain retryable. Every interactive and autostart entry point uses the same resolver. `kick_resolve_worker` snapshots pointer-owned configuration before off-thread work begins, and the UI derives installation state from the resolver result.
 

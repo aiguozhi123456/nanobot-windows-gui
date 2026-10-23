@@ -8,7 +8,8 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 
 - 启动/停止 nanobot gateway（支持 `nanobot gateway` 和 `python -m nanobot gateway` 两种方式）
 - 实时健康检查（WinHTTP `GET /health`）
-- 自动检测 `nanobot.exe`（pip 入口点）或回退到 Python + 模块方式
+- 自动检测 nanobot：一键安装的托管 venv（`~\.nanobot\venv`，含 `%NANOBOT_VENV%` 覆盖）→ PATH 上的 `nanobot.exe`（pip 入口点）→ Python + 模块回退
+- 应用内一键安装按钮：在可见的 PowerShell 窗口中运行 nanobot 官方安装命令，窗口关闭后自动重新检测
 - 原生 WebSocket 聊天客户端，流式显示 delta/message，连接 gateway WebUI 端口
 - 本地持久化对话历史，管理器重启后恢复
 - 全局快捷键 **Ctrl+Shift+N**，在任意应用中显示/隐藏窗口（可在设置中开关）
@@ -20,13 +21,19 @@ Windows 原生 GUI 管理面板，用于管理 [nanobot](https://github.com/HKUD
 - 中英双语界面，运行时切换
 - 主题：跟随系统 / 深色 / 浅色（跟随系统时读取 Windows 个性化设置）
 - 可配置 Gateway 健康端口与 Manager WebUI 端口，认证密钥保存到 Credential Manager（绝不写入 `config.json`）
-- NSIS 安装包，nanobot mark 图标，中英文双语安装向导
+- NSIS 安装包，nanobot mark 图标，中英文双语安装向导，per-user 安装无需管理员权限
 
 ## 依赖
 
 - Windows 10/11（64 位）
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) 或更新版本（支持 VS 2026），含 C++ CMake 工具集
-- [Python 3.x](https://www.python.org/) + nanobot-ai >= 0.2.2（`python -m pip install -U "nanobot-ai>=0.2.2"`）
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) 或更新版本（支持 VS 2026），含 C++ CMake 工具集 —— 仅构建需要
+- [Python 3.11+](https://www.python.org/) 与 nanobot（`nanobot-ai >= 0.2.2`）。推荐使用官方一键安装（PowerShell）：
+
+  ```powershell
+  irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex
+  ```
+
+  它会在 `~\.nanobot\venv` 创建独立 venv（不改 PATH、不写注册表）；管理器会自动检测该位置，应用内的一键安装按钮运行的也是同一条命令。备选方式：`python -m pip install -U "nanobot-ai>=0.2.2"`。
 
 ## 构建
 
@@ -54,7 +61,7 @@ scripts\package.bat
 
 前往 [GitHub Releases](https://github.com/aiguozhi123456/nanobot-windows-gui/releases) 下载最新安装包。
 
-运行 `nanobot-manager-setup.exe`，按照向导完成安装即可。
+运行 `nanobot-manager-setup.exe`，按照向导完成安装即可。安装为 **per-user** 形态 —— 装到 `%LOCALAPPDATA%\Programs\nanobot-manager`，无需管理员权限（与 nanobot 自身的安装形态一致）。从 1.6 之前的 Program Files 版本升级时，安装程序会先引导运行旧版卸载器，再全新安装。
 
 ## 使用
 

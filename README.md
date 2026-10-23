@@ -8,7 +8,8 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 
 - Start/stop nanobot gateway (`nanobot gateway` or `python -m nanobot gateway`)
 - Real-time health check via WinHTTP (`GET /health`)
-- Auto-detect `nanobot.exe` (pip console script) or fall back to Python + module
+- Auto-detect nanobot: one-click installer's managed venv (`~\.nanobot\venv`, incl. `%NANOBOT_VENV%`), `nanobot.exe` on PATH (pip console script), or Python + module fallback
+- In-app one-click install button that runs the official nanobot installer in a visible PowerShell window and re-detects when it closes
 - Native WebSocket chat client with streaming UI (delta/message) connected to the gateway WebUI port
 - Conversation history persisted locally across manager restarts
 - Global hotkey **Ctrl+Shift+N** to show/hide the window from any application (toggleable)
@@ -20,13 +21,19 @@ A native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot) —
 - Bilingual UI (Chinese / English) with runtime switching
 - Theme modes: system / dark / light (follows the Windows personalization setting)
 - Configurable Gateway health and Manager WebUI ports; bootstrap secret stored in Windows Credential Manager (never written to `config.json`)
-- NSIS installer with the nanobot mark icon, bilingual (Chinese/English) setup wizard
+- NSIS installer with the nanobot mark icon, bilingual (Chinese/English) setup wizard, per-user install without administrator rights
 
 ## Requirements
 
 - Windows 10 / 11 (64-bit)
-- [Visual Studio 2022](https://visualstudio.microsoft.com/) or newer (VS 2026 supported), with C++ CMake tools
-- [Python 3.x](https://www.python.org/) + `nanobot-ai >= 0.2.2` (`python -m pip install -U "nanobot-ai>=0.2.2"`)
+- [Visual Studio 2022](https://visualstudio.microsoft.com/) or newer (VS 2026 supported), with C++ CMake tools — build only
+- [Python 3.11+](https://www.python.org/) and nanobot (`nanobot-ai >= 0.2.2`). Recommended: the official one-click installer (PowerShell):
+
+  ```powershell
+  irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex
+  ```
+
+  It creates an isolated venv at `~\.nanobot\venv` (no PATH or registry changes); the manager auto-detects that location, and the in-app install button runs the same command. Alternative: `python -m pip install -U "nanobot-ai>=0.2.2"`.
 
 ## Build
 
@@ -54,7 +61,7 @@ Output: `nanobot-manager\dist\nanobot-manager-setup.exe`
 
 Download the latest installer from [GitHub Releases](https://github.com/aiguozhi123456/nanobot-windows-gui/releases).
 
-Run `nanobot-manager-setup.exe` and follow the wizard to install.
+Run `nanobot-manager-setup.exe` and follow the wizard to install. The setup is **per-user** — it installs to `%LOCALAPPDATA%\Programs\nanobot-manager` and needs no administrator rights (matching nanobot's own install form). When upgrading from a pre-1.6 Program Files install, the setup asks you to run the old uninstaller first, then install fresh.
 
 ## Usage
 

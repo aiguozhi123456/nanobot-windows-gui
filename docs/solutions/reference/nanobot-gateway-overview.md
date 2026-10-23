@@ -1,7 +1,7 @@
 ---
 title: "nanobot Gateway Overview — 上游被托管网关的整体画像"
 date: 2026-07-11
-last_updated: 2026-07-13
+last_updated: 2026-10-24
 category: reference
 module: upstream/nanobot
 problem_type: reference_overview
@@ -21,7 +21,7 @@ tags: [nanobot, gateway, websocket, http-api, upstream, integration, python]
 
 nanobot 是 HKUDS 的开源、超轻量、可自托管的个人 AI agent 运行时（MIT，作者 Xubin Ren / re-bin）。其核心是一个极简 agent loop：消息 → LLM 决定调用工具 → 将记忆与技能作为上下文注入。支持多入口（WebUI / CLI / Telegram / Discord / Slack / WeChat / Feishu / Email 等），丰富的工具集（文件 / shell / web / MCP / cron / 图像生成 / subagents），以及持久化（会话历史 + Dream 长期记忆 + 长程目标 `/goal`）。
 
-pip 包名为 **`nanobot-ai`**（注意不是 `nanobot`），可执行命令为 `nanobot`，要求 Python ≥ 3.11，Windows 官方支持（v0.1.5.post2 起）。当前稳定版 **v0.2.2** "Durability Release"（2026-06-21），节奏极快（几乎每日更新），33+ contributors。
+pip 包名为 **`nanobot-ai`**（注意不是 `nanobot`），可执行命令为 `nanobot`，要求 Python ≥ 3.11，Windows 官方支持（v0.1.5.post2 起）。Windows 官方一键安装（`irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex`）用系统 Python 创建独立 venv **`~\.nanobot\venv`**（可用 `NANOBOT_VENV` 覆盖），**不写 PATH / 不写注册表 / 无 shim**，入口为 `venv\Scripts\nanobot.exe` 或 `venv\Scripts\python.exe -m nanobot`（manager 的解析器有对应的托管 venv 探测层）。当前稳定版 **v0.2.2** "Durability Release"（2026-06-21），节奏极快（几乎每日更新），33+ contributors。
 
 本仓库 `nanobot-manager` 是 nanobot 的 **Windows 原生 GUI 管理器**：它负责启动 / 停止 `nanobot gateway` 长驻进程、健康检查、并提供一个内嵌的原生聊天页面。本文档为"适配 nanobot 版本变化"提供完整的事实基线。
 
@@ -215,7 +215,7 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 
 | manager 侧 | 职责 | 对接的 nanobot 资源 |
 |------------|------|---------------------|
-| `process.c` | 命令解析 | 配置路径 → `nanobot.exe` → `py.exe` / Python 候选；Python 层执行 `-m nanobot --version` 探测 |
+| `process.c` | 命令解析 | 候选顺序：配置路径 → PATH `nanobot.exe` → 一键安装托管 venv（`%NANOBOT_VENV%` 或 `~\.nanobot\venv` 的 `Scripts\nanobot.exe` / `Scripts\python.exe`）→ PATH `py.exe` / Python 候选；`gateway --help` 探测门控 |
 | `process.c` | 启动 | `nanobot.exe gateway --background` / `python -m nanobot gateway --background`；丢弃短生命周期 launcher 句柄 |
 | `process.c` | 状态记录 / PID | 读取 `%USERPROFILE%\.nanobot\run\gateway.json`，用真实 gateway PID `OpenProcess`；启动路径优先校验十进制 FILETIME `identity` |
 | `process.c` | 停止 | 优先 `gateway stop --timeout 20`；失败后才走句柄终止 / process-tree fallback |

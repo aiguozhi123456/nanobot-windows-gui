@@ -30,6 +30,11 @@ The manager's coordinated status for resolving, idle, startup, running, stopping
 
 Terminal unavailability can be reached by a process-exit event or sustained failed readiness; it does not by itself prove that the process has exited.
 
+### Managed Venv Install
+The on-disk form of nanobot's official Windows one-click install: an isolated venv at `~\.nanobot\venv` (or `%NANOBOT_VENV%`) with entry points `Scripts\nanobot.exe` / `Scripts\python.exe -m nanobot`.
+
+Unlike pip PATH installs or uv tool / pipx shims, it touches neither PATH nor the registry nor any shim directory, so it is discoverable only by probing the canonical location — which is why command resolution has a dedicated tier for it.
+
 ### WebUI Port
 The Nanobot Gateway endpoint used for its web interface, Bootstrap, and Chat Session transport; it is independent of the Gateway Health Port.
 

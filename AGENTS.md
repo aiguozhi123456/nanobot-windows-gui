@@ -13,7 +13,7 @@ Native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot). Prod
 | `nanobot-manager/src/chat.c` | WebUI bootstrap + WinHTTP WebSocket chat client (connect/send/stream) |
 | `nanobot-manager/src/autostart.c` | `HKCU\...\Run` value `nanobot-manager` → `"exe" --autostart` |
 | `nanobot-manager/ui/dashboard.uix` | Core UI SFC (layout + reactive state, chat page) |
-| `nanobot-manager/installer/installer.nsi` | NSIS setup (needs prior Release build) |
+| `nanobot-manager/installer/installer.nsi` | NSIS setup (needs prior Release build). **Per-user**: `$LOCALAPPDATA\Programs\nanobot-manager`, `RequestExecutionLevel user`; legacy Program Files installs are routed through their own (elevating) uninstaller first |
 | `nanobot-manager/CMakeLists.txt` | App target; pulls `../core-ui` + FetchContent cJSON |
 | `core-ui/` | Submodule only — do not treat as primary app source |
 | `docs/solutions/` | Documented solutions to past problems (bugs, best practices, architecture patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas |
@@ -53,10 +53,11 @@ ctest --test-dir nanobot-manager\build -C Release --output-on-failure
 
 ## Runtime behavior agents miss
 
-- **Start command**: `nanobot.exe gateway --background --port N`, else `python.exe -m nanobot gateway --background --port N` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`). Full resolution probes for `--background` support.
+- **Start command**: `nanobot.exe gateway --background --port N`, else `python.exe -m nanobot gateway --background --port N` (`CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP`). Candidate order: config `nanobot_path` → `nanobot.exe` on PATH → one-click managed venv `%NANOBOT_VENV%` or `%USERPROFILE%\.nanobot\venv` (`Scripts\nanobot.exe`, then `Scripts\python.exe -m nanobot`) → py/python on PATH. Full resolution probes for `--background` support.
 - **Health**: `GET http://localhost:{health_check_port}/health` via WinHTTP; HTTP 200 = running. Default port **18790**.
 - **WebUI open**: `http://localhost:{webui_port}` (default **8765**, independent of health port). Not `health_check_port + 1`.
 - **Chat**: native page talks to the same WebUI host via `GET /webui/bootstrap` then WebSocket (see `chat.c`). Optional gateway `tokenIssueSecret` is stored in Windows Credential Manager, not normal config or reactive UI state.
+- **One-click install button** (`btn_install_nanobot`, shown on the `!installed` banner): spawns a visible PowerShell running upstream's `irm .../scripts/install.ps1 | iex` (`-NoExit`), re-resolves on window close (`WM_INSTALLER_EXITED`). Upstream install = system Python 3.11+ + venv at `~\.nanobot\venv`, no PATH/registry changes.
 - **`--autostart`**: if `stay_in_tray` is false → start nanobot (if needed) and exit; if tray enabled → silent tray + optional start. Logs: `nanobot-manager-autostart.log` / `nanobot-manager-process.log` beside exe.
 - **config.json** (exe directory) fields in code (README table is incomplete):
 
