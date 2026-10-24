@@ -152,6 +152,7 @@ void config_apply_defaults(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
     cfg->health_check_port = 0;   /* 0 = auto: follow the running gateway, fallback 18790 */
     cfg->theme_mode = 0;
+    cfg->window_transparent = 1;  /* acrylic translucent window on by default */
     cfg->hotkey_enabled = 1;
     cfg->webui_port = 0;    /* 0 = auto-detect from nanobot's config */
     strcpy(cfg->language, "zh");
@@ -195,6 +196,9 @@ int config_parse_json(app_config* cfg, const char* json) {
     item = cJSON_GetObjectItem(root, "theme_mode");
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 2)
         cfg->theme_mode = item->valueint;
+    item = cJSON_GetObjectItem(root, "window_transparent");
+    if (item && (cJSON_IsBool(item) || cJSON_IsNumber(item)))
+        cfg->window_transparent = cJSON_IsTrue(item) || (cJSON_IsNumber(item) && item->valueint != 0);
     item = cJSON_GetObjectItem(root, "language");
     if (item && cJSON_IsString(item) && item->valuestring[0] &&
         (strcmp(item->valuestring, "zh") == 0 || strcmp(item->valuestring, "en") == 0)) {
@@ -262,6 +266,7 @@ char* config_serialize_json(const app_config* cfg) {
     cJSON_AddBoolToObject(root, "hotkey_enabled", cfg->hotkey_enabled);
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
+    cJSON_AddBoolToObject(root, "window_transparent", cfg->window_transparent != 0);
     cJSON_AddStringToObject(root, "language", cfg->language);
     cJSON_AddStringToObject(root, "log_level", cfg->log_level);
     cJSON_AddNumberToObject(root, "webui_port", cfg->webui_port);

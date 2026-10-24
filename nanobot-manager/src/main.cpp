@@ -16,9 +16,38 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shlwapi.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Translucent-window backdrop ------------------------------------------------
+ * The UIX <window translucent> switch renders through DirectComposition with
+ * premultiplied alpha and clears transparent; DWM must paint acrylic behind
+ * the window or the transparent pixels just show the raw desktop. Documented
+ * Win11 system backdrop first, undocumented accent policy as the Win10-era
+ * fallback; if neither sticks we degrade to an opaque clear via
+ * ui_window_set_translucent(0) so the window stays readable. */
+#ifndef DWMWA_SYSTEMBACKDROP_TYPE
+#define DWMWA_SYSTEMBACKDROP_TYPE 38
+#endif
+#ifndef DWMSBT_TRANSIENTWINDOW
+#define DWMSBT_TRANSIENTWINDOW 3   /* acrylic */
+#endif
+typedef enum _WINDOWCOMPOSITIONATTRIB {
+    WCA_ACCENT_POLICY = 19
+} WINDOWCOMPOSITIONATTRIB;
+typedef struct _ACCENT_POLICY {
+    int accent_state;   /* 3 = ACCENT_ENABLE_ACRYLICBLURBEHIND */
+    int accent_flags;
+    unsigned gradient;  /* 0xAABBGGRR tint over the blur */
+    int animation_id;
+} ACCENT_POLICY;
+typedef struct _WINCOMPATTRDATA {
+    WINDOWCOMPOSITIONATTRIB attrib;
+    void* data;
+    unsigned size_of_data;
+} WINCOMPATTRDATA;
 
 static UiPage    g_page  = 0;
 static UiWindow  g_win   = 0;
@@ -72,6 +101,54 @@ static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manage
 #define WM_ASYNC_RESOLVE_DONE   (WM_APP + 6)   /* WPARAM = start_intent(0/1), LPARAM = resolve_payload* (malloc'd; handler frees) */
 #define WM_INSTALLER_EXITED     (WM_APP + 7)   /* one-click installer window closed; re-run detection */
 #define WM_CHAT_EVENT           (WM_APP + 10)
+
+/* --- Translucent-window backdrop application (needs g_hwnd above) --- */
+#pragma comment(lib, "dwmapi.lib")
+/* 0 = none applied, 1 = Win11 system backdrop (theme-aware, no re-apply
+ * needed), 2 = accent policy (tint must be re-applied on theme change). */
+static int g_backdrop_kind = 0;
+
+static int apply_accent_acrylic(HWND hwnd, int dark) {
+    typedef BOOL (WINAPI *SetWindowCompositionAttributeFn)(HWND, const WINCOMPATTRDATA*);
+    static SetWindowCompositionAttributeFn pSet = NULL;
+    if (!pSet)
+        pSet = (SetWindowCompositionAttributeFn)(void*)GetProcAddress(
+            GetModuleHandleW(L"user32.dll"), "SetWindowCompositionAttribute");
+    if (!pSet) return 0;
+
+    ACCENT_POLICY policy = {0};
+    policy.accent_state = 3;   /* ACCENT_ENABLE_ACRYLICBLURBEHIND */
+    policy.accent_flags = 2;
+    /* Same smoke tone as the theme window backgrounds: #292929 dark / near
+     * white light, ~0xB0 opacity so the desktop reads through the blur. */
+    policy.gradient = dark ? 0xB0292929u : 0xB0F2F2F2u;
+    WINCOMPATTRDATA data = {0};
+    data.attrib = WCA_ACCENT_POLICY;
+    data.data = &policy;
+    data.size_of_data = sizeof(policy);
+    if (!pSet(hwnd, &data)) return 0;
+    g_backdrop_kind = 2;
+    return 1;
+}
+
+static int apply_window_backdrop(HWND hwnd, int dark) {
+    if (!hwnd) return 0;
+    int backdrop = DWMSBT_TRANSIENTWINDOW;
+    HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                                       &backdrop, sizeof(backdrop));
+    if (SUCCEEDED(hr)) {
+        g_backdrop_kind = 1;
+        return 1;
+    }
+    return apply_accent_acrylic(hwnd, dark);
+}
+
+static void backdrop_reapply_for_theme(int dark) {
+    /* Win11 system backdrops restyle themselves; only the accent-policy tint
+     * embeds a literal color that must follow the theme. */
+    if (g_backdrop_kind == 2 && g_hwnd)
+        apply_accent_acrylic(g_hwnd, dark);
+}
 
 static void tray_remove(void);
 static int has_arg(LPCWSTR cmd, const wchar_t* arg);
@@ -1596,10 +1673,13 @@ static void apply_theme(int mode) {
     if (mode < 0 || mode > 2) mode = 0;
     g_theme_mode = mode;
     g_cfg.theme_mode = mode;
+    int dark = 1;
     if (mode == 1)
         ui_theme_set_mode(UI_THEME_DARK);
-    else if (mode == 2)
+    else if (mode == 2) {
         ui_theme_set_mode(UI_THEME_LIGHT);
+        dark = 0;
+    }
     else {
         HKEY hk;
         DWORD val = 0, sz = sizeof(val);
@@ -1610,7 +1690,9 @@ static void apply_theme(int mode) {
             RegCloseKey(hk);
         }
         ui_theme_set_mode(val ? UI_THEME_LIGHT : UI_THEME_DARK);
+        dark = !val;
     }
+    backdrop_reapply_for_theme(dark);
 
     const char* labels[] = { "system", "dark", "light" };
     page_set("theme", labels[mode]);
@@ -2063,6 +2145,20 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_hwnd = hwnd;
+    /* The window is created translucent by the UIX <window translucent> tag;
+     * paint DWM acrylic behind it (or degrade to an opaque clear when neither
+     * backdrop API is available / window_transparent is turned off). */
+    if (g_cfg.window_transparent &&
+        apply_window_backdrop(hwnd, ui_theme_get_mode() == UI_THEME_DARK)) {
+        nm_log(NM_LOG_INFO, "app", "translucent window: acrylic backdrop kind=%d", g_backdrop_kind);
+    } else {
+        ui_window_set_translucent(g_win, 0);
+        g_backdrop_kind = 0;
+        if (!g_cfg.window_transparent)
+            nm_log(NM_LOG_INFO, "app", "translucent window disabled by config");
+        else
+            nm_log(NM_LOG_WARN, "app", "no DWM acrylic backdrop available; opaque fallback");
+    }
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);

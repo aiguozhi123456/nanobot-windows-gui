@@ -16,6 +16,9 @@ typedef struct {
                                    18790 (default); legacy serialized 18790
                                    normalizes to 0; other values pin the port */
     int theme_mode;
+    int window_transparent;   /* 1 = translucent window + DWM acrylic backdrop
+                                   (default); 0 = escape hatch for DWM/driver
+                                   trouble (window stays opaque) */
     char language[8];
     char log_level[8];       /* debug|info|warn|error, default info (see logger.h) */
     int webui_port;           /* 0 = auto-detect from nanobot config (default);
