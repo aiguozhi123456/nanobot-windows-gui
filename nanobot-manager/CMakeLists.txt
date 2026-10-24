@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 project(nanobot-manager C CXX)
 
-set(NANOBOT_MANAGER_VERSION "1.6.1" CACHE STRING "Project version" FORCE)
+set(NANOBOT_MANAGER_VERSION "1.6.2" CACHE STRING "Project version" FORCE)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

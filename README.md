@@ -88,7 +88,7 @@ Portable builds (an adjacent `portable.flag`) and independent executable copies 
   "autostart_nanobot": false,
   "stay_in_tray": false,
   "hotkey_enabled": true,
-  "health_check_port": 18790,
+  "health_check_port": 0,
   "webui_port": 0,
   "theme_mode": 0,
   "language": "zh"
@@ -101,7 +101,7 @@ Portable builds (an adjacent `portable.flag`) and independent executable copies 
 | `autostart_nanobot` | bool | false | Launch nanobot when the manager starts |
 | `stay_in_tray` | bool | false | Minimize to system tray instead of exiting |
 | `hotkey_enabled` | bool | true | Enable the Ctrl+Shift+N global show/hide hotkey |
-| `health_check_port` | int | 18790 | Configured Gateway `/health` port for the next manager launch; a detected running Gateway displays its actual port |
+| `health_check_port` | int | 0 | 0 = auto: attach to the detected running Gateway (state file + probe, fallback 18790) and start new Gateways on 18790; any other value pins the port, applied on the next start (legacy serialized 18790 normalizes to auto) |
 | `webui_port` | int | 0 | Chat/WebSocket port: 0 = auto-read from nanobot's config (`channels.websocket.port`, fallback 8765); any other value pins the port explicitly (legacy serialized 8765 normalizes to auto) |
 | bootstrap secret | Credential Manager, then nanobot config | auto | Explicit Credential Manager entry wins; when unset the manager auto-reads nanobot's `channels.websocket.tokenIssueSecret` (falls back to `token`). Never serialized to `config.json` (legacy `webui_auth` migrates on startup) |
 | `theme_mode` | int | 0 | 0 = follow system, 1 = dark, 2 = light |

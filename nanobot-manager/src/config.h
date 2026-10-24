@@ -12,7 +12,9 @@ typedef struct {
     int autostart_nanobot;
     int stay_in_tray;
     int hotkey_enabled;     /* global Ctrl+Shift+N summon hotkey, default on */
-    int health_check_port;
+    int health_check_port;    /* 0 = auto: follow the running gateway, start on
+                                   18790 (default); legacy serialized 18790
+                                   normalizes to 0; other values pin the port */
     int theme_mode;
     char language[8];
     int webui_port;           /* 0 = auto-detect from nanobot config (default);
@@ -36,7 +38,8 @@ void config_apply_defaults(app_config* cfg);
 
 /* Overlay parsed JSON fields onto cfg (call config_apply_defaults first).
  * Returns 0 on success (invalid JSON is tolerated: fields keep prior values).
- * Validates ranges: ports 1..65535, theme 0..2; out-of-range values ignored. */
+ * Validates ranges: ports 0..65535 (0 = auto sentinel), theme 0..2;
+ * out-of-range values ignored. */
 int  config_parse_json(app_config* cfg, const char* json);
 
 /* Serialize cfg to a malloc'd NUL-terminated JSON string. Caller frees. */

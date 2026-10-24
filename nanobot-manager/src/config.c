@@ -150,7 +150,7 @@ const wchar_t* config_get_active_path(void) { select_config_path(); return g_act
 
 void config_apply_defaults(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
-    cfg->health_check_port = 18790;
+    cfg->health_check_port = 0;   /* 0 = auto: follow the running gateway, fallback 18790 */
     cfg->theme_mode = 0;
     cfg->hotkey_enabled = 1;
     cfg->webui_port = 0;    /* 0 = auto-detect from nanobot's config */
@@ -186,8 +186,11 @@ int config_parse_json(app_config* cfg, const char* json) {
     item = cJSON_GetObjectItem(root, "hotkey_enabled");
     if (item && cJSON_IsBool(item)) cfg->hotkey_enabled = item->valueint;
     item = cJSON_GetObjectItem(root, "health_check_port");
-    if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint > 0 && item->valueint <= 65535)
-        cfg->health_check_port = item->valueint;
+    /* 0..65535 valid; 0 = auto sentinel. Managers before auto-detect always
+     * serialized 18790 (the old default): normalize it so pre-existing configs
+     * follow the running gateway instead of pinning the old display value. */
+    if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 65535)
+        cfg->health_check_port = (item->valueint == 18790) ? 0 : item->valueint;
     item = cJSON_GetObjectItem(root, "theme_mode");
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint >= 0 && item->valueint <= 2)
         cfg->theme_mode = item->valueint;

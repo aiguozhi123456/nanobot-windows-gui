@@ -64,6 +64,7 @@ static int has_arg(LPCWSTR cmd, const wchar_t* arg);
 static int can_edit_gateway_port(void);
 static VOID CALLBACK on_timer_focus_chat(HWND, UINT, UINT_PTR, DWORD);
 static void update_webui_port_sub(void);
+static void update_gateway_port_sub(void);
 static void update_credential_ui(void);
 
 static void show_main_window(void) {
@@ -305,8 +306,19 @@ static int can_edit_gateway_port(void) {
     return state == NM_STATE_IDLE || state == NM_STATE_DEAD;
 }
 
+/* Health/gateway port resolution: a pinned config value wins; the auto
+ * sentinel (0) probes and starts on the default 18790 until a running
+ * gateway's actual port is latched into g_effective_health_port. */
+static int gateway_port_fallback(void) {
+    return g_cfg.health_check_port > 0 ? g_cfg.health_check_port : 18790;
+}
+
 static void refresh_effective_health_port(void) {
     page_set_int("port", g_effective_health_port);
+    /* Keep the settings sub-label in step: this runs on latch (RUNNING),
+     * reset (DEAD/stop/apply) and boot, exactly the moments the effective
+     * gateway port can change. */
+    update_gateway_port_sub();
 }
 
 /* Settings-page sub-label for the WebUI port row, mirroring the effective-port
@@ -325,6 +337,24 @@ static void update_webui_port_sub(void) {
                          : "Empty = auto-read from nanobot config, now %d",
                  g_effective_webui_port);
     page_set("webuiPortSub", text);
+}
+
+/* Settings-page sub-label for the Gateway (health) port row, mirroring the
+ * WebUI row: auto (0) follows the running gateway / 18790 fallback, a value
+ * pins the port. */
+static void update_gateway_port_sub(void) {
+    char text[160];
+    if (g_cfg.health_check_port > 0)
+        snprintf(text, sizeof(text),
+                 is_zh() ? "用于 /health；已固定为 %d；留空并应用可恢复自动"
+                         : "Used for /health; pinned to %d; clear to resume auto",
+                 g_cfg.health_check_port);
+    else
+        snprintf(text, sizeof(text),
+                 is_zh() ? "用于 /health；留空 = 自动探测运行中的 Gateway，当前生效: %d"
+                         : "Used for /health; empty = auto-detect, currently %d",
+                 g_effective_health_port);
+    page_set("gatewayPortSub", text);
 }
 
 /* The WebUI port and bootstrap secret nanobot actually serves live in its own
@@ -347,8 +377,9 @@ static void refresh_effective_webui(void) {
         g_effective_webui_port = 8765;
     /* The auto-read secret can appear/disappear at these same refresh points,
      * so the credential status line (which shows the effective source) and the
-     * port sub-label follow the same cadence. */
+     * port sub-labels follow the same cadence. */
     update_webui_port_sub();
+    update_gateway_port_sub();
     update_credential_ui();
 }
 
@@ -554,7 +585,7 @@ static void apply_health_result(int running, int actual_port) {
     s_health_fail_streak = 0;
     stop_uptime_timer();
     nm_state_set_pid(0);
-    g_effective_health_port = g_cfg.health_check_port;
+    g_effective_health_port = gateway_port_fallback();
     refresh_effective_health_port();
     chat_disconnect_async();
     chat_ui_on_gateway_stopped();
@@ -793,8 +824,8 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
 
     if (start_intent) {
         int pid_local = 0;
-        int effective_port = g_cfg.health_check_port;
-        int rc = nanobot_start(p->exe, p->is_python, g_cfg.health_check_port,
+        int effective_port = gateway_port_fallback();
+        int rc = nanobot_start(p->exe, p->is_python, effective_port,
                                &pid_local, &effective_port);
 
         if (rc == 0) {
@@ -1007,7 +1038,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         set_status_i18n("stopped", "status_stopped", "status_stopped_sub");
         stop_uptime_timer();
         nm_state_set_pid(0);
-        g_effective_health_port = g_cfg.health_check_port;
+        g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
         s_health_fail_streak = 0;
         chat_disconnect_async();
@@ -1057,7 +1088,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         s_health_fail_streak = 0;
         set_status_i18n("stopped", "status_stopped", "status_exited_sub");
         stop_uptime_timer();
-        g_effective_health_port = g_cfg.health_check_port;
+        g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
         chat_disconnect_async();
         chat_ui_on_gateway_stopped();
@@ -1276,26 +1307,19 @@ static void restore_webui_port_input(void) {
 
 static void restore_health_port_input(void) {
     wchar_t port[16];
-    swprintf_s(port, _countof(port), L"%d", g_cfg.health_check_port);
+    /* Empty input = auto-detect (the 0 sentinel in config.json). */
+    if (g_cfg.health_check_port > 0)
+        swprintf_s(port, _countof(port), L"%d", g_cfg.health_check_port);
+    else
+        port[0] = L'\0';
     ui_page_set_text(g_page, "healthPort", port);
 }
 
+/* Port settings inputs: an empty value is valid and yields 0, the auto-detect
+ * sentinel stored in config.json (health port follows the running gateway,
+ * WebUI port follows nanobot's config). */
 static int read_port_input(const char* name, int* out_port) {
     char* raw = ui_page_get_json(g_page, name);
-    if (!raw) return 0;
-    cJSON* value = cJSON_Parse(raw);
-    ui_page_free(raw);
-    if (!value) return 0;
-    int valid = cJSON_IsString(value) && value->valuestring &&
-        config_parse_port(value->valuestring, out_port);
-    cJSON_Delete(value);
-    return valid;
-}
-
-/* Like read_port_input but an empty value is valid and yields 0, the
- * auto-detect sentinel stored in config.json. */
-static int read_webui_port_input(int* out_port) {
-    char* raw = ui_page_get_json(g_page, "webuiPort");
     if (!raw) return 0;
     cJSON* value = cJSON_Parse(raw);
     ui_page_free(raw);
@@ -1445,7 +1469,7 @@ static void on_clear_credential(UiWidget w, void* ud) {
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
     int new_health_port = 0, new_webui_port = 0;
-    if (!read_port_input("healthPort", &new_health_port) || !read_webui_port_input(&new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
+    if (!read_port_input("healthPort", &new_health_port) || !read_port_input("webuiPort", &new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
     app_config proposed = g_cfg;
     proposed.health_check_port = new_health_port;
     proposed.webui_port = new_webui_port;
@@ -1465,7 +1489,7 @@ static void on_apply_network(UiWidget w, void* ud) {
     g_cfg.health_check_port = proposed.health_check_port;
     g_cfg.webui_port = proposed.webui_port;
     if (can_edit_gateway_port()) {
-        g_effective_health_port = g_cfg.health_check_port;
+        g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
     }
     restore_health_port_input(); restore_webui_port_input();
@@ -1663,9 +1687,10 @@ static void apply_lang(const char* loc) {
     config_save(&g_cfg);
     ui_page_set_locale(g_page, loc);
     page_set("lang", loc);
-    /* Model-driven strings (credential source, WebUI port sub) don't re-fire
+    /* Model-driven strings (credential source, port sub-labels) don't re-fire
      * through $t() bindings on a locale change -- re-derive them here. */
     update_webui_port_sub();
+    update_gateway_port_sub();
     update_credential_ui();
 }
 
@@ -1764,7 +1789,7 @@ static int run_autostart_mode(void) {
     nm_state_set_installed(1);
 
     int detected_port = 0;
-    if (nanobot_detect_running_port(g_cfg.health_check_port, &detected_port)) {
+    if (nanobot_detect_running_port(gateway_port_fallback(), &detected_port)) {
         nm_resolution_free(&res);
         char message[128];
         snprintf(message, sizeof(message), "nanobot already running on health port %d", detected_port);
@@ -1773,8 +1798,8 @@ static int run_autostart_mode(void) {
     }
 
     int pid = 0;
-    int effective_port = g_cfg.health_check_port;
-    int rc = nanobot_start(res.exe, res.is_python, g_cfg.health_check_port, &pid,
+    int effective_port = gateway_port_fallback();
+    int rc = nanobot_start(res.exe, res.is_python, effective_port, &pid,
                            &effective_port);
     nm_resolution_free(&res);
     if (rc != 0) {
@@ -1941,7 +1966,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "open_webui=打开 WebUI\n"
             "settings_network=网络\n"
             "setting_gateway_port=Gateway 端口\n"
-            "setting_gateway_port_sub=用于 /health；下次启动生效\n"
             "setting_webui_port=WebUI 端口\n"
             "setting_credential_status=认证密钥\n"
             "setting_credential_manage=管理\n"
@@ -1978,7 +2002,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "open_webui=Open WebUI\n"
             "settings_network=Network\n"
             "setting_gateway_port=Gateway Port\n"
-            "setting_gateway_port_sub=Used for /health; applies on next start\n"
             "setting_webui_port=WebUI Port\n"
             "setting_credential_status=Bootstrap Secret\n"
             "setting_credential_manage=Manage\n"
@@ -2029,10 +2052,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_set_bool(g_page, "hotkeyEnabled", g_cfg.hotkey_enabled);
 
     wchar_t port_w[16];
-    g_effective_health_port = g_cfg.health_check_port;
-    swprintf_s(port_w, _countof(port_w), L"%d", g_cfg.health_check_port);
+    g_effective_health_port = gateway_port_fallback();
+    swprintf_s(port_w, _countof(port_w), L"%d", g_effective_health_port);
     ui_page_set_text(g_page, "port", port_w);
-    ui_page_set_text(g_page, "healthPort", port_w);
+    restore_health_port_input();   /* empty settings input = auto sentinel */
 
     if (g_cfg.nanobot_path && g_cfg.nanobot_path[0]) {
         wchar_t wpath[MAX_PATH] = {0};

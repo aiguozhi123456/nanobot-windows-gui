@@ -61,7 +61,7 @@ ctest --test-dir nanobot-manager\build -C Release --output-on-failure
 - **`--autostart`**: if `stay_in_tray` is false → start nanobot (if needed) and exit; if tray enabled → silent tray + optional start. Logs: `nanobot-manager-autostart.log` / `nanobot-manager-process.log` beside exe.
 - **config.json** (exe directory) fields in code (README table is incomplete):
 
-  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port`, `webui_port` (0 = auto-detect from nanobot config, the default; other values pin the port), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`). Legacy `webui_auth` is migration-only and is never serialized.
+  `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port` (0 = auto: attach to the detected running Gateway, start new ones on 18790; legacy serialized 18790 normalizes to 0; other values pin), `webui_port` (0 = auto-detect from nanobot config, the default; legacy 8765 normalizes to 0; other values pin the port), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`). Legacy `webui_auth` is migration-only and is never serialized.
 
 - **i18n**: zh/en strings are **embedded** in `main.cpp` via `ui_page_load_language_string`, not external `.lang` files. UI copy changes often need both `.uix` (`$t('key')`) and those strings.
 - **UI wiring**: widget `id`s in `dashboard.uix` must match `ui_page_on_widget_mount(..., "id", ...)` in `main.cpp`. Native clicks/toggles are mounted from C++; reactive fields use `ui_page_set_*` / page `data()`.

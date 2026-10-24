@@ -87,7 +87,7 @@ nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
   "autostart_nanobot": false,
   "stay_in_tray": false,
   "hotkey_enabled": true,
-  "health_check_port": 18790,
+  "health_check_port": 0,
   "webui_port": 0,
   "theme_mode": 0,
   "language": "zh"
@@ -100,7 +100,7 @@ nanobot-manager.exe --scrub-adjacent-legacy-auth  仅供内部提权清理使用
 | `autostart_nanobot` | bool | false | 管理器启动时是否自动启动 nanobot |
 | `stay_in_tray` | bool | false | 最小化到系统托盘而非退出 |
 | `hotkey_enabled` | bool | true | 启用 Ctrl+Shift+N 全局显示/隐藏快捷键 |
-| `health_check_port` | int | 18790 | 下次由 Manager 启动 Gateway 时使用的 `/health` 配置端口；发现已运行 Gateway 时界面显示其实际端口 |
+| `health_check_port` | int | 0 | 0 = 自动：跟随已运行的 Gateway（状态文件 + 探测，回退 18790），新启动的 Gateway 使用 18790；其他值钉死端口，下次启动生效（旧版写入的 18790 会归一化为自动） |
 | `webui_port` | int | 0 | 聊天/WebSocket 端口：0 = 自动读取 nanobot 配置（`channels.websocket.port`，回退 8765）；其他值显式钉死端口（旧版写入的 8765 会归一化为自动） |
 | 引导认证密钥 | Credential Manager，其次 nanobot 配置 | 自动 | 凭据管理器中的显式条目优先；未设置时自动读取 nanobot 配置的 `channels.websocket.tokenIssueSecret`（回退 `token`）。绝不写入 `config.json`（旧版 `webui_auth` 启动时迁移） |
 | `theme_mode` | int | 0 | 0 = 跟随系统，1 = 深色，2 = 浅色 |

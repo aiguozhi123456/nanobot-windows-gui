@@ -20,7 +20,8 @@ export default {
       nanobotPath: "",
       webuiPort: "",
       webuiPortSub: "",
-      healthPort: "18790",
+      gatewayPortSub: "",
+      healthPort: "",
       credentialStatus: "",
       hasCredential: false,
       theme: "system",
@@ -829,9 +830,9 @@ export default {
           <div class="setting-row setting-col">
             <div class="setting-label-wrap">
               <label class="setting-label">{{ $t('setting_gateway_port') }}</label>
-              <label class="setting-sub">{{ $t('setting_gateway_port_sub') }}</label>
+              <label class="setting-sub">{{ gatewayPortSub }}</label>
             </div>
-            <input id="health_port_input" v-model="healthPort" class="port-input" placeholder="18790"/>
+            <input id="health_port_input" v-model="healthPort" class="port-input"/>
           </div>
 
           <div class="setting-row setting-col">
