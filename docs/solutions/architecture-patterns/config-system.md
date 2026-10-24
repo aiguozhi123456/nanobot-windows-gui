@@ -1,7 +1,7 @@
 ---
 title: "Config module: a testable pure-logic core behind filesystem I/O"
 date: 2026-07-11
-last_updated: 2026-08-01
+last_updated: 2026-10-24
 category: architecture-patterns
 module: nanobot-manager/config
 problem_type: module_architecture
@@ -29,6 +29,7 @@ typedef struct {
     int   health_check_port;         /* default 18790 */
     int   theme_mode;                /* 0=system 1=dark 2=light */
     char  language[8];               /* "zh" / "en", default "zh" */
+    char  log_level[8];              /* "debug"/"info"/"warn"/"error", default "info" */
     int   webui_port;                /* default 8765 */
     char  legacy_webui_auth[128];    /* transient old JSON secret; NEVER serialized */
     int   legacy_migration_pending;  /* while set, config_save refuses (ERROR_BUSY) */
@@ -74,6 +75,7 @@ Validation lives inline in `config_parse_json` and silently ignores out-of-range
 | `webui_port` | `> 0 && <= 65535` | ignored, default kept |
 | `theme_mode` | `>= 0 && <= 2` | ignored, default kept |
 | `language` | `char[8]`, truncated + NUL-terminated | safe truncation |
+| `log_level` | one of `"debug"`/`"info"`/`"warn"`/`"error"` | ignored, prior value kept |
 | `nanobot_path` | non-empty string → `_strdup`; null/empty → NULL | no leak |
 | `hotkey_enabled` | bool | ignored if not boolean |
 
@@ -182,3 +184,4 @@ free(json);
 - `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — why `legacy_webui_auth` is migration-only, the migrate-verify-delete flow, and the atomic `config_save` (temp + `FlushFileBuffers` + `MoveFileExW`) implementation.
 - `docs/solutions/infrastructure/testing-and-ci-setup.md` — the CMake test wiring, the self-contained `nm_test.h` framework, CTest, and CI; also the autostart registry round-trip pattern.
 - `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — how `webui_port` / `health_check_port` (defined here) are surfaced in the settings UI via the read-on-click Apply pattern.
+- `docs/solutions/architecture-patterns/logging-pipeline.md` — how the `log_level` field (defined here) drives the unified logger's runtime filtering.

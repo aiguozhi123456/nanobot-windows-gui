@@ -155,6 +155,7 @@ void config_apply_defaults(app_config* cfg) {
     cfg->hotkey_enabled = 1;
     cfg->webui_port = 0;    /* 0 = auto-detect from nanobot's config */
     strcpy(cfg->language, "zh");
+    strcpy(cfg->log_level, "info");
 }
 
 int config_parse_port(const char* text, int* out_port) {
@@ -198,6 +199,12 @@ int config_parse_json(app_config* cfg, const char* json) {
     if (item && cJSON_IsString(item) && item->valuestring[0] &&
         (strcmp(item->valuestring, "zh") == 0 || strcmp(item->valuestring, "en") == 0)) {
         strcpy(cfg->language, item->valuestring);
+    }
+    item = cJSON_GetObjectItem(root, "log_level");
+    if (item && cJSON_IsString(item) && item->valuestring[0] &&
+        (strcmp(item->valuestring, "debug") == 0 || strcmp(item->valuestring, "info") == 0 ||
+         strcmp(item->valuestring, "warn") == 0 || strcmp(item->valuestring, "error") == 0)) {
+        strcpy(cfg->log_level, item->valuestring);
     }
     item = cJSON_GetObjectItem(root, "webui_port");
     if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint &&
@@ -256,6 +263,7 @@ char* config_serialize_json(const app_config* cfg) {
     cJSON_AddNumberToObject(root, "health_check_port", cfg->health_check_port);
     cJSON_AddNumberToObject(root, "theme_mode", cfg->theme_mode);
     cJSON_AddStringToObject(root, "language", cfg->language);
+    cJSON_AddStringToObject(root, "log_level", cfg->log_level);
     cJSON_AddNumberToObject(root, "webui_port", cfg->webui_port);
     char* json = cJSON_Print(root);
     cJSON_Delete(root);

@@ -17,6 +17,7 @@ typedef struct {
                                    normalizes to 0; other values pin the port */
     int theme_mode;
     char language[8];
+    char log_level[8];       /* debug|info|warn|error, default info (see logger.h) */
     int webui_port;           /* 0 = auto-detect from nanobot config (default);
                                    legacy serialized 8765 normalizes to 0;
                                    other values pin the port explicitly */

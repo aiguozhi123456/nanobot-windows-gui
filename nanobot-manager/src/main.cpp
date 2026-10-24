@@ -5,6 +5,7 @@
 #include "chat_ui.h"
 #include "credential.h"
 #include "i18n.h"
+#include "logger.h"
 #include "version.h"
 
 #include "ui_core.h"
@@ -1672,6 +1673,42 @@ static void on_lang_en_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_lang_en, NULL);
 }
 
+static void apply_log_level(const char* level) {
+    nm_log_level parsed = logger_level_from_string(level);
+    strncpy(g_cfg.log_level, logger_level_to_string(parsed),
+            sizeof(g_cfg.log_level) - 1);
+    g_cfg.log_level[sizeof(g_cfg.log_level) - 1] = '\0';
+    logger_set_level(parsed);
+    config_save(&g_cfg);
+    page_set("logLevel", g_cfg.log_level);
+    nm_log(NM_LOG_INFO, "app", "log level set to %s", g_cfg.log_level);
+}
+
+static void on_log_debug(UiWidget w, void* ud) { (void)w; (void)ud; apply_log_level("debug"); }
+static void on_log_info(UiWidget w, void* ud)  { (void)w; (void)ud; apply_log_level("info"); }
+static void on_log_warn(UiWidget w, void* ud)  { (void)w; (void)ud; apply_log_level("warn"); }
+static void on_log_error(UiWidget w, void* ud) { (void)w; (void)ud; apply_log_level("error"); }
+
+static void on_log_debug_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_log_debug, NULL);
+}
+
+static void on_log_info_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_log_info, NULL);
+}
+
+static void on_log_warn_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_log_warn, NULL);
+}
+
+static void on_log_error_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_click(w, on_log_error, NULL);
+}
+
 static int has_arg(LPCWSTR cmd, const wchar_t* arg) {
     int argc = 0;
     LPWSTR* argv = CommandLineToArgvW(cmd, &argc);
@@ -1682,46 +1719,6 @@ static int has_arg(LPCWSTR cmd, const wchar_t* arg) {
     }
     LocalFree(argv);
     return found;
-}
-
-static void autostart_log(const char* msg) {
-    wchar_t exe_dir[MAX_PATH];
-    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
-    wchar_t* slash = wcsrchr(exe_dir, L'\\');
-    if (slash) *slash = L'\0';
-
-    wchar_t log_path[MAX_PATH];
-    swprintf_s(log_path, _countof(log_path),
-        L"%s\\nanobot-manager-autostart.log", exe_dir);
-
-    {
-        WIN32_FILE_ATTRIBUTE_DATA fad;
-        if (GetFileAttributesExW(log_path, GetFileExInfoStandard, &fad)) {
-            ULARGE_INTEGER sz;
-            sz.LowPart = fad.nFileSizeLow;
-            sz.HighPart = fad.nFileSizeHigh;
-            if (sz.QuadPart > 512 * 1024) {
-                wchar_t bak[MAX_PATH];
-                swprintf_s(bak, _countof(bak),
-                    L"%s\\nanobot-manager-autostart.bak", exe_dir);
-                MoveFileExW(log_path, bak, MOVEFILE_REPLACE_EXISTING);
-            }
-        }
-    }
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    char line[512];
-    snprintf(line, sizeof(line), "[%04d-%02d-%02d %02d:%02d:%02d] %s\n",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond, msg);
-
-    FILE* f = _wfopen(log_path, L"a");
-    if (f) {
-        fputs(line, f);
-        fclose(f);
-    }
 }
 
 static int run_autostart_mode(void) {
@@ -1736,11 +1733,11 @@ static int run_autostart_mode(void) {
     if (!res.found) {
         nm_state_set_installed(res.status != NM_RES_NOT_FOUND);
         if (res.status == NM_RES_INCOMPATIBLE)
-            autostart_log("nanobot incompatible: requires nanobot-ai >= 0.2.2 (missing gateway --background)");
+            nm_log(NM_LOG_WARN, "autostart", "nanobot incompatible: requires nanobot-ai >= 0.2.2 (missing gateway --background)");
         else if (res.status == NM_RES_PROBE_FAILED)
-            autostart_log("nanobot capability probe failed, skipping");
+            nm_log(NM_LOG_WARN, "autostart", "nanobot capability probe failed, skipping");
         else
-            autostart_log("nanobot not installed, skipping");
+            nm_log(NM_LOG_INFO, "autostart", "nanobot not installed, skipping");
         nm_resolution_free(&res);
         return 0;
     }
@@ -1749,9 +1746,7 @@ static int run_autostart_mode(void) {
     int detected_port = 0;
     if (nanobot_detect_running_port(gateway_port_fallback(), &detected_port)) {
         nm_resolution_free(&res);
-        char message[128];
-        snprintf(message, sizeof(message), "nanobot already running on health port %d", detected_port);
-        autostart_log(message);
+        nm_log(NM_LOG_INFO, "autostart", "nanobot already running on health port %d", detected_port);
         return 0;
     }
 
@@ -1761,9 +1756,7 @@ static int run_autostart_mode(void) {
                            &effective_port);
     nm_resolution_free(&res);
     if (rc != 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "nanobot start failed (error %d)", rc);
-        autostart_log(buf);
+        nm_log(NM_LOG_WARN, "autostart", "nanobot start failed (error %d)", rc);
         return 0;
     }
 
@@ -1774,7 +1767,7 @@ static int run_autostart_mode(void) {
     for (int i = 0; i < boot_count; i++) {
         Sleep(cadence[i]);
         if (nanobot_detect_running_port(effective_port, &detected_port)) {
-            autostart_log("nanobot started and health check passed");
+            nm_log(NM_LOG_INFO, "autostart", "nanobot started and health check passed");
             /* M6: release the OpenProcess handle the manager won't track further
              * in this no-tray path (no watch was armed). OS would reclaim it on
              * exit, but this is disciplined and keeps the log clean. */
@@ -1782,7 +1775,7 @@ static int run_autostart_mode(void) {
             return 0;
         }
     }
-    autostart_log("nanobot health check timed out");
+    nm_log(NM_LOG_WARN, "autostart", "nanobot health check timed out");
     /* M6: same -- release the handle before the process exits. */
     nm_state_clear();
     return 0;
@@ -1831,6 +1824,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     /* Initialize guarded process state before any worker thread or read/write. */
     nm_state_init();
 
+    /* Logging pipeline first so every path below (early-outs, autostart,
+     * config failures) is captured. INFO until config_load overrides it;
+     * on failure the logger is a no-op and never blocks startup. */
+    logger_init(NULL, NM_LOG_INFO);
+
     if (has_arg(GetCommandLineW(), L"--delete-credential")) {
         return credential_delete(NULL) == 0 ? 0 : 1;
     }
@@ -1850,13 +1848,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             L"无法读取配置，程序未启动。\nCould not load configuration; startup was cancelled.\n\n错误 / Error: %lu\n路径 / Path: %s",
             (unsigned long)config_get_last_error(), config_get_active_path());
         if (has_arg(GetCommandLineW(), L"--autostart"))
-            autostart_log("configuration load failed; autostart cancelled");
+            nm_log(NM_LOG_ERROR, "autostart", "configuration load failed (error %lu); autostart cancelled",
+                (unsigned long)config_get_last_error());
         else
             MessageBoxW(NULL, message, L"nanobot-manager - Configuration error", MB_OK | MB_ICONERROR);
         config_free(&g_cfg);
         return 1;
     }
     migration_result migration = migrate_legacy_credential();
+    logger_set_level(logger_level_from_string(g_cfg.log_level));
     if (migration == MIGRATION_CONFLICT) {
         MessageBoxW(NULL,
             L"旧配置密钥与 Credential Manager 中现有密钥不同；两个来源均未修改，程序未启动。\n"
@@ -1978,6 +1978,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         page_set("lang", loc);
     }
 
+    page_set("logLevel", logger_level_to_string(
+        logger_level_from_string(g_cfg.log_level)));
+
     {
         wchar_t ver_w[32];
         swprintf_s(ver_w, _countof(ver_w), L"v" NANOBOT_MANAGER_VERSION);
@@ -2011,6 +2014,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "theme_system", on_theme_system_mount, NULL);
     ui_page_on_widget_mount(g_page, "lang_zh", on_lang_zh_mount, NULL);
     ui_page_on_widget_mount(g_page, "lang_en", on_lang_en_mount, NULL);
+    ui_page_on_widget_mount(g_page, "log_debug", on_log_debug_mount, NULL);
+    ui_page_on_widget_mount(g_page, "log_info", on_log_info_mount, NULL);
+    ui_page_on_widget_mount(g_page, "log_warn", on_log_warn_mount, NULL);
+    ui_page_on_widget_mount(g_page, "log_error", on_log_error_mount, NULL);
 
     if (g_autostart_silent)
         g_win = ui_page_prepare_window(g_page, NULL);
@@ -2080,5 +2087,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);
+    logger_shutdown();
     return ret;
 }

@@ -31,7 +31,10 @@ nm_add_test(test_credential ${CMAKE_SOURCE_DIR}/src/credential.c)
 target_include_directories(test_credential PRIVATE ${CMAKE_SOURCE_DIR}/src)
 target_link_libraries(test_credential PRIVATE advapi32)
 
-nm_add_test(test_process ${CMAKE_SOURCE_DIR}/src/process.c)
+nm_add_test(test_process
+    ${CMAKE_SOURCE_DIR}/src/process.c
+    ${CMAKE_SOURCE_DIR}/src/logger.c
+)
 target_include_directories(test_process PRIVATE
     ${CMAKE_SOURCE_DIR}/src
     ${cjson_SOURCE_DIR}
@@ -60,6 +63,10 @@ target_include_directories(test_chat_protocol PRIVATE
     ${cjson_SOURCE_DIR}
 )
 target_link_libraries(test_chat_protocol PRIVATE cjson)
+
+# logger: file pipeline (level filter, format, rotation) against a temp dir.
+nm_add_test(test_logger ${CMAKE_SOURCE_DIR}/src/logger.c)
+target_include_directories(test_logger PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # i18n: pure string-table assembly + zh/en key parity (no platform deps).
 nm_add_test(test_i18n ${CMAKE_SOURCE_DIR}/src/i18n.c)

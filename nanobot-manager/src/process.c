@@ -9,39 +9,7 @@
 #include <string.h>
 
 #include "cJSON.h"
-
-static void process_log(const char* fmt, ...) {
-    wchar_t exe_dir[MAX_PATH];
-    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
-    wchar_t* slash = wcsrchr(exe_dir, L'\\');
-    if (slash) *slash = L'\0';
-
-    wchar_t log_path[MAX_PATH];
-    swprintf_s(log_path, _countof(log_path),
-        L"%s\\nanobot-manager-process.log", exe_dir);
-
-    SYSTEMTIME st;
-    GetLocalTime(&st);
-
-    char prefix[64];
-    snprintf(prefix, sizeof(prefix), "[%04d-%02d-%02d %02d:%02d:%02d] ",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
-
-    char body[512];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(body, sizeof(body), fmt, ap);
-    va_end(ap);
-
-    FILE* f = _wfopen(log_path, L"a");
-    if (f) {
-        fputs(prefix, f);
-        fputs(body, f);
-        fputc('\n', f);
-        fclose(f);
-    }
-}
+#include "logger.h"
 
 /* --- Python interpreter name set -------------------------------------------
  * Single source of truth for "what counts as a python interpreter". The narrow
@@ -767,13 +735,13 @@ static VOID CALLBACK wait_callback(PVOID param, BOOLEAN timeout) {
 int nanobot_watch_handle(HWND hwnd, UINT msg) {
     HANDLE h = nm_state_get_handle();
     if (h == NULL) {
-        process_log("watch_handle: no handle, HTTP-only liveness");
+        nm_log(NM_LOG_DEBUG, "process", "watch_handle: no handle, HTTP-only liveness");
         return 0;                          /* HTTP-only fallback (e.g. P5b-attach path)     */
     }
 
     struct wait_ctx* ctx = (struct wait_ctx*)malloc(sizeof(*ctx));
     if (!ctx) {
-        process_log("watch_handle: malloc failed");
+        nm_log(NM_LOG_ERROR, "process", "watch_handle: malloc failed");
         return 1;
     }
     ctx->hwnd = hwnd;
@@ -785,12 +753,12 @@ int nanobot_watch_handle(HWND hwnd, UINT msg) {
     if (!ok) {
         DWORD err = GetLastError();
         free(ctx);
-        process_log("watch_handle: RegisterWaitForSingleObject failed err=%d", (int)err);
+        nm_log(NM_LOG_ERROR, "process", "watch_handle: RegisterWaitForSingleObject failed err=%d", (int)err);
         return (int)err ? (int)err : 1;
     }
 
     nm_state_set_wait_handle(wait);
-    process_log("watch_handle: armed one-shot wait");
+    nm_log(NM_LOG_DEBUG, "process", "watch_handle: armed one-shot wait");
     return 0;
 }
 
@@ -806,7 +774,7 @@ void nanobot_unwatch_handle(void) {
      * the callback could fire into a closed handle). */
     UnregisterWaitEx(w, INVALID_HANDLE_VALUE);
     nm_state_set_wait_handle(NULL);
-    process_log("watch_handle: unregistered");
+    nm_log(NM_LOG_DEBUG, "process", "watch_handle: unregistered");
 }
 
 /* C1b: centralized close helper. Atomically steal the gateway handle under the
@@ -863,7 +831,7 @@ int nanobot_attach_running(void) {
     HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
                            FALSE, gs.pid);
     if (!h) {
-        process_log("attach: OpenProcess failed pid=%u err=%lu",
+        nm_log(NM_LOG_WARN, "process", "attach: OpenProcess failed pid=%u err=%lu",
             (unsigned)gs.pid, (unsigned long)GetLastError());
         return -2;
     }
@@ -872,7 +840,7 @@ int nanobot_attach_running(void) {
      *    from a prior run -- don't latch onto a dead handle. */
     if (WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
         CloseHandle(h);
-        process_log("attach: gateway pid %u already dead", (unsigned)gs.pid);
+        nm_log(NM_LOG_INFO, "process", "attach: gateway pid %u already dead", (unsigned)gs.pid);
         return -3;
     }
 
@@ -891,7 +859,7 @@ int nanobot_attach_running(void) {
     nm_state_set_handle(h);
     nm_state_set_start_tick(GetTickCount64());
 
-    process_log("attach: latched onto running gateway pid=%u", (unsigned)gs.pid);
+    nm_log(NM_LOG_INFO, "process", "attach: latched onto running gateway pid=%u", (unsigned)gs.pid);
     return 0;
 }
 
@@ -1384,6 +1352,45 @@ int nanobot_detect_running_port(int configured_port, int* out_port) {
  * WaitForSingleObject + CloseHandle. If you store the launcher handle, the
  * health/death detector will report a "crash" ~1s after every successful start.
  */
+/* Open nanobot-gateway.log beside the exe for child stdout/stderr redirection,
+ * rotating to .bak at 512 KiB (same policy as the manager log). Opened with
+ * FILE_SHARE_DELETE so a later rotation isn't blocked by a still-running
+ * gateway holding an inherited write handle. Returns NULL on any failure;
+ * callers degrade to a spawn without redirection. */
+static HANDLE open_gateway_log_handle(void) {
+    wchar_t exe[MAX_PATH];
+    wchar_t path[MAX_PATH];
+    wchar_t bak[MAX_PATH];
+    if (!GetModuleFileNameW(NULL, exe, _countof(exe))) return NULL;
+    wchar_t* slash = wcsrchr(exe, L'\\');
+    if (!slash) return NULL;
+    *slash = L'\0';
+    if (swprintf_s(path, _countof(path), L"%s\\nanobot-gateway.log", exe) <= 0)
+        return NULL;
+
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &fad)) {
+        ULARGE_INTEGER sz;
+        sz.LowPart = fad.nFileSizeLow;
+        sz.HighPart = fad.nFileSizeHigh;
+        if (sz.QuadPart > 512LL * 1024LL &&
+            swprintf_s(bak, _countof(bak), L"%s\\nanobot-gateway.bak", exe) > 0) {
+            MoveFileExW(path, bak, MOVEFILE_REPLACE_EXISTING);
+        }
+    }
+
+    SECURITY_ATTRIBUTES sa;
+    sa.nLength = sizeof(sa);
+    sa.bInheritHandle = TRUE;             /* the child inherits the write end */
+    sa.lpSecurityDescriptor = NULL;
+    HANDLE h = CreateFileW(path, GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return NULL;
+    SetFilePointer(h, 0, NULL, FILE_END); /* append across manager restarts */
+    return h;
+}
+
 int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                    int* out_effective_health_port) {
     if (out_pid) *out_pid = 0;
@@ -1399,13 +1406,6 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     int prior_state_found = nanobot_read_gateway_state(&prior_state) == 0 &&
                             prior_state.found && prior_state.pid > 0;
 
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-
     /* Workdir-derivation (unchanged from pre-P3a): strip the last path
      * component from the exe path so nanobot runs from its install dir. */
     wchar_t* wide_exe = utf8_to_wide_alloc(exe);
@@ -1416,25 +1416,81 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     if (!slash) slash = wcsrchr(workdir, L'/');
     if (slash) *slash = '\0'; else workdir[0] = '\0';
 
-    /* P3a: append --background. The launcher forks the foreground gateway,
-     * writes the state file, and exits fast. */
+    /* Gateway output capture: redirect the launcher's stdout/stderr to
+     * nanobot-gateway.log. File redirection -- NOT a pipe -- because the
+     * gateway outlives the manager; a pipe would lose its reader once the
+     * manager exits and a full pipe could block the child. The attribute
+     * list restricts inheritance to exactly this one handle (same pattern as
+     * the capability probe above). A NULL handle degrades to the legacy
+     * void-redirected spawn; logging must never fail the start. The launcher
+     * prints its own diagnostics here, and the forked gateway inherits the
+     * handles only insofar as nanobot propagates them. */
+    HANDLE gateway_log = open_gateway_log_handle();
+
+    STARTUPINFOEXW siex;
+    PROCESS_INFORMATION pi;
+    ZeroMemory(&siex, sizeof(siex));
+    ZeroMemory(&pi, sizeof(pi));
+    siex.StartupInfo.cb = sizeof(siex);
+    siex.StartupInfo.dwFlags = STARTF_USESHOWWINDOW;
+    siex.StartupInfo.wShowWindow = SW_HIDE;
+
+    LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    if (gateway_log) {
+        siex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+        siex.StartupInfo.hStdOutput = gateway_log;
+        siex.StartupInfo.hStdError  = gateway_log;
+        siex.StartupInfo.hStdInput  = NULL;
+        SIZE_T attribute_size = 0;
+        InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_size);
+        attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attribute_size);
+        if (attributes &&
+            InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size)) {
+            HANDLE inheritable_handles[1];
+            inheritable_handles[0] = gateway_log;
+            if (!UpdateProcThreadAttribute(attributes, 0,
+                    PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                    inheritable_handles, sizeof(inheritable_handles), NULL, NULL)) {
+                DeleteProcThreadAttributeList(attributes);
+                free(attributes);
+                attributes = NULL;
+            } else {
+                siex.lpAttributeList = attributes;
+            }
+        }
+    }
+
     wchar_t arguments[96];
     swprintf_s(arguments, _countof(arguments),
         is_python ? L"-m nanobot gateway --background --port %d"
                   : L"gateway --background --port %d", health_port);
     wchar_t* cmdline = build_command_line(wide_exe, arguments);
-    if (!cmdline) { free(workdir); free(wide_exe); return ERROR_NOT_ENOUGH_MEMORY; }
+    if (!cmdline) {
+        if (attributes) { DeleteProcThreadAttributeList(attributes); free(attributes); }
+        if (gateway_log) CloseHandle(gateway_log);
+        free(workdir); free(wide_exe);
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
 
     FILETIME launcher_started_ft;
     GetSystemTimeAsFileTime(&launcher_started_ft);
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
-            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-            NULL, workdir[0] ? workdir : NULL, &si, &pi))
+    DWORD spawn_flags = CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP;
+    if (siex.lpAttributeList)
+        spawn_flags |= EXTENDED_STARTUPINFO_PRESENT;
+    if (!CreateProcessW(NULL, cmdline, NULL, NULL, siex.lpAttributeList ? TRUE : FALSE,
+            spawn_flags, NULL, workdir[0] ? workdir : NULL, &siex.StartupInfo, &pi))
     {
         int error = (int)GetLastError();
+        if (attributes) { DeleteProcThreadAttributeList(attributes); free(attributes); }
+        if (gateway_log) CloseHandle(gateway_log);
         free(cmdline); free(workdir); free(wide_exe);
         return error;
     }
+    if (siex.lpAttributeList)
+        nm_log(NM_LOG_INFO, "process",
+               "nanobot_start: gateway stdout/stderr -> nanobot-gateway.log");
+    if (attributes) { DeleteProcThreadAttributeList(attributes); free(attributes); }
+    if (gateway_log) CloseHandle(gateway_log);
     free(cmdline); free(workdir); free(wide_exe);
 
     /* --- The launcher is short-lived: wait for it to finish writing the state
@@ -1451,9 +1507,9 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     pi.hProcess = NULL;
 
     if (wait == WAIT_TIMEOUT)
-        process_log("nanobot_start: launcher still active after 5s (continuing)");
+        nm_log(NM_LOG_WARN, "process", "nanobot_start: launcher still active after 5s (continuing)");
     else if (dwExit != 0)
-        process_log("nanobot_start: launcher exited code=%d (continuing)", (int)dwExit);
+        nm_log(NM_LOG_WARN, "process", "nanobot_start: launcher exited code=%d (continuing)", (int)dwExit);
 
     /* --- Retry-read the state file for the REAL gateway pid. The launcher may
      * not have written it yet, so poll ~10 x 200ms = ~2s. */
@@ -1469,14 +1525,14 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     }
     if (!got_pid) {
         if (wait == WAIT_OBJECT_0 && dwExit != 0) {
-            process_log("nanobot_start: launcher exit=%lu; no valid gateway pid", dwExit);
+            nm_log(NM_LOG_ERROR, "process", "nanobot_start: launcher exit=%lu; no valid gateway pid", dwExit);
             return NANOBOT_START_LAUNCHER_FAILED;
         }
-        process_log("nanobot_start: state file missing or no pid after ~2s");
+        nm_log(NM_LOG_ERROR, "process", "nanobot_start: state file missing or no pid after ~2s");
         return NANOBOT_START_NO_STATEFILE;
     }
 
-    process_log("nanobot_start: expected port=%d; state file reports pid=%d port=%d identity=%s%s",
+    nm_log(NM_LOG_INFO, "process", "nanobot_start: expected port=%d; state file reports pid=%d port=%d identity=%s%s",
         health_port, (int)gs.pid, gs.port, gs.identity[0] ? gs.identity : "(none)",
         gs.port > 0 && gs.port != health_port ? " (port mismatch)" : "");
 
@@ -1492,7 +1548,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
             process_access |= PROCESS_TERMINATE;
         h = OpenProcess(process_access, FALSE, gs.pid);
         if (!h) {
-            process_log("nanobot_start: OpenProcess(pid=%d) failed err=%d",
+            nm_log(NM_LOG_ERROR, "process", "nanobot_start: OpenProcess(pid=%d) failed err=%d",
                 (int)gs.pid, (int)GetLastError());
             return NANOBOT_START_OPEN_FAILED;
         }
@@ -1500,13 +1556,13 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
             /* pid already dead => stale state file */
             CloseHandle(h);
             h = NULL;
-            process_log("nanobot_start: stale gateway pid=%d", (int)gs.pid);
+            nm_log(NM_LOG_WARN, "process", "nanobot_start: stale gateway pid=%d", (int)gs.pid);
             /* If the file now references a DIFFERENT pid, retry on that one. */
             nm_gateway_state gs2;
             if (nanobot_read_gateway_state(&gs2) == 0 && gs2.found && gs2.pid != 0
                 && gs2.pid != gs.pid) {
                 gs = gs2;
-                process_log("nanobot_start: state file refreshed to pid=%d",
+                nm_log(NM_LOG_DEBUG, "process", "nanobot_start: state file refreshed to pid=%d",
                     (int)gs.pid);
             }
             continue;
@@ -1519,7 +1575,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
         {
             FILETIME create_check;
             if (!get_process_creation_time(h, &create_check)) {
-                process_log("nanobot_start: PID-reuse cross-check skipped "
+                nm_log(NM_LOG_DEBUG, "process", "nanobot_start: PID-reuse cross-check skipped "
                     "(GetProcessTimes failed) pid=%d", (int)gs.pid);
                 break;                  /* live handle; check inert */
             }
@@ -1535,13 +1591,13 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                     unsigned long long idv = filetime_to_ull(id_ft);
                     /* 2s tol: identity should be exact, but allow tiny skew. */
                     if (!filetimes_within_tol(idv, ct, 2ULL * 10000000ULL)) {
-                        process_log("nanobot_start: identity mismatch, suspecting "
+                        nm_log(NM_LOG_WARN, "process", "nanobot_start: identity mismatch, suspecting "
                             "pid reuse (identity_ull=%llu create_ull=%llu pid=%d)",
                             idv, ct, (int)gs.pid);
                         mismatch = 1;
                     }
                 } else {
-                    process_log("nanobot_start: identity unparseable (%s), "
+                    nm_log(NM_LOG_DEBUG, "process", "nanobot_start: identity unparseable (%s), "
                         "falling through to started_at pid=%d",
                         gs.identity, (int)gs.pid);
                 }
@@ -1561,13 +1617,13 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                         ok = filetimes_within_tol(loc, ct, NM_PID_REUSE_TOL_FT);
                     }
                     if (!ok) {
-                        process_log("nanobot_start: started_at mismatch, suspecting "
+                        nm_log(NM_LOG_WARN, "process", "nanobot_start: started_at mismatch, suspecting "
                             "pid reuse (started_at=%s create_ull=%llu pid=%d)",
                             gs.started_at, ct, (int)gs.pid);
                         mismatch = 1;
                     }
                 } else {
-                    process_log("nanobot_start: started_at cross-check skipped "
+                    nm_log(NM_LOG_DEBUG, "process", "nanobot_start: started_at cross-check skipped "
                         "(unparseable) pid=%d", (int)gs.pid);
                 }
             }
@@ -1584,7 +1640,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                 if (nanobot_read_gateway_state(&gs2) == 0 && gs2.found
                     && gs2.pid != 0 && gs2.pid != gs.pid) {
                     gs = gs2;
-                    process_log("nanobot_start: state file refreshed to pid=%d",
+                    nm_log(NM_LOG_DEBUG, "process", "nanobot_start: state file refreshed to pid=%d",
                         (int)gs.pid);
                 }
                 continue;
@@ -1593,7 +1649,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
         break;                          /* live handle */
     }
     if (!h) {
-        process_log("nanobot_start: gateway pid stale after retries");
+        nm_log(NM_LOG_ERROR, "process", "nanobot_start: gateway pid stale after retries");
         return NANOBOT_START_STALE_PID;
     }
 
@@ -1620,7 +1676,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                 }
                 CloseHandle(h);
                 h = refreshed_handle;
-                process_log("nanobot_start: state record refreshed to pid=%d while verifying port mismatch",
+                nm_log(NM_LOG_INFO, "process", "nanobot_start: state record refreshed to pid=%d while verifying port mismatch",
                             (int)refreshed.pid);
             }
             gs = refreshed;
@@ -1635,19 +1691,19 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
             int ownership_proven = nanobot_unverified_candidate_is_owned(
                 wait, dwExit, gs.pid, prior_state_found, prior_state.pid,
                 candidate_creation_known, candidate_creation_ft, launcher_started_ft);
-            process_log("nanobot_start: refusing unverified state candidate pid=%d port=%d",
+            nm_log(NM_LOG_WARN, "process", "nanobot_start: refusing unverified state candidate pid=%d port=%d",
                         (int)gs.pid, gs.port);
             if (ownership_proven) {
                 if (TerminateProcess(h, ERROR_INVALID_DATA)) {
                     DWORD terminate_wait = WaitForSingleObject(h, 5000);
-                    process_log("nanobot_start: cleanup performed for unverified candidate pid=%d wait=%lu",
+                    nm_log(NM_LOG_INFO, "process", "nanobot_start: cleanup performed for unverified candidate pid=%d wait=%lu",
                                 (int)gs.pid, (unsigned long)terminate_wait);
                 } else {
-                    process_log("nanobot_start: cleanup failed for owned unverified candidate pid=%d err=%d",
+                    nm_log(NM_LOG_ERROR, "process", "nanobot_start: cleanup failed for owned unverified candidate pid=%d err=%d",
                                 (int)gs.pid, (int)GetLastError());
                 }
             } else {
-                process_log("nanobot_start: cleanup skipped because ownership is unproven");
+                nm_log(NM_LOG_INFO, "process", "nanobot_start: cleanup skipped because ownership is unproven");
             }
             CloseHandle(h);
             return NANOBOT_START_UNVERIFIED_STATE;
@@ -1656,10 +1712,10 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
 
     int effective_port = (gs.port >= 1 && gs.port <= 65535) ? gs.port : health_port;
     if (effective_port != health_port)
-        process_log("nanobot_start: adopted actual health port=%d (requested=%d)",
+        nm_log(NM_LOG_INFO, "process", "nanobot_start: adopted actual health port=%d (requested=%d)",
                     effective_port, health_port);
     else if (gs.port < 1 || gs.port > 65535)
-        process_log("nanobot_start: state port invalid; using requested health port=%d",
+        nm_log(NM_LOG_WARN, "process", "nanobot_start: state port invalid; using requested health port=%d",
                     health_port);
 
     /* --- Live: capture creation time (PID-reuse guard for P4), then publish.
@@ -1677,7 +1733,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     ZeroMemory(&create_ft, sizeof(create_ft));
     int got_create_ft = GetProcessTimes(h, &create_ft, &exit_ft, &kern_ft, &user_ft);
     if (!got_create_ft) {
-        process_log("nanobot_start: GetProcessTimes failed err=%d",
+        nm_log(NM_LOG_WARN, "process", "nanobot_start: GetProcessTimes failed err=%d",
             (int)GetLastError());
         /* create_ft stays zeroed => reuse guard inert (by design). */
     }
@@ -1693,7 +1749,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
 
     if (out_pid) *out_pid = (int)gs.pid;
     if (out_effective_health_port) *out_effective_health_port = effective_port;
-    process_log("nanobot started (gateway pid=%d health_port=%d)", (int)gs.pid,
+    nm_log(NM_LOG_INFO, "process", "nanobot started (gateway pid=%d health_port=%d)", (int)gs.pid,
                 effective_port);
     return 0;
 }
@@ -1725,7 +1781,7 @@ static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
             BOOL ok = get_process_creation_time(q, &ft);
             CloseHandle(q);
             if (ok && filetime_to_ull(ft) != filetime_to_ull(*expected_create)) {
-                process_log("pid reuse suspected, skipping terminate pid=%u", (unsigned)pid);
+                nm_log(NM_LOG_WARN, "process", "pid reuse suspected, skipping terminate pid=%u", (unsigned)pid);
                 return;
             }
         }
@@ -1776,20 +1832,20 @@ int nanobot_stop(void) {
          * to stop. */
         nm_gateway_state gs;
         if (nanobot_read_gateway_state(&gs) == 0 && gs.pid == 0) {
-            process_log("nanobot stop: gateway not running");
+            nm_log(NM_LOG_INFO, "process", "nanobot stop: gateway not running");
             /* I2: do NOT flip to IDLE here -- this runs on stop_worker.
              * WM_ASYNC_STOP_DONE owns the STOPPING->IDLE flip (UI thread). */
             return 0;
         }
         if (gs.found && gs.pid != 0) {
             effective_pid = gs.pid;
-            process_log("nanobot stop: adopting state-file pid=%d (no tracked handle)",
+            nm_log(NM_LOG_INFO, "process", "nanobot stop: adopting state-file pid=%d (no tracked handle)",
                 (int)effective_pid);
         }
     }
 
     if (effective_pid == 0) {
-        process_log("nanobot stop: no pid to stop");
+        nm_log(NM_LOG_INFO, "process", "nanobot stop: no pid to stop");
         /* I2: do NOT flip to IDLE here -- same as above. */
         return 0;
     }
@@ -1823,7 +1879,7 @@ int nanobot_stop(void) {
                     memcpy(resolved_exe, exe_start, len);
                     resolved_exe[len] = '\0';
                     resolved_is_python = (strstr(cmd, "-m nanobot") != NULL) ? 1 : 0;
-                    process_log("nanobot stop: derived exe from state file command "
+                    nm_log(NM_LOG_DEBUG, "process", "nanobot stop: derived exe from state file command "
                         "(%s, is_python=%d)", resolved_exe, resolved_is_python);
                 }
             }
@@ -1843,7 +1899,7 @@ int nanobot_stop(void) {
     }
 
     if (resolved_exe[0] == '\0') {
-        process_log("nanobot stop: cannot resolve nanobot exe for stop CLI; "
+        nm_log(NM_LOG_WARN, "process", "nanobot stop: cannot resolve nanobot exe for stop CLI; "
                     "falling back to direct kill pid=%d", (int)effective_pid);
         /* No CLI -> skip tiers 0/1, go straight to the kill tree. */
         if (v.handle) {
@@ -1878,7 +1934,7 @@ int nanobot_stop(void) {
             GENERIC_WRITE, FILE_SHARE_READ, &sa,
             CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
         if (stdout_file == INVALID_HANDLE_VALUE) {
-            process_log("nanobot stop: CreateFileW(temp) failed err=%d",
+            nm_log(NM_LOG_WARN, "process", "nanobot stop: CreateFileW(temp) failed err=%d",
                 (int)GetLastError());
             stdout_file = NULL;        /* degrade: spawn w/o capture */
         }
@@ -1905,7 +1961,7 @@ int nanobot_stop(void) {
             CREATE_NO_WINDOW, NULL, NULL, &si, &stop_pi)) {
         spawned = 1;
     } else {
-        process_log("nanobot stop: CreateProcessW failed err=%d (escalating)",
+        nm_log(NM_LOG_ERROR, "process", "nanobot stop: CreateProcessW failed err=%d (escalating)",
             (int)GetLastError());
     }
     free(cmdline);
@@ -1948,7 +2004,7 @@ int nanobot_stop(void) {
     int tok_timeout      = (strstr(stdout_buf, "gateway_stop_timeout")  != NULL);
     int tok_stale        = (strstr(stdout_buf, "gateway_state_stale")   != NULL);
 
-    process_log("nanobot stop: CLI spawned=%d exit=%d tok(stopped=%d,not_running=%d,"
+    nm_log(NM_LOG_INFO, "process", "nanobot stop: CLI spawned=%d exit=%d tok(stopped=%d,not_running=%d,"
         "timeout=%d,stale=%d)", spawned, stop_exit_code,
         tok_stopped, tok_not_running, tok_timeout, tok_stale);
 
@@ -1972,18 +2028,18 @@ int nanobot_stop(void) {
              * so this is just confirm-or-escalate. */
             DWORD wait = WaitForSingleObject(v.handle, 8000);
             if (wait == WAIT_OBJECT_0) {
-                process_log("nanobot stop: gateway exited cleanly pid=%d",
+                nm_log(NM_LOG_INFO, "process", "nanobot stop: gateway exited cleanly pid=%d",
                     (int)effective_pid);
                 goto cleanup;
             }
-            process_log("nanobot stop: clean exit not confirmed, escalating "
+            nm_log(NM_LOG_WARN, "process", "nanobot stop: clean exit not confirmed, escalating "
                 "(tier 1: TerminateProcess) pid=%d", (int)effective_pid);
             TerminateProcess(v.handle, 0);
             WaitForSingleObject(v.handle, 3000);
             goto cleanup;
         }
         /* No tracked handle -> tier 2. */
-        process_log("nanobot stop: no tracked handle, escalating (tier 2: "
+        nm_log(NM_LOG_WARN, "process", "nanobot stop: no tracked handle, escalating (tier 2: "
             "kill_process_tree) pid=%d", (int)effective_pid);
         kill_process_tree(effective_pid,
             (v.create_ft.dwLowDateTime || v.create_ft.dwHighDateTime)
@@ -1992,7 +2048,7 @@ int nanobot_stop(void) {
     }
 
     /* Escalation path. */
-    process_log("nanobot stop: escalating after stop CLI (escalate=%d) pid=%d",
+    nm_log(NM_LOG_WARN, "process", "nanobot stop: escalating after stop CLI (escalate=%d) pid=%d",
         escalate, (int)effective_pid);
     if (v.handle) {
         /* Tier 1: we own the handle, hard-kill it. */

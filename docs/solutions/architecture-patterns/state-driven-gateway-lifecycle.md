@@ -1,7 +1,7 @@
 ---
 title: "State-Driven Gateway Lifecycle Management on Windows"
 date: 2026-07-13
-last_updated: 2026-07-31
+last_updated: 2026-10-24
 category: architecture-patterns
 module: nanobot-manager/process
 problem_type: architecture_pattern
@@ -264,7 +264,7 @@ Do not add the full pattern to an in-process component with no independent lifec
 
 1. `WinMain` initializes guarded state and kicks resolution for detection or silent-tray start.
 2. The resolver derives installation UI state from one runnable command result.
-3. Start launches background mode, discards launcher handles, reads and validates the state record, and opens the real gateway PID.
+3. Start launches background mode (stdout/stderr redirected to the gateway log via an explicit one-handle inheritance list — see `logging-pipeline.md`), discards the launcher's process handles, reads and validates the state record, and opens the real gateway PID.
 4. The current gateway's verified state port becomes the effective health endpoint; WebUI/bootstrap continues using its independent configured port.
 5. A process wait posts immediate death events while a health worker polls readiness and steady health.
 6. Stop enters the stopping state, runs the upstream stop command on a worker, confirms death, and escalates only when necessary.

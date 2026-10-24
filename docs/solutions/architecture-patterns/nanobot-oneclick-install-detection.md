@@ -92,7 +92,7 @@ config nanobot_path
 - 上游 install.ps1 改 venv 路径或 `NANOBOT_VENV` 语义 → 改 `managed_venv_dir()` + 本文档
 - 上游取消 wheel console script（`Scripts\nanobot.exe` 消失）→ venv python 候选已覆盖，确认探测仍通过即可
 - 上游推出独立 exe / 服务安装形态 → 需要新的候选层（不是改本层），并评估是否绕过 Python 层
-- manager "未找到" 排查：看 `nanobot-manager-process.log` 的候选与探测结果，先确认 venv 层是否命中
+- manager "未找到" 排查：看 `nanobot-manager.log` 的 `[process]` 行的候选与探测结果（候选与探测细节为 DEBUG 级，需在设置页把日志级别切到 debug），先确认 venv 层是否命中
 
 ## Related
 

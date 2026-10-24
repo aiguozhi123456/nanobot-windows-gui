@@ -37,6 +37,7 @@ FetchContent_MakeAvailable(cjson)
 
 add_executable(nanobot-manager WIN32
     src/main.cpp
+    src/logger.c
     src/process.c
     src/autostart.c
     src/config.c

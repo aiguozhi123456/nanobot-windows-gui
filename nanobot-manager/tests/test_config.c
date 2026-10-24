@@ -15,6 +15,7 @@ static int configs_equal(const app_config* left, const app_config* right) {
         left->health_check_port == right->health_check_port &&
         left->theme_mode == right->theme_mode &&
         strcmp(left->language, right->language) == 0 &&
+        strcmp(left->log_level, right->log_level) == 0 &&
         left->webui_port == right->webui_port;
 }
 
@@ -22,7 +23,7 @@ static const char* FULL_JSON =
     "{\"nanobot_path\":\"C:\\\\tools\\\\nanobot.exe\","
     "\"autostart_nanobot\":true,\"stay_in_tray\":true,\"hotkey_enabled\":false,"
     "\"health_check_port\":19000,\"theme_mode\":2,"
-    "\"language\":\"en\",\"webui_port\":9000,"
+    "\"language\":\"en\",\"webui_port\":9000,\"log_level\":\"warn\","
     "\"webui_auth\":\"nbwt_abcdef\"}";
 
 static void test_defaults(void) {
@@ -36,6 +37,7 @@ static void test_defaults(void) {
     TEST_CHECK(cfg.webui_port == 0);   /* 0 = auto-detect from nanobot config */
     TEST_CHECK(cfg.theme_mode == 0);
     TEST_CHECK(strcmp(cfg.language, "zh") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "info") == 0);
     config_free(&cfg);
 }
 
@@ -47,6 +49,28 @@ static void test_parse_full(void) {
     TEST_CHECK(cfg.autostart_nanobot == 1 && cfg.stay_in_tray == 1 && cfg.hotkey_enabled == 0);
     TEST_CHECK(cfg.health_check_port == 19000 && cfg.webui_port == 9000);
     TEST_CHECK(cfg.theme_mode == 2 && strcmp(cfg.language, "en") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "warn") == 0);
+    config_free(&cfg);
+}
+
+static void test_log_level_validation(void) {
+    app_config cfg;
+    config_apply_defaults(&cfg);
+    /* Valid values pass through. */
+    TEST_CHECK(config_parse_json(&cfg, "{\"log_level\":\"debug\"}") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "debug") == 0);
+    TEST_CHECK(config_parse_json(&cfg, "{\"log_level\":\"error\"}") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "error") == 0);
+    /* Invalid / missing values keep the prior value (default info). */
+    TEST_CHECK(config_parse_json(&cfg, "{\"log_level\":\"verbose\"}") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "error") == 0);
+    config_apply_defaults(&cfg);
+    TEST_CHECK(config_parse_json(&cfg, "{\"log_level\":\"\"}") == 0);
+    TEST_CHECK(strcmp(cfg.log_level, "info") == 0);
+    /* Serialized output contains the field; defaults round-trip to "info". */
+    char* json = config_serialize_json(&cfg);
+    TEST_CHECK(json && strstr(json, "\"log_level\"") != NULL);
+    free(json);
     config_free(&cfg);
 }
 
@@ -187,6 +211,7 @@ static void test_active_legacy_source_has_priority(void) {
 TEST_LIST = {
     { "config_defaults", test_defaults },
     { "config_parse_full", test_parse_full },
+    { "config_log_level_validation", test_log_level_validation },
     { "config_partial_invalid_null", test_parse_partial_invalid_and_null },
     { "config_webui_port_auto_sentinel", test_webui_port_auto_sentinel },
     { "config_health_port_auto_sentinel", test_health_port_auto_sentinel },

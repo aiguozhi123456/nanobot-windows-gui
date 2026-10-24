@@ -28,6 +28,7 @@ export default {
       installed: true,
       installing: false,
       lang: "zh",
+      logLevel: "info",
       messages: [],
       draft: "",
       canSend: true,
@@ -911,6 +912,26 @@ export default {
               </div>
               <div id="lang_en" :class="lang == 'en' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>EN</label>
+              </div>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div class="setting-label-wrap">
+              <label class="setting-label">{{ $t('setting_log_level') }}</label>
+            </div>
+            <div class="lang-row">
+              <div id="log_debug" :class="logLevel == 'debug' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>DEBUG</label>
+              </div>
+              <div id="log_info" :class="logLevel == 'info' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>INFO</label>
+              </div>
+              <div id="log_warn" :class="logLevel == 'warn' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>WARN</label>
+              </div>
+              <div id="log_error" :class="logLevel == 'error' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+                <label>ERROR</label>
               </div>
             </div>
           </div>
