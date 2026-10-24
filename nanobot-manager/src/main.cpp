@@ -63,6 +63,8 @@ static void tray_remove(void);
 static int has_arg(LPCWSTR cmd, const wchar_t* arg);
 static int can_edit_gateway_port(void);
 static VOID CALLBACK on_timer_focus_chat(HWND, UINT, UINT_PTR, DWORD);
+static void update_webui_port_sub(void);
+static void update_credential_ui(void);
 
 static void show_main_window(void) {
     if (!g_win) return;
@@ -275,7 +277,6 @@ static void set_status(const char* status, const char* text, const char* sub) {
         ui_page_set_bool(g_page, "canStop", 0);
         ui_page_set_bool(g_page, "canRefresh", 1);
     }
-    ui_page_set_bool(g_page, "canEditGatewayPort", can_edit_gateway_port());
 }
 
 static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
@@ -308,6 +309,24 @@ static void refresh_effective_health_port(void) {
     page_set_int("port", g_effective_health_port);
 }
 
+/* Settings-page sub-label for the WebUI port row, mirroring the effective-port
+ * precedence (pinned input > auto-read > 8765 fallback). Lives here and not in
+ * the input's placeholder because core-ui placeholders are static-only. */
+static void update_webui_port_sub(void) {
+    char text[160];
+    if (g_cfg.webui_port > 0)
+        snprintf(text, sizeof(text),
+                 is_zh() ? "已固定为 %d；留空并应用可恢复自动"
+                         : "Pinned to %d; clear and apply to resume auto",
+                 g_cfg.webui_port);
+    else
+        snprintf(text, sizeof(text),
+                 is_zh() ? "留空 = 自动读取 nanobot 配置端口，当前生效: %d；填写可强制覆盖"
+                         : "Empty = auto-read from nanobot config, now %d",
+                 g_effective_webui_port);
+    page_set("webuiPortSub", text);
+}
+
 /* The WebUI port and bootstrap secret nanobot actually serves live in its own
  * config (channels.websocket.{port,tokenIssueSecret,token}); the manager's
  * webui_port is a fallback (0/empty input = auto) and a non-zero value stays
@@ -326,6 +345,11 @@ static void refresh_effective_webui(void) {
         g_effective_webui_port = detected_port;
     else
         g_effective_webui_port = 8765;
+    /* The auto-read secret can appear/disappear at these same refresh points,
+     * so the credential status line (which shows the effective source) and the
+     * port sub-label follow the same cadence. */
+    update_webui_port_sub();
+    update_credential_ui();
 }
 
 /* Effective bootstrap secret: Credential Manager (explicit) first, then the
@@ -713,7 +737,6 @@ static void kick_resolve_worker(HWND hwnd, int start_intent) {
     if (previous_state != NM_STATE_RUNNING && previous_state != NM_STATE_STARTING &&
         previous_state != NM_STATE_STOPPING) {
         nm_state_set_state(NM_STATE_RESOLVING);
-        ui_page_set_bool(g_page, "canEditGatewayPort", 0);
     }
     HANDLE thread = CreateThread(NULL, 0, resolve_worker, c, 0, NULL);
     if (thread) {
@@ -1297,7 +1320,11 @@ static void update_credential_ui(void) {
         page_set("credentialStatus", is_zh() ? "已安全保存" : "Securely saved");
         ui_page_set_bool(g_page, "hasCredential", 1);
     } else if (state == 0) {
-        page_set("credentialStatus", is_zh() ? "未设置" : "Not set");
+        if (g_effective_webui_secret[0])
+            page_set("credentialStatus", is_zh() ? "未设置 · 自动读取 nanobot 配置"
+                                                 : "Not set · auto-read from nanobot config");
+        else
+            page_set("credentialStatus", is_zh() ? "未设置" : "Not set");
         ui_page_set_bool(g_page, "hasCredential", 0);
     } else {
         char text[96];
@@ -1411,17 +1438,14 @@ static void on_clear_credential(UiWidget w, void* ud) {
     }
 }
 
-/* Apply gateway health and independent manager WebUI ports transactionally. */
+/* Apply gateway health and independent manager WebUI ports transactionally.
+ * A gateway-port change while the gateway is live is saved and takes effect on
+ * the next start; the probe port (g_effective_health_port) is deliberately not
+ * switched below so monitoring of the running process is unaffected. */
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
     int new_health_port = 0, new_webui_port = 0;
     if (!read_port_input("healthPort", &new_health_port) || !read_webui_port_input(&new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
-    nm_state lifecycle = nm_state_get();
-    if (new_health_port != g_cfg.health_check_port && !can_edit_gateway_port()) {
-        restore_health_port_input();
-        MessageBoxW((HWND)ui_window_hwnd(g_win), is_zh() ? L"请停止 Gateway 后再修改 Gateway 端口。" : L"Stop the Gateway before changing its port.", is_zh() ? L"端口未修改" : L"Port not changed", MB_OK | MB_ICONINFORMATION);
-        return;
-    }
     app_config proposed = g_cfg;
     proposed.health_check_port = new_health_port;
     proposed.webui_port = new_webui_port;
@@ -1639,6 +1663,10 @@ static void apply_lang(const char* loc) {
     config_save(&g_cfg);
     ui_page_set_locale(g_page, loc);
     page_set("lang", loc);
+    /* Model-driven strings (credential source, WebUI port sub) don't re-fire
+     * through $t() bindings on a locale change -- re-derive them here. */
+    update_webui_port_sub();
+    update_credential_ui();
 }
 
 static void on_lang_zh(UiWidget w, void* ud) {
@@ -1915,7 +1943,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_gateway_port=Gateway 端口\n"
             "setting_gateway_port_sub=用于 /health；下次启动生效\n"
             "setting_webui_port=WebUI 端口\n"
-            "setting_webui_port_sub=留空 = 自动读取 nanobot 配置的端口（默认 8765）；填入端口号可强制覆盖\n"
             "setting_credential_status=认证密钥\n"
             "setting_credential_manage=管理\n"
             "setting_credential_clear=清除\n"
@@ -1953,7 +1980,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_gateway_port=Gateway Port\n"
             "setting_gateway_port_sub=Used for /health; applies on next start\n"
             "setting_webui_port=WebUI Port\n"
-            "setting_webui_port_sub=Leave empty to auto-read the port from nanobot's config (fallback 8765); enter a port to override\n"
             "setting_credential_status=Bootstrap Secret\n"
             "setting_credential_manage=Manage\n"
             "setting_credential_clear=Clear\n"

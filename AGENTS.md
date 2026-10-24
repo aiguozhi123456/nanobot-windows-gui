@@ -65,6 +65,7 @@ ctest --test-dir nanobot-manager\build -C Release --output-on-failure
 
 - **i18n**: zh/en strings are **embedded** in `main.cpp` via `ui_page_load_language_string`, not external `.lang` files. UI copy changes often need both `.uix` (`$t('key')`) and those strings.
 - **UI wiring**: widget `id`s in `dashboard.uix` must match `ui_page_on_widget_mount(..., "id", ...)` in `main.cpp`. Native clicks/toggles are mounted from C++; reactive fields use `ui_page_set_*` / page `data()`.
+- **Dynamic hints in settings**: input `placeholder` is static-only in core-ui (no runtime setter, and `placeholder` is not a reactive binding property in `ApplyBindingToWidget`) — a `:placeholder="expr"` binding compiles but silently no-ops. For live values (current effective port, credential source), drive a model string from C++ and render it in a label (`{{ webuiPortSub }}` / `{{ credentialStatus }}` pattern), refreshed wherever the underlying value or the language changes.
 - **core-ui API**: when changing UI patterns, prefer `core-ui/docs/uix-ai-guide.md` (and `core-ui/include/ui_core.h`) over inventing APIs. Submodule pin is independent of manager version.
 
 ## Conventions
