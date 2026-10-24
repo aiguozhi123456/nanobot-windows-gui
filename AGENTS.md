@@ -10,6 +10,7 @@ Native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot). Prod
 | `nanobot-manager/src/process.c` | Find/start/stop nanobot, WinHTTP `/health` |
 | `nanobot-manager/src/config.c` | installed/portable `config.json`, atomic saves, legacy secret migration (cJSON) |
 | `nanobot-manager/src/credential.c` | Windows Credential Manager storage for the WebUI bootstrap secret |
+| `nanobot-manager/src/i18n.c` | zh/en language tables (`i18n_table` / `i18n_status`), single-source status table |
 | `nanobot-manager/src/chat.c` | WebUI bootstrap + WinHTTP WebSocket chat client (connect/send/stream) |
 | `nanobot-manager/src/autostart.c` | `HKCU\...\Run` value `nanobot-manager` → `"exe" --autostart` |
 | `nanobot-manager/ui/dashboard.uix` | Core UI SFC (layout + reactive state, chat page) |
@@ -63,7 +64,7 @@ ctest --test-dir nanobot-manager\build -C Release --output-on-failure
 
   `nanobot_path`, `autostart_nanobot`, `stay_in_tray`, `health_check_port` (0 = auto: attach to the detected running Gateway, start new ones on 18790; legacy serialized 18790 normalizes to 0; other values pin), `webui_port` (0 = auto-detect from nanobot config, the default; legacy 8765 normalizes to 0; other values pin the port), `theme_mode` (0=system, 1=dark, 2=light), `language` (`zh`/`en`). Legacy `webui_auth` is migration-only and is never serialized.
 
-- **i18n**: zh/en strings are **embedded** in `main.cpp` via `ui_page_load_language_string`, not external `.lang` files. UI copy changes often need both `.uix` (`$t('key')`) and those strings.
+- **i18n**: zh/en strings are **embedded** in `src/i18n.c` (`i18n_table()` feeds `ui_page_load_language_string`; `i18n_status()` resolves status keys for C++ pushes), not external `.lang` files; `tests/test_i18n.c` enforces zh/en key parity. UI copy changes often need both `.uix` (`$t('key')`) and those strings. Bilingual `MessageBoxW` dialog strings intentionally stay inline in `main.cpp` (`is_zh()` ternaries), outside the language-table system.
 - **UI wiring**: widget `id`s in `dashboard.uix` must match `ui_page_on_widget_mount(..., "id", ...)` in `main.cpp`. Native clicks/toggles are mounted from C++; reactive fields use `ui_page_set_*` / page `data()`.
 - **Dynamic hints in settings**: input `placeholder` is static-only in core-ui (no runtime setter, and `placeholder` is not a reactive binding property in `ApplyBindingToWidget`) — a `:placeholder="expr"` binding compiles but silently no-ops. For live values (current effective port, credential source), drive a model string from C++ and render it in a label (`{{ webuiPortSub }}` / `{{ credentialStatus }}` pattern), refreshed wherever the underlying value or the language changes.
 - **core-ui API**: when changing UI patterns, prefer `core-ui/docs/uix-ai-guide.md` (and `core-ui/include/ui_core.h`) over inventing APIs. Submodule pin is independent of manager version.

@@ -40,6 +40,7 @@ add_executable(nanobot-manager WIN32
     src/process.c
     src/autostart.c
     src/config.c
+    src/i18n.c
     src/credential.c
     src/chat.c
     src/chat_protocol.c

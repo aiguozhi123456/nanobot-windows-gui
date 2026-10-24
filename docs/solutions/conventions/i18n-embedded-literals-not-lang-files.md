@@ -1,13 +1,15 @@
 ---
-title: "i18n convention: embed zh/en strings as literals in main.cpp, not external .lang files"
+title: "i18n convention: embed zh/en strings as literals in src/i18n.c, not external .lang files"
 date: 2026-08-01
+last_updated: 2026-10-24
 category: conventions
-module: nanobot-manager/main
+module: nanobot-manager/i18n
 problem_type: convention
 component: documentation
 severity: medium
 related_components:
   - nanobot-manager/ui
+  - nanobot-manager/main
 applies_when:
   - "Adding or changing any user-visible UI string (label, button, status, tooltip) in the manager"
   - "Looking for the .lang / language files and finding none"
@@ -16,11 +18,11 @@ applies_when:
 tags: [i18n, localization, embedded-strings, language-strings, ui-page-load-language-string, core-ui, convention, cpp]
 ---
 
-# i18n convention: embed zh/en strings as literals in main.cpp, not external .lang files
+# i18n convention: embed zh/en strings as literals in src/i18n.c, not external .lang files
 
 ## Context
 
-The manager is bilingual (zh / en). New contributors looking for where UI copy lives will, by default, hunt for `.lang` / `.json` / resource files — that's how most UI frameworks do i18n. **There are none in this project.** Both language blobs are embedded as C string literals inside `main.cpp` and handed to core-ui's `ui_page_load_language_string` at startup. UI copy that changes often needs edits in *two* places (the `.uix` `$t('key')` reference and the `main.cpp` literal), and for status text there is a third concern — keeping the strings that C++ pushes directly in sync with the strings the template looks up via `$t()`.
+The manager is bilingual (zh / en). New contributors looking for where UI copy lives will, by default, hunt for `.lang` / `.json` / resource files — that's how most UI frameworks do i18n. **There are none in this project.** Both language blobs are embedded as C string literals in `src/i18n.c` and handed to core-ui's `ui_page_load_language_string` at startup (they were inline in `main.cpp` until v1.6.2, then moved to the dedicated i18n module; still compiled-in, never files). UI copy that changes often needs edits in *two* places (the `.uix` `$t('key')` reference and the `i18n.c` literal), and for status text there is a third concern — keeping the strings that C++ pushes directly in sync with the strings the template looks up via `$t()`.
 
 This convention record exists so contributors don't (a) invent `.lang` files that the loader never reads, or (b) add a status string in one place but not the other.
 
@@ -32,11 +34,11 @@ core-ui offers `ui_page_load_language_string(page, lang_code, string)` — give 
 
 ### Two embedded blobs, one per language
 
-UI strings (labels, buttons, settings rows) live as multi-line C string literals in `main.cpp`, structured as `key=zh_or_en\n`:
+UI strings (labels, buttons, settings rows) live as multi-line C string literals in `src/i18n.c` (`s_prefix_zh` / `s_prefix_en`), structured as `key=zh_or_en\n`:
 
 ```c
-/* zh block — Chinese as byte-escaped UTF-8 OR raw UTF-8 source */
-const char* zh =
+/* src/i18n.c */
+static const char s_prefix_zh[] =
     "app_title=nanobot manager\n"
     "chat_empty=开始对话\n"
     "btn_start=启动\n"
@@ -47,17 +49,18 @@ const char* zh =
     /* ... */
     ;
 /* en block — parallel keys */
-const char* en =
+static const char s_prefix_en[] =
     "app_title=nanobot manager\n"
     "chat_empty=Start a conversation\n"
     "btn_start=Start\n"
     /* ... */
     ;
-ui_page_load_language_string(g_page, "zh", zh);
-ui_page_load_language_string(g_page, "en", en);
+/* main.cpp, at boot */
+ui_page_load_language_string(g_page, "zh", i18n_table("zh"));
+ui_page_load_language_string(g_page, "en", i18n_table("en"));
 ```
 
-Every key in the zh block **must** appear in the en block and vice versa. The `.uix` references these via `$t('btn_start')`, `$t('settings_network')`, etc. Adding a visible label means editing both the `.uix` (a `$t('new_key')`) and *both* language blobs in `main.cpp`.
+Every key in the zh block **must** appear in the en block and vice versa (enforced by `tests/test_i18n.c`). The `.uix` references these via `$t('btn_start')`, `$t('settings_network')`, etc. Adding a visible label means editing both the `.uix` (a `$t('new_key')`) and *both* language blobs in `src/i18n.c`.
 
 ### `/utf-8` lets Chinese be raw, but byte-escaped is the legacy form
 
@@ -70,7 +73,7 @@ Status text (running, stopped, starting…) has an extra failure mode: it is bot
 The manager solves this with a `status_i18n_entry` table that is the **only** wording source for `status_*` keys:
 
 ```c
-/* main.cpp */
+/* src/i18n.c */
 typedef struct { const char* key; const char* zh; const char* en; } status_i18n_entry;
 static const status_i18n_entry g_status_i18n[] = {
     { "status_running",         "运行中",            "Running" },
@@ -80,8 +83,8 @@ static const status_i18n_entry g_status_i18n[] = {
 };
 ```
 
-- `t_status(key, lang)` looks up a key for C++ to push via `page_set` / `set_status_i18n`.
-- `append_status_i18n_lang(lang)` **generates** the `status_*` portion of the language blob passed to `ui_page_load_language_string` — so the `$t()` lookups and the C++ pushes are reading the *same table*. They cannot drift, because there is only one set of strings.
+- `i18n_status(key, zh)` looks up a key for C++ to push via `page_set` / `set_status_i18n` (main.cpp's `t_status(key)` wrapper passes `is_zh()`).
+- `i18n_table(locale)` **generates** the `status_*` portion of the language blob passed to `ui_page_load_language_string` (via the internal `append_status_i18n_lang`) — so the `$t()` lookups and the C++ pushes are reading the *same table*. They cannot drift, because there is only one set of strings.
 
 **When adding a new status:** add one row to `g_status_i18n`. It is automatically available to both `$t()` (via the generated blob) and C++ push (via `t_status`). Do not hand-write the new `status_*` line into the zh/en string literals — that would create a second source.
 
@@ -93,6 +96,47 @@ The split is deliberate:
 
 Don't move static keys into the table "for consistency" — the table exists specifically to solve the dual-reference problem, and static keys don't have it.
 
+### The literals live in the i18n module (v1.6.2+)
+
+The blobs and the status table live in `src/i18n.c` / `src/i18n.h`, not in main.cpp. The module is pure C: language is always a parameter (`is_zh()` stays in main.cpp), and it touches no config, globals, or platform APIs — which is why a unit test can link it with one `nm_add_test` line. The whole public API is two functions:
+
+```c
+/* src/i18n.h */
+const char* i18n_table(const char* locale);
+/* Assembled "key=value\n" table (prefix + generated status_* lines) for
+ * "zh"/"en"; lazy-built into static buffers; prefix-only fallback on
+ * overflow; NULL for unknown locale. */
+const char* i18n_status(const char* key, int zh);
+/* Single-source status lookup; missing key returns key itself (same
+ * fallback as $t). */
+```
+
+main.cpp keeps only consumers — the two load calls, and a thin wrapper so no existing call site churned:
+
+```c
+/* main.cpp — at boot */
+ui_page_load_language_string(g_page, "zh", i18n_table("zh"));
+ui_page_load_language_string(g_page, "en", i18n_table("en"));
+
+/* main.cpp — the C++ push path keeps its shape */
+static const char* t_status(const char* key) {
+    return i18n_status(key, is_zh());
+}
+```
+
+Scope note: the ~20 `is_zh() ? L"…" : L"…"` `MessageBoxW` dialog strings intentionally stay inline in main.cpp — they are wide-string dialog copy tied to specific dialogs, not `$t()` table data.
+
+### The discipline is enforced by CTest, not review
+
+`tests/test_i18n.c` parses both assembled tables and mechanically checks what this doc asks humans to remember:
+
+1. **Shape** — every line is `key=value\n` with non-empty key and value; the table ends with `\n`.
+2. **Parity** — zh/en key sets are identical (61 = 35 prefix + 26 status); a mismatch fails naming the exact missing key (`key 'setting_advanced' exists in zh but is missing in en`), instead of a raw key rendering in the UI for a user to report.
+3. **Status single-source** — every `status_*` key in the generated table resolves via `i18n_status` in both languages; hand-writing a `status_*` line into the prefix literals (a second wording source) makes this fail.
+4. **Fallbacks** — missing key returns the key itself; unknown locale returns NULL.
+
+Run CTest before committing string changes: `ctest --test-dir nanobot-manager/build -C Release --output-on-failure`.
+
 ### Don't invent `.lang` files
 
 If a guide or habit suggests creating `assets/zh.lang` / `en.lang`: **don't.** The loader is `ui_page_load_language_string(page, code, string)` — it takes a string, not a path. There is no code path that reads a `.lang` file. Adding one would be dead weight and would not be loaded.
@@ -101,15 +145,16 @@ If a guide or habit suggests creating `assets/zh.lang` / `en.lang`: **don't.** T
 
 - **Avoids the missing-files hunt.** The single most common i18n onboarding confusion here is "where are the language files?" Answering it once, in the convention doc, saves every future contributor the search.
 - **The status anti-drift table is load-bearing.** Without it, `$t('status_running')` in the template and the C++ push of the running string would be two independent edits, and they would eventually disagree (one says "Running", the other "Active"). The table makes drift impossible by construction.
+- **The discipline is now mechanical.** The both-languages rule used to be review-only: forgetting the en side surfaced as a raw key in the UI — a runtime discovery by a user. `test_key_parity` fails at build time and names the missing key, and `status_single_source` catches a second wording source the moment it appears.
 - **Edits-in-two-places is the recurring cost.** A label change touches the `.uix` key reference (rarely) and *both* language blobs (always). Forgetting the second language leaves a key unresolved — `$t()` falls back to the key itself, so the UI shows the raw key string. The fix is mechanical (edit zh and en), but the discipline is "always both."
 - **Keeping it in-source keeps the build simple.** No resource embedding step, no install rule for language files, no missing-file failure mode. The strings compile into the binary.
 
 ## When to Apply
 
-- **Adding any user-visible string** — add the key to the `.uix` (`$t('key')`), then add `key=zh` to the zh blob and `key=en` to the en blob in `main.cpp`. Both languages, every time.
+- **Adding any user-visible string** — add the key to the `.uix` (`$t('key')`), then add `key=zh` to `s_prefix_zh` and `key=en` to `s_prefix_en` in `src/i18n.c`. Both languages, every time.
 - **Adding a status string** (referenced from both template and C++) — add one row to `g_status_i18n`; do not hand-edit the zh/en blobs for it.
 - **Considering external `.lang` / `.json` language files** — don't; the loader takes in-source strings. If the string count ever makes in-source unwieldy, that's a deliberate refactor decision, not a default.
-- **Seeing `$t('some_key')` render as the literal `some_key`** — the key is missing from the active language blob; add it to both blobs.
+- **Seeing `$t('some_key')` render as the literal `some_key`** — the key is missing from the active language blob; add it to both blobs. `tests/test_i18n.c` fails on zh/en key drift, so run CTest before committing string changes.
 - **Reviewing an i18n PR** — confirm: every new key exists in zh *and* en; status keys went into the table, not the blobs; no `.lang` file was added.
 
 ## Examples
@@ -132,7 +177,7 @@ If a guide or habit suggests creating `assets/zh.lang` / `en.lang`: **don't.** T
 ```c
 { "status_restarting", "重启中…", "Restarting…" },
 ```
-Now both `$t('status_restarting')` and `t_status("status_restarting", lang)` work, from the same string.
+Now both `$t('status_restarting')` and `i18n_status("status_restarting", zh)` work, from the same string.
 
 ### Wrong: inventing a .lang file
 
@@ -145,6 +190,10 @@ ui_page_load_language_file(g_page, "assets/en.lang");  /* no such API in this pr
 
 - `docs/solutions/reference/core-ui-overview.md` — core-ui's i18n API surface, including the absence of `ui_text_input_on_changed` and the `ui_page_load_language_string` contract.
 - `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — references the embedded-literal convention for its settings-section i18n; this doc is the canonical statement.
-- `nanobot-manager/src/main.cpp` — the zh/en string blobs, `g_status_i18n` table, `t_status` / `append_status_i18n_lang`, and the `ui_page_load_language_string` calls.
+- `nanobot-manager/src/i18n.c` / `src/i18n.h` — the zh/en string blobs, `g_status_i18n` table, `i18n_table` / `i18n_status`, and the assembly with overflow fallback.
+- `nanobot-manager/src/main.cpp` — the `ui_page_load_language_string` calls, the `t_status` wrapper, and the `is_zh()` dialog strings (which are intentionally NOT part of the language-table system).
+- `nanobot-manager/tests/test_i18n.c` — CTest enforcement of zh/en key parity and status single-source.
+- `docs/solutions/architecture-patterns/config-system.md` — the same pattern family: carve a pure, testable module out of a fat source file and pin it with a unit test.
+- `docs/solutions/infrastructure/testing-and-ci-setup.md` — how CTest targets are wired (`nm_add_test`), including `test_i18n`.
 - `nanobot-manager/ui/dashboard.uix` — the `$t('key')` references that resolve against these blobs.
 - Commit `96d8b1b` — `feat(ui): add i18n with Chinese/English language switching` (the origin of this convention).

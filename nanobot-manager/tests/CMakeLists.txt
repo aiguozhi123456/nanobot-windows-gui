@@ -60,3 +60,7 @@ target_include_directories(test_chat_protocol PRIVATE
     ${cjson_SOURCE_DIR}
 )
 target_link_libraries(test_chat_protocol PRIVATE cjson)
+
+# i18n: pure string-table assembly + zh/en key parity (no platform deps).
+nm_add_test(test_i18n ${CMAKE_SOURCE_DIR}/src/i18n.c)
+target_include_directories(test_i18n PRIVATE ${CMAKE_SOURCE_DIR}/src)
