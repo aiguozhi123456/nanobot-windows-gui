@@ -128,6 +128,28 @@ The framework's binding of its text-measurement context to the active renderer, 
 
 Layout triggered outside that scope runs with no measure context, so text measurement silently degrades: multi-line text reports a single-line height and caret geometry reports zero advance. Event callbacks must therefore only request a layout (mark it dirty) and let the next frame's scoped layout pass perform it, never invoke layout synchronously. This is the same unbound-measure hazard named under IME Caret Position.
 
+## Core UI Rendering & Animation
+
+### Default Height Fallback
+A box-layout rule in the UI framework where a non-positive explicit height is treated as unspecified and replaced by a default height, so an element sized to zero renders as a default-size sliver instead of disappearing.
+
+Hiding an element must go through the visibility switch, never through a zero size binding; sizes meant to stay fixed belong in static styling rather than reactive bindings.
+
+### Widget Subtree Opacity
+The framework composites a widget's opacity over its entire subtree, so an ancestor held at zero opacity hides all descendants regardless of their own values.
+
+Anything that must stay visible must not live under an ancestor whose opacity is animated toward zero; motion that should not affect children is expressed through size or the ancestor's own surfaces instead.
+
+### Binding-Driven Transition
+The framework's CSS transitions animate only property changes that arrive through reactive bindings; property changes driven by state pseudo-classes (hover, active) bypass the animation path entirely and land instantly.
+
+Hover and similar state animations therefore route through the binding trampoline: pointer events write a reactive field, and the styled property reads from a binding expression over that field.
+
+### Mount-Phase Snap Gate
+The rule that binding applications landing before a subtree's first paint are set instantly rather than animated, so an entrance animation cannot start from its invisible initial state without a forced blank beat.
+
+Because page scripts expose no timers, there is no flicker-free mount-animation path; entrance effects are avoided rather than engineered around the gate.
+
 ## UI Text & Localization
 
 ### Language Table
