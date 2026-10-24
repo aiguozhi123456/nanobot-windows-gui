@@ -46,7 +46,7 @@ tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha
 - **不打 DWM 背景的透窗窗口透出的是纯黑**——core-ui 的透明清屏和 DWM 亚克力必须成对出现（日志 `acrylic backdrop kind=1/2` vs `opaque fallback` 的由来）。
 - **系统亚克力材质的深浅跟随 immersive-dark 旗标，不跟随应用主题**。只设 `DWMWA_SYSTEMBACKDROP_TYPE` 时材质按系统默认（多为浅色）渲染——深色主题的应用后面是一层亮白雾，深色壁纸透出来被洗成粉彩，用户看到的就是"暗色模式坏了"。`DwmSetWindowAttribute` 返回 S_OK 只说明 API 接受了，不代表视觉正确。
 
-**色场 alpha 纪律**：透窗后"玻璃要糊的对象"是真实桌面，窗内色场（`radial-gradient` 色块）只能当色相点缀——alpha ≤ 0.32 左右。本项目首版沿用不透明时代的 0.85/0.75/0.70，盖满窗口后亚克力透出的画面被搅成不透明粉彩糊，用户观感"压根没透"（管线其实在工作）。
+**色场 alpha 纪律**：透窗后"玻璃要糊的对象"是真实桌面，窗内色场（`radial-gradient` 色块）只能当色相点缀——0.3~0.45 是实测可用的区间（0.85/0.75/0.70 的首版盖满窗口后亚克力透出的画面被搅成不透明粉彩糊，用户观感"压根没透"而管线其实在工作；跌破 ~0.3 则设计感消失）。同理，玻璃卡上的输入框/字段容器不要用实色 `--input-bg`/`--bg-2`（玻璃上贴色块），TextInput 直接不写 background/border 走框架的 WinUI 状态机（烟熏填充+底线下划），div 类容器用白烟熏 alpha（0.07 底 + 0.16 描边）。
 
 ## Why This Works
 

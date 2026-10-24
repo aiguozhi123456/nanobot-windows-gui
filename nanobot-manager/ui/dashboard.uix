@@ -79,7 +79,7 @@ export default {
     width: 300px;
     height: 300px;
     margin-bottom: -300px;
-    background: radial-gradient(rgba(58, 128, 152, 0.32), rgba(58, 128, 152, 0) 70%);
+    background: radial-gradient(rgba(58, 128, 152, 0.42), rgba(58, 128, 152, 0) 70%);
   }
 
   .backdrop-b {
@@ -91,7 +91,7 @@ export default {
        above the title bar. */
     margin-bottom: -520px;
     align-self: flex-end;
-    background: radial-gradient(rgba(106, 94, 188, 0.28), rgba(106, 94, 188, 0) 70%);
+    background: radial-gradient(rgba(106, 94, 188, 0.36), rgba(106, 94, 188, 0) 70%);
   }
 
   .backdrop-c {
@@ -99,7 +99,7 @@ export default {
     height: 240px;
     margin-bottom: -240px;
     align-self: flex-end;
-    background: radial-gradient(rgba(96, 148, 90, 0.25), rgba(96, 148, 90, 0) 70%);
+    background: radial-gradient(rgba(96, 148, 90, 0.32), rgba(96, 148, 90, 0) 70%);
   }
 
   .titlebar-left {
@@ -635,7 +635,10 @@ export default {
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    background: var(--bg-2);
+    /* Same smoke-glass language as the composer (white-alpha reads as a soft
+       field on the frosted card in both themes; solid --bg-2 read as slabs). */
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 4px;
     cursor: pointer;
   }
@@ -659,11 +662,13 @@ export default {
   }
 
   .port-input {
+    /* No custom background/border: TextInputWidget's default WinUI state
+       machine (smoke fill + underline + focus accent) is the chat-input look
+       the settings fields should match; a solid --input-bg box reads as a
+       flat black/white slab on the glass card. */
     height: 32px;
     font-size: 13px;
     padding: 0 8px;
-    background: var(--input-bg);
-    border: 1px solid rgba(128, 128, 128, 0.35);
     border-radius: 4px;
   }
 
@@ -704,7 +709,9 @@ export default {
     align-items: center;
     gap: 6px;
     padding: 6px 10px;
-    background: var(--bg-2);
+    /* Same smoke-glass field as .path-display (chat-input look-alike). */
+    background: rgba(255, 255, 255, 0.07);
+    border: 1px solid rgba(255, 255, 255, 0.16);
     border-radius: 4px;
   }
 
