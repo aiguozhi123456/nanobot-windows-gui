@@ -23,6 +23,9 @@ cmake_install.cmake
 *.swp
 *.swo
 
+# ZCode agent session workspace
+.zcode/
+
 # OS
 Thumbs.db
 .DS_Store
