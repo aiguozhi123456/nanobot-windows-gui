@@ -805,24 +805,37 @@ static int    g_installing = 0;
 static HANDLE g_installer_process = NULL;   /* we own; closed after unwatch    */
 static HANDLE g_installer_wait = NULL;      /* RegisterWaitForSingleObject reg */
 
-struct installer_wait_ctx { HWND hwnd; UINT msg; };   /* heap; owned by callback */
+struct installer_wait_ctx { HWND hwnd; UINT msg; };
+
+/* The registration's callback arg. Freed by the callback when it fires, or by
+ * installer_unwatch when the wait is cancelled first (manager exits while the
+ * installer window is still open) -- whichever runs last owns it. */
+static struct installer_wait_ctx* g_installer_ctx = NULL;
 
 static VOID CALLBACK installer_wait_callback(PVOID param, BOOLEAN timeout) {
     (void)timeout;                         /* INFINITE wait -- always FALSE    */
     struct installer_wait_ctx* ctx = (struct installer_wait_ctx*)param;
     if (!ctx) return;
     PostMessageW(ctx->hwnd, ctx->msg, 0, 0);
-    free(ctx);                             /* single-fire => freed exactly once */
+    if (ctx == g_installer_ctx)
+        g_installer_ctx = NULL;            /* unwatch path must not free it    */
+    free(ctx);
 }
 
 /* Drain any in-flight callback and drop the registration. MUST be called
  * before CloseHandle on g_installer_process (same discipline as process.c's
- * nanobot_unwatch_handle). */
+ * nanobot_unwatch_handle). Unlike that path the process may still be alive
+ * here, so the callback may never fire -- UnregisterWaitEx only cancels, it
+ * does not invoke it, and the ctx must be freed on this side instead. */
 static void installer_unwatch(void) {
     if (g_installer_wait) {
         UnregisterWaitEx(g_installer_wait, INVALID_HANDLE_VALUE);
         g_installer_wait = NULL;
     }
+    /* No callback is running or can start after the drain above; a non-NULL
+     * value means the callback never fired and we own it. */
+    free(g_installer_ctx);
+    g_installer_ctx = NULL;
 }
 
 static void on_install_nanobot(UiWidget w, void* ud) {
@@ -839,9 +852,11 @@ static void on_install_nanobot(UiWidget w, void* ud) {
         swprintf_s(message, _countof(message),
             L"This opens PowerShell and runs the official nanobot one-click installer:\n\n%s\n\nPython 3.11+ is required. Continue?",
             NANOBOT_INSTALL_CMD);
+    /* No is the default: this authorizes running internet-fetched code, so a
+     * stray Enter must not launch it. */
     if (MessageBoxW(owner, message,
             is_zh() ? L"安装 nanobot" : L"Install nanobot",
-            MB_YESNO | MB_ICONINFORMATION) != IDYES)
+            MB_YESNO | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDYES)
         return;
 
     wchar_t ps[MAX_PATH];
@@ -886,6 +901,7 @@ static void on_install_nanobot(UiWidget w, void* ud) {
     if (ctx) {
         ctx->hwnd = owner;
         ctx->msg  = WM_INSTALLER_EXITED;
+        g_installer_ctx = ctx;   /* visible to callback/unwatch from here on */
         if (RegisterWaitForSingleObject(&wait, pi.hProcess, installer_wait_callback,
                                         ctx, INFINITE,
                                         WT_EXECUTEONLYONCE | WT_EXECUTEINPERSISTENTTHREAD)) {
@@ -895,6 +911,7 @@ static void on_install_nanobot(UiWidget w, void* ud) {
             ui_page_set_bool(g_page, "installing", 1);
             return;
         }
+        g_installer_ctx = NULL;
         free(ctx);
     }
     CloseHandle(pi.hProcess);   /* no watch armed; refresh stays the fallback */

@@ -48,13 +48,18 @@ static void test_owned_candidate_must_not_predate_launcher(void) {
  * which also makes the tier deterministic in tests: point the env var at a
  * temp dir, lay down stub Scripts\ exes, then restore the original value. */
 
-static wchar_t g_venv_saved_value[MAX_PATH];
-static int     g_venv_was_set;
+static wchar_t* g_venv_saved_value;
+static int      g_venv_was_set;
 
 static void venv_env_save(void) {
-    DWORD n = GetEnvironmentVariableW(L"NANOBOT_VENV",
-                                      g_venv_saved_value, MAX_PATH);
-    g_venv_was_set = (n > 0 && n < MAX_PATH);
+    DWORD need = GetEnvironmentVariableW(L"NANOBOT_VENV", NULL, 0);
+    g_venv_was_set = 0;
+    if (need == 0) return;                 /* unset (or empty == unset)        */
+    g_venv_saved_value = (wchar_t*)malloc((size_t)need * sizeof(wchar_t));
+    if (!g_venv_saved_value) return;
+    g_venv_was_set =
+        GetEnvironmentVariableW(L"NANOBOT_VENV", g_venv_saved_value, need)
+        == need - 1;                       /* chars copied, excl. NUL          */
 }
 
 static void venv_env_restore(void) {
@@ -62,6 +67,9 @@ static void venv_env_restore(void) {
         SetEnvironmentVariableW(L"NANOBOT_VENV", g_venv_saved_value);
     else
         SetEnvironmentVariableW(L"NANOBOT_VENV", NULL);
+    free(g_venv_saved_value);
+    g_venv_saved_value = NULL;
+    g_venv_was_set = 0;
 }
 
 /* Create an empty marker file at <dir>\<rel>; parent dirs must exist. */
@@ -92,6 +100,14 @@ static int index_of_candidate(char** exes, int count, const char* expect) {
     return -1;
 }
 
+/* Index of the first candidate with the given source, or -1. */
+static int first_index_with_source(const nm_source* sources, int count,
+                                   nm_source want) {
+    for (int i = 0; i < count; i++)
+        if (sources[i] == want) return i;
+    return -1;
+}
+
 /* Create <tmp>\nm-test-venv-<tag> with a Scripts subdir (no exes). */
 static int make_temp_venv(wchar_t* dir, size_t cap, const wchar_t* tag) {
     wchar_t tmp[MAX_PATH], scripts[MAX_PATH];
@@ -119,10 +135,15 @@ static void remove_temp_venv(const wchar_t* dir) {
 static void test_candidates_managed_venv_nanobot_exe(void) {
     wchar_t dir[MAX_PATH];
     venv_env_save();
-    if (!make_temp_venv(dir, _countof(dir), L"nb") ||
-        !create_stub(dir, L"Scripts\\nanobot.exe")) {
+    if (!make_temp_venv(dir, _countof(dir), L"nb")) {
         TEST_CHECK(0 && "fixture setup failed");
         venv_env_restore();
+        return;
+    }
+    if (!create_stub(dir, L"Scripts\\nanobot.exe")) {
+        TEST_CHECK(0 && "fixture setup failed");
+        venv_env_restore();
+        remove_temp_venv(dir);             /* don't leak the empty temp tree   */
         return;
     }
     SetEnvironmentVariableW(L"NANOBOT_VENV", dir);
@@ -142,6 +163,12 @@ static void test_candidates_managed_venv_nanobot_exe(void) {
         if (idx >= 0) {
             TEST_CHECK(is_py[idx] == 0);
             TEST_CHECK(sources[idx] == NM_SRC_MANAGED_VENV);
+            /* Documented precedence: config < PATH nanobot.exe < managed venv
+             * < PATH python (asserted only for tiers present on this machine). */
+            int path_idx = first_index_with_source(sources, count, NM_SRC_PATH_NANOBOT);
+            int py_idx   = first_index_with_source(sources, count, NM_SRC_PYTHON);
+            if (path_idx >= 0) TEST_CHECK(path_idx < idx);
+            if (py_idx >= 0)   TEST_CHECK(idx < py_idx);
         }
     }
 
@@ -153,10 +180,15 @@ static void test_candidates_managed_venv_nanobot_exe(void) {
 static void test_candidates_managed_venv_python_only(void) {
     wchar_t dir[MAX_PATH];
     venv_env_save();
-    if (!make_temp_venv(dir, _countof(dir), L"py") ||
-        !create_stub(dir, L"Scripts\\python.exe")) {
+    if (!make_temp_venv(dir, _countof(dir), L"py")) {
         TEST_CHECK(0 && "fixture setup failed");
         venv_env_restore();
+        return;
+    }
+    if (!create_stub(dir, L"Scripts\\python.exe")) {
+        TEST_CHECK(0 && "fixture setup failed");
+        venv_env_restore();
+        remove_temp_venv(dir);             /* don't leak the empty temp tree   */
         return;
     }
     SetEnvironmentVariableW(L"NANOBOT_VENV", dir);
@@ -176,6 +208,12 @@ static void test_candidates_managed_venv_python_only(void) {
         if (idx >= 0) {
             TEST_CHECK(is_py[idx] == 1);
             TEST_CHECK(sources[idx] == NM_SRC_MANAGED_VENV);
+            /* Documented precedence: config < PATH nanobot.exe < managed venv
+             * < PATH python (asserted only for tiers present on this machine). */
+            int path_idx = first_index_with_source(sources, count, NM_SRC_PATH_NANOBOT);
+            int py_idx   = first_index_with_source(sources, count, NM_SRC_PYTHON);
+            if (path_idx >= 0) TEST_CHECK(path_idx < idx);
+            if (py_idx >= 0)   TEST_CHECK(idx < py_idx);
         }
     }
 
@@ -216,11 +254,42 @@ static void test_candidates_managed_venv_absent(void) {
     venv_env_restore();
 }
 
+static void test_candidates_managed_venv_empty_override_equals_unset(void) {
+    /* install.ps1 treats %NANOBOT_VENV% as set only when non-empty; an empty
+     * value must probe exactly the same candidates as an unset one. Compared
+     * head-to-head so the assertion holds on any machine (a real
+     * ~\.nanobot\venv shows up identically in both runs). */
+    venv_env_save();
+    SetEnvironmentVariableW(L"NANOBOT_VENV", L"");
+
+    char** exes_a = NULL; int* is_py_a = NULL; nm_source* src_a = NULL; int count_a = 0;
+    nanobot_resolve_candidates(NULL, &exes_a, &is_py_a, &src_a, &count_a);
+
+    SetEnvironmentVariableW(L"NANOBOT_VENV", NULL);
+
+    char** exes_b = NULL; int* is_py_b = NULL; nm_source* src_b = NULL; int count_b = 0;
+    nanobot_resolve_candidates(NULL, &exes_b, &is_py_b, &src_b, &count_b);
+
+    TEST_CHECK(count_a == count_b);
+    if (count_a == count_b) {
+        for (int i = 0; i < count_a; i++) {
+            TEST_CHECK(_stricmp(exes_a[i], exes_b[i]) == 0);
+            TEST_CHECK(is_py_a[i] == is_py_b[i]);
+            TEST_CHECK(src_a[i] == src_b[i]);
+        }
+    }
+
+    nm_candidates_free(exes_a, is_py_a, src_a, count_a);
+    nm_candidates_free(exes_b, is_py_b, src_b, count_b);
+    venv_env_restore();
+}
+
 TEST_LIST = {
     { "owned_candidate_requires_all_evidence", test_owned_candidate_requires_all_evidence },
     { "owned_candidate_must_not_predate_launcher", test_owned_candidate_must_not_predate_launcher },
     { "candidates_managed_venv_nanobot_exe", test_candidates_managed_venv_nanobot_exe },
     { "candidates_managed_venv_python_only", test_candidates_managed_venv_python_only },
     { "candidates_managed_venv_absent", test_candidates_managed_venv_absent },
+    { "candidates_managed_venv_empty_override_equals_unset", test_candidates_managed_venv_empty_override_equals_unset },
     { NULL, NULL }
 };

@@ -119,7 +119,10 @@ static int managed_venv_dir(wchar_t* out, size_t cap) {
         if (profile) CoTaskMemFree(profile);
         return 0;
     }
-    int written = swprintf_s(out, cap, L"%s\\.nanobot\\venv", profile);
+    /* _TRUNCATE so an over-long profile path yields -1; plain swprintf_s
+     * invokes the CRT invalid-parameter handler (process termination) on
+     * overflow instead of returning. */
+    int written = _snwprintf_s(out, cap, _TRUNCATE, L"%s\\.nanobot\\venv", profile);
     CoTaskMemFree(profile);                 /* always free, even on truncation-fail */
     return (written > 0) ? 1 : 0;
 }
@@ -186,14 +189,19 @@ int nanobot_resolve_candidates(const app_config* cfg,
     if (count < CAP) {
         wchar_t venv[MAX_PATH];
         if (managed_venv_dir(venv, _countof(venv))) {
-            static const wchar_t* const venv_exes[] = {
-                L"Scripts\\nanobot.exe", L"Scripts\\python.exe"
+            static const struct {
+                const wchar_t* rel;        /* relative to the venv root       */
+                int            is_python;
+            } venv_entries[] = {
+                { L"Scripts\\nanobot.exe", 0 },  /* wheel console script       */
+                { L"Scripts\\python.exe",  1 },  /* python -m nanobot fallback */
             };
-            static const int venv_is_python[] = { 0, 1 };
-            for (int i = 0; i < 2 && count < CAP; i++) {
+            for (int i = 0; i < (int)_countof(venv_entries) && count < CAP; i++) {
                 wchar_t candidate[MAX_PATH];
-                if (swprintf_s(candidate, _countof(candidate), L"%s\\%s",
-                               venv, venv_exes[i]) <= 0)
+                /* _TRUNCATE: a venv path that cannot fit is skipped (-1), not
+                 * a CRT constraint violation (see managed_venv_dir). */
+                if (_snwprintf_s(candidate, _countof(candidate), _TRUNCATE,
+                                 L"%s\\%s", venv, venv_entries[i].rel) < 0)
                     continue;
                 DWORD attr = GetFileAttributesW(candidate);
                 if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY))
@@ -201,7 +209,7 @@ int nanobot_resolve_candidates(const app_config* cfg,
                 char* candidate_utf8 = wide_to_utf8_alloc(candidate);
                 if (candidate_utf8) {
                     exes[count] = candidate_utf8;
-                    is_py[count] = venv_is_python[i];
+                    is_py[count] = venv_entries[i].is_python;
                     sources[count] = NM_SRC_MANAGED_VENV;
                     count++;
                 }
