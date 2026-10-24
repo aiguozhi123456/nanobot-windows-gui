@@ -38,6 +38,10 @@ static int g_messages_ui_dirty = 0;
 
 #define CHAT_ATTACH_TIMEOUT_MS 10000ULL
 #define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
+/* UI renders at most the newest N messages so per-push work (serialize + JSON
+ * parse + v-for rebind) stays bounded on long histories. The full array is
+ * still what chat_history persists; only the rendered slice is capped. */
+#define CHAT_UI_DISPLAY_CAP 200
 
 static void restore_new_history_backup(void);
 static void terminal_failure(const char* zh, const char* en, const char* detail);
@@ -63,17 +67,44 @@ static void ensure_messages(void) {
     if (!g_messages) g_messages = cJSON_CreateArray();
 }
 
+/* Serialize at most the newest CHAT_UI_DISPLAY_CAP messages. Reference items
+ * alias g_messages (no deep copy); deleting the tail array frees only the
+ * reference wrappers. Caller frees the returned string. */
+static char* print_visible_messages(void) {
+    int count = cJSON_GetArraySize(g_messages);
+    cJSON* tail = NULL;
+    char* json;
+    if (count > CHAT_UI_DISPLAY_CAP) {
+        tail = cJSON_CreateArray();
+        if (tail) {
+            for (int index = count - CHAT_UI_DISPLAY_CAP; index < count; index++)
+                cJSON_AddItemReferenceToArray(tail, cJSON_GetArrayItem(g_messages, index));
+        }
+    }
+    json = cJSON_PrintUnformatted(tail ? tail : g_messages);
+    if (tail) cJSON_Delete(tail);
+    return json;
+}
+
 static void push_messages_ui(void) {
     char* json;
     int follow = 0;
     if (!g_page) return;
-    if (g_chat_scroll) {
+    /* While the chat page is unmounted (v-if switched to another page) the
+     * v-for has no live watchers, so the O(history) serialize + JSON parse
+     * would feed nobody. Leave the dirty flag set; the scroll mount hook
+     * flushes on page re-entry. */
+    if (!g_chat_scroll) {
+        g_messages_ui_dirty = 1;
+        return;
+    }
+    {
         float y = ui_scroll_get_y(g_chat_scroll);
         float max_y = ui_scroll_get_max_y(g_chat_scroll);
         follow = max_y <= 0.0f || max_y - y <= CHAT_FOLLOW_THRESHOLD_DIP;
     }
     ensure_messages();
-    json = cJSON_PrintUnformatted(g_messages);
+    json = print_visible_messages();
     if (json) {
         ui_page_set_json(g_page, "messages", json);
         if (follow) ui_scroll_to_end(g_chat_scroll);
@@ -772,6 +803,9 @@ void chat_ui_mount_scroll(UiPage page, UiWidget widget, void* userdata) {
     (void)page;
     (void)userdata;
     g_chat_scroll = widget;
+    /* Flush anything deferred while the page was unmounted before jumping to
+     * the end, so re-entering chat shows the latest stream state. */
+    flush_messages_ui();
     ui_scroll_to_end(widget);
 }
 

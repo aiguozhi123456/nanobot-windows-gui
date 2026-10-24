@@ -43,7 +43,18 @@ static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manage
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
 #define TIMER_FOCUS_CHAT 1005
-#define CHAT_UI_FRAME_MS 33
+#define TIMER_AMBIENT 1006
+#define TIMER_PULSE 1007
+/* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
+ * and each flush costs an O(rendered-history) serialize + JSON parse. */
+#define CHAT_UI_FRAME_MS 66
+/* Running-state LED heartbeat period. The .status-dot opacity transition is
+ * the same duration, so each toggle animates one full sine-like cycle. */
+#define LED_HEARTBEAT_MS 1400
+/* Radar pulse tick: reset -> anticipate -> expand+dissolve phases, each one
+ * tick apart. The .pulse-ring CSS transition (450ms) is tuned to land inside
+ * this spacing. */
+#define PULSE_TICK_MS 470
 #define ID_TRAY_SHOW 40001
 #define ID_TRAY_QUIT 40002
 
@@ -267,26 +278,72 @@ static void stop_uptime_timer(void) {
     ui_page_set_text(g_page, "pid", L"-");
 }
 
+static void set_action_bools(int start, int stop, int refresh) {
+    ui_page_set_bool(g_page, "canStart", start);
+    ui_page_set_bool(g_page, "canStop", stop);
+    ui_page_set_bool(g_page, "canRefresh", refresh);
+}
+
+/* Radar pulse on the hero LED when the status actually changes. Size-only
+ * choreography (opacity stays 1: dimming the ring would dim its child dot):
+ *   t0      reset   ringSize 16  (retract any in-flight bloom, back to halo)
+ *   t0+1tk  bloom   ringSize 28  (450ms ease-out expand through the ring's
+ *   t0+2tk  retract ringSize 16   CSS transition; the halo returns to rest)
+ * Re-triggering mid-pulse just restarts the reset phase. */
+static int g_pulse_phase = 0;
+
+static VOID CALLBACK on_timer_pulse(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)msg; (void)tick;
+    if (!g_page) {
+        KillTimer(hwnd, id);
+        g_pulse_phase = 0;
+        return;
+    }
+    switch (g_pulse_phase) {
+    case 0:
+        ui_page_set_float(g_page, "ringSize", 28.0f);
+        g_pulse_phase = 1;
+        break;
+    case 1:
+        ui_page_set_float(g_page, "ringSize", 16.0f);
+        g_pulse_phase = 2;
+        break;
+    default:
+        KillTimer(hwnd, id);
+        g_pulse_phase = 0;
+        break;
+    }
+}
+
+static void led_pulse_start(void) {
+    if (!g_page || !g_hwnd) return;
+    g_pulse_phase = 0;
+    ui_page_set_float(g_page, "ringSize", 16.0f);
+    SetTimer(g_hwnd, TIMER_PULSE, PULSE_TICK_MS, on_timer_pulse);
+}
+
 static void set_status(const char* status, const char* text, const char* sub) {
+    static char last_status[16] = "";
     page_set("status", status);
     page_set("statusText", text);
     page_set("statusSub", sub);
 
-    if (strcmp(status, "running") == 0) {
-        ui_page_set_bool(g_page, "canStart", 0);
-        ui_page_set_bool(g_page, "canStop", 1);
-        ui_page_set_bool(g_page, "canRefresh", 1);
-    } else if (strcmp(status, "starting") == 0 || strcmp(status, "stopping") == 0) {
+    if (strcmp(status, "running") == 0)
+        set_action_bools(0, 1, 1);
+    else if (strcmp(status, "starting") == 0 || strcmp(status, "stopping") == 0) {
         /* M5: "stopping" disables both buttons -- same as "starting".
          * M8: also disable refresh during transitions -- the worker guard
          * would no-op a click here anyway, but a disabled button is clearer. */
-        ui_page_set_bool(g_page, "canStart", 0);
-        ui_page_set_bool(g_page, "canStop", 0);
-        ui_page_set_bool(g_page, "canRefresh", 0);
-    } else {
-        ui_page_set_bool(g_page, "canStart", 1);
-        ui_page_set_bool(g_page, "canStop", 0);
-        ui_page_set_bool(g_page, "canRefresh", 1);
+        set_action_bools(0, 0, 0);
+    } else
+        set_action_bools(1, 0, 1);
+
+    /* Health polling calls set_status with the same state every cycle;
+     * only a real transition fires the pulse. */
+    if (strcmp(last_status, status) != 0) {
+        strncpy(last_status, status, sizeof(last_status) - 1);
+        last_status[sizeof(last_status) - 1] = '\0';
+        led_pulse_start();
     }
 }
 
@@ -309,6 +366,26 @@ static VOID CALLBACK on_timer_focus_chat(HWND hwnd, UINT msg, UINT_PTR id, DWORD
     UiWidget input = ui_widget_find_by_id(root, "chat_input");
     if (input)
         ui_window_focus_widget(g_win, input);
+}
+
+/* Running-state LED heartbeat: ping-pong the dot opacity through the
+ * .status-dot opacity transition (same LED_HEARTBEAT_MS duration, sine-like
+ * ease-in-out). Only while the gateway actually runs; any other state holds
+ * full opacity. Hidden windows skip paint invalidation, so this is near free
+ * when minimized to tray. */
+static VOID CALLBACK on_timer_ambient(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    static int dimmed = 0;
+    if (!g_page) return;
+    if (nm_state_get() != NM_STATE_RUNNING) {
+        if (dimmed) {
+            dimmed = 0;
+            ui_page_set_float(g_page, "ambientGlow", 1.0f);
+        }
+        return;
+    }
+    dimmed = !dimmed;
+    ui_page_set_float(g_page, "ambientGlow", dimmed ? 0.45f : 1.0f);
 }
 
 static int can_edit_gateway_port(void) {
@@ -1254,24 +1331,14 @@ static void on_open_webui(UiWidget w, void* ud) {
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 }
 
-static void restore_webui_port_input(void) {
-    wchar_t port[16];
-    /* Empty input = auto-detect (the 0 sentinel in config.json). */
-    if (g_cfg.webui_port > 0)
-        swprintf_s(port, _countof(port), L"%d", g_cfg.webui_port);
+/* Empty input = auto-detect (the 0 sentinel in config.json). */
+static void restore_port_input(const char* field, int port) {
+    wchar_t text[16];
+    if (port > 0)
+        swprintf_s(text, _countof(text), L"%d", port);
     else
-        port[0] = L'\0';
-    ui_page_set_text(g_page, "webuiPort", port);
-}
-
-static void restore_health_port_input(void) {
-    wchar_t port[16];
-    /* Empty input = auto-detect (the 0 sentinel in config.json). */
-    if (g_cfg.health_check_port > 0)
-        swprintf_s(port, _countof(port), L"%d", g_cfg.health_check_port);
-    else
-        port[0] = L'\0';
-    ui_page_set_text(g_page, "healthPort", port);
+        text[0] = L'\0';
+    ui_page_set_text(g_page, field, text);
 }
 
 /* Port settings inputs: an empty value is valid and yields 0, the auto-detect
@@ -1428,7 +1495,7 @@ static void on_clear_credential(UiWidget w, void* ud) {
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
     int new_health_port = 0, new_webui_port = 0;
-    if (!read_port_input("healthPort", &new_health_port) || !read_port_input("webuiPort", &new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
+    if (!read_port_input("healthPort", &new_health_port) || !read_port_input("webuiPort", &new_webui_port)) { restore_port_input("healthPort", g_cfg.health_check_port); restore_port_input("webuiPort", g_cfg.webui_port); return; }
     app_config proposed = g_cfg;
     proposed.health_check_port = new_health_port;
     proposed.webui_port = new_webui_port;
@@ -1451,7 +1518,8 @@ static void on_apply_network(UiWidget w, void* ud) {
         g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
     }
-    restore_health_port_input(); restore_webui_port_input();
+    restore_port_input("healthPort", g_cfg.health_check_port);
+    restore_port_input("webuiPort", g_cfg.webui_port);
     refresh_effective_webui();
     chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
     if (webui_changed) set_chat_endpoint_effective(1);
@@ -1595,19 +1663,12 @@ static void on_btn_webui_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_open_webui, NULL);
 }
 
-static void on_theme_light_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_theme_light, NULL);
-}
-
-static void on_theme_dark_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_theme_dark, NULL);
-}
-
-static void on_theme_system_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_theme_system, NULL);
+/* One mount shim for every click-only settings choice (theme/lang/log level):
+ * the UiClickCallback to wire is passed as userdata, so each choice needs no
+ * dedicated mount trampoline. */
+static void on_setting_choice_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p;
+    ui_widget_on_click(w, (UiClickCallback)ud, NULL);
 }
 
 static void on_tray_toggle(UiWidget w, int val, void* ud) {
@@ -1663,16 +1724,6 @@ static void on_lang_en(UiWidget w, void* ud) {
     apply_lang("en");
 }
 
-static void on_lang_zh_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_lang_zh, NULL);
-}
-
-static void on_lang_en_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_lang_en, NULL);
-}
-
 static void apply_log_level(const char* level) {
     nm_log_level parsed = logger_level_from_string(level);
     strncpy(g_cfg.log_level, logger_level_to_string(parsed),
@@ -1688,26 +1739,6 @@ static void on_log_debug(UiWidget w, void* ud) { (void)w; (void)ud; apply_log_le
 static void on_log_info(UiWidget w, void* ud)  { (void)w; (void)ud; apply_log_level("info"); }
 static void on_log_warn(UiWidget w, void* ud)  { (void)w; (void)ud; apply_log_level("warn"); }
 static void on_log_error(UiWidget w, void* ud) { (void)w; (void)ud; apply_log_level("error"); }
-
-static void on_log_debug_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_log_debug, NULL);
-}
-
-static void on_log_info_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_log_info, NULL);
-}
-
-static void on_log_warn_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_log_warn, NULL);
-}
-
-static void on_log_error_mount(UiPage p, UiWidget w, void* ud) {
-    (void)p; (void)ud;
-    ui_widget_on_click(w, on_log_error, NULL);
-}
 
 static int has_arg(LPCWSTR cmd, const wchar_t* arg) {
     int argc = 0;
@@ -1953,7 +1984,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     g_effective_health_port = gateway_port_fallback();
     swprintf_s(port_w, _countof(port_w), L"%d", g_effective_health_port);
     ui_page_set_text(g_page, "port", port_w);
-    restore_health_port_input();   /* empty settings input = auto sentinel */
+    restore_port_input("healthPort", g_cfg.health_check_port);   /* empty settings input = auto sentinel */
 
     if (g_cfg.nanobot_path && g_cfg.nanobot_path[0]) {
         wchar_t wpath[MAX_PATH] = {0};
@@ -1967,7 +1998,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
      * settings input shows the configured override (empty = auto); the
      * effective endpoint used to connect is resolved from nanobot's config. */
     refresh_effective_webui();
-    restore_webui_port_input();
+    restore_port_input("webuiPort", g_cfg.webui_port);
     update_credential_ui();
 
     apply_theme(g_cfg.theme_mode);
@@ -2009,15 +2040,15 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "chat_input", chat_ui_mount_input, NULL);
     ui_page_on_widget_mount(g_page, "chat_scroll", chat_ui_mount_scroll, NULL);
     ui_page_on_widget_unmount(g_page, "chat_scroll", chat_ui_unmount_scroll, NULL);
-    ui_page_on_widget_mount(g_page, "theme_light", on_theme_light_mount, NULL);
-    ui_page_on_widget_mount(g_page, "theme_dark", on_theme_dark_mount, NULL);
-    ui_page_on_widget_mount(g_page, "theme_system", on_theme_system_mount, NULL);
-    ui_page_on_widget_mount(g_page, "lang_zh", on_lang_zh_mount, NULL);
-    ui_page_on_widget_mount(g_page, "lang_en", on_lang_en_mount, NULL);
-    ui_page_on_widget_mount(g_page, "log_debug", on_log_debug_mount, NULL);
-    ui_page_on_widget_mount(g_page, "log_info", on_log_info_mount, NULL);
-    ui_page_on_widget_mount(g_page, "log_warn", on_log_warn_mount, NULL);
-    ui_page_on_widget_mount(g_page, "log_error", on_log_error_mount, NULL);
+    ui_page_on_widget_mount(g_page, "theme_light", on_setting_choice_mount, on_theme_light);
+    ui_page_on_widget_mount(g_page, "theme_dark", on_setting_choice_mount, on_theme_dark);
+    ui_page_on_widget_mount(g_page, "theme_system", on_setting_choice_mount, on_theme_system);
+    ui_page_on_widget_mount(g_page, "lang_zh", on_setting_choice_mount, on_lang_zh);
+    ui_page_on_widget_mount(g_page, "lang_en", on_setting_choice_mount, on_lang_en);
+    ui_page_on_widget_mount(g_page, "log_debug", on_setting_choice_mount, on_log_debug);
+    ui_page_on_widget_mount(g_page, "log_info", on_setting_choice_mount, on_log_info);
+    ui_page_on_widget_mount(g_page, "log_warn", on_setting_choice_mount, on_log_warn);
+    ui_page_on_widget_mount(g_page, "log_error", on_setting_choice_mount, on_log_error);
 
     if (g_autostart_silent)
         g_win = ui_page_prepare_window(g_page, NULL);
@@ -2034,6 +2065,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     g_hwnd = hwnd;
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
+    SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     if (g_tray_enabled_effective)
         tray_add(hwnd);
     if (g_cfg.hotkey_enabled)
@@ -2084,6 +2116,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         KillTimer(hwnd, TIMER_FOCUS_CHAT);
         g_focus_chat_pending = 0;
     }
+    /* KillTimer on an idle id is a harmless no-op (pulse is one-shot-ish). */
+    KillTimer(hwnd, TIMER_AMBIENT);
+    KillTimer(hwnd, TIMER_PULSE);
     chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);
