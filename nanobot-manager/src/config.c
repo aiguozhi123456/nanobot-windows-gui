@@ -153,7 +153,7 @@ void config_apply_defaults(app_config* cfg) {
     cfg->health_check_port = 18790;
     cfg->theme_mode = 0;
     cfg->hotkey_enabled = 1;
-    cfg->webui_port = 8765;
+    cfg->webui_port = 0;    /* 0 = auto-detect from nanobot's config */
     strcpy(cfg->language, "zh");
 }
 
@@ -169,10 +169,6 @@ int config_parse_port(const char* text, int* out_port) {
     if (value == 0) return 0;
     *out_port = (int)value;
     return 1;
-}
-
-int config_parse_webui_port(const char* text, int* out_port) {
-    return config_parse_port(text, out_port);
 }
 
 int config_parse_json(app_config* cfg, const char* json) {
@@ -201,8 +197,13 @@ int config_parse_json(app_config* cfg, const char* json) {
         strcpy(cfg->language, item->valuestring);
     }
     item = cJSON_GetObjectItem(root, "webui_port");
-    if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint && item->valueint > 0 && item->valueint <= 65535)
-        cfg->webui_port = item->valueint;
+    if (item && cJSON_IsNumber(item) && item->valuedouble == item->valueint &&
+        item->valueint >= 0 && item->valueint <= 65535) {
+        /* 0 = auto-detect. Managers before auto-detection always serialized
+         * the old default 8765, which equals nanobot's own default -- normalize
+         * it to auto so pre-existing configs keep following nanobot's config. */
+        cfg->webui_port = (item->valueint == 8765) ? 0 : item->valueint;
+    }
     item = cJSON_GetObjectItem(root, "webui_auth");
     if (item && cJSON_IsString(item) && item->valuestring) {
         size_t length = strlen(item->valuestring);

@@ -15,7 +15,9 @@ typedef struct {
     int health_check_port;
     int theme_mode;
     char language[8];
-    int webui_port;           /* default 8765 */
+    int webui_port;           /* 0 = auto-detect from nanobot config (default);
+                                   legacy serialized 8765 normalizes to 0;
+                                   other values pin the port explicitly */
     char legacy_webui_auth[128]; /* transient old JSON secret; never serialized */
     int legacy_migration_pending;
     wchar_t legacy_source_path[MAX_PATH]; /* file containing transient legacy secret */
@@ -58,7 +60,6 @@ int  config_should_scan_adjacent_legacy(int active_legacy_migration_pending);
 /* Strict ASCII decimal port parser. Accepts leading zeroes, but no whitespace,
  * signs, decimal/exponent notation, or non-ASCII numerals. */
 int  config_parse_port(const char* text, int* out_port);
-int  config_parse_webui_port(const char* text, int* out_port);
 
 #ifdef __cplusplus
 }

@@ -18,7 +18,7 @@ export default {
       stayInTray: false,
       hotkeyEnabled: true,
       nanobotPath: "",
-      webuiPort: "8765",
+      webuiPort: "",
       healthPort: "18790",
       canEditGatewayPort: true,
       credentialStatus: "",

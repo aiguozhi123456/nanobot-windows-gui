@@ -1107,6 +1107,115 @@ static int iso8601_to_filetimes(const char* iso,
     return 1;
 }
 
+/* --- WebUI endpoint detection (port + bootstrap secret) -------------------- */
+
+/* Mirror of nanobot's cli/webui_support.webui_bootstrap_secret: the first
+ * non-empty (after trimming ASCII whitespace) of tokenIssueSecret / token,
+ * copied capped (cap includes the NUL) into out. Leaves out empty when the
+ * channel carries no usable secret. */
+static void webui_extract_secret(cJSON* ws, char* out, size_t cap) {
+    static const char* const keys[] = { "tokenIssueSecret", "token" };
+    if (!out || cap == 0) return;
+    out[0] = '\0';
+    if (!cJSON_IsObject(ws)) return;
+    for (int i = 0; i < (int)_countof(keys); i++) {
+        cJSON* item = cJSON_GetObjectItem(ws, keys[i]);
+        if (!item || !cJSON_IsString(item) || !item->valuestring) continue;
+        const char* s = item->valuestring;
+        while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+        size_t len = strlen(s);
+        while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' ||
+                           s[len - 1] == '\r' || s[len - 1] == '\n'))
+            len--;
+        if (len == 0) continue;
+        size_t copy = (len < cap - 1) ? len : cap - 1;
+        memcpy(out, s, copy);
+        out[copy] = '\0';
+        return;
+    }
+}
+
+/* nanobot serves its WebUI from the channels.websocket channel, so its own
+ * config is authoritative for where the UI listens and which bootstrap secret
+ * it expects. Pure: fills out_port (1..65535, else 0 when absent, invalid, or
+ * the channel is disabled) and out_secret (see webui_extract_secret) from one
+ * document. Returns 1 when an enabled websocket channel exists. Absent enabled
+ * counts as on (nanobot's WebSocketConfig default). */
+int nanobot_config_webui_info(const char* json, int* out_port,
+                              char* out_secret, size_t secret_cap) {
+    if (out_port) *out_port = 0;
+    if (out_secret && secret_cap) out_secret[0] = '\0';
+    if (!json || !json[0]) return 0;
+    cJSON* root = cJSON_Parse(json);
+    if (!root) return 0;
+    int found = 0;
+    cJSON* channels = cJSON_GetObjectItem(root, "channels");
+    cJSON* ws = cJSON_IsObject(channels)
+                    ? cJSON_GetObjectItem(channels, "websocket") : NULL;
+    if (cJSON_IsObject(ws)) {
+        cJSON* enabled = cJSON_GetObjectItem(ws, "enabled");
+        if (!cJSON_IsBool(enabled) || cJSON_IsTrue(enabled)) {
+            found = 1;
+            if (out_port) {
+                cJSON* jport = cJSON_GetObjectItem(ws, "port");
+                if (jport && cJSON_IsNumber(jport) &&
+                    jport->valueint >= 1 && jport->valueint <= 65535)
+                    *out_port = jport->valueint;
+            }
+            webui_extract_secret(ws, out_secret, secret_cap);
+        }
+    }
+    cJSON_Delete(root);
+    return found;
+}
+
+/* Resolve nanobot's WebUI endpoint with one read of the shared
+ * ~\.nanobot\config.json (same Path.home() semantics as
+ * nanobot_read_gateway_state): fills out_port / out_secret from the file and
+ * returns the detected port, or `fallback_port` when the file is missing,
+ * unreadable, or carries no usable channel. */
+int nanobot_detect_webui(int* out_port, char* out_secret, size_t secret_cap,
+                         int fallback_port) {
+    if (out_port) *out_port = 0;
+    if (out_secret && secret_cap) out_secret[0] = '\0';
+    /* "~" on Windows == %USERPROFILE% == Python's Path.home(). */
+    PWSTR profile = NULL;
+    HRESULT hr = SHGetKnownFolderPath(&FOLDERID_Profile, 0, NULL, &profile);
+    if (FAILED(hr) || !profile) {
+        if (profile) CoTaskMemFree(profile);
+        return fallback_port;
+    }
+    wchar_t wpath[MAX_PATH];
+    int n = swprintf_s(wpath, _countof(wpath),
+        L"%s\\.nanobot\\config.json", profile);
+    CoTaskMemFree(profile);             /* always free, even on truncation-fail */
+    if (n <= 0) return fallback_port;
+
+    FILE* f = _wfopen(wpath, L"rb");
+    if (!f) return fallback_port;
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    /* nanobot's config carries model presets and MCP servers and reaches a few
+     * hundred KB; 4 MiB is generous headroom without allowing the unbounded
+     * malloc a hostile file could trigger. */
+    if (len <= 0 || len > (4L << 20)) { fclose(f); return fallback_port; }
+
+    char* buf = (char*)malloc((size_t)len + 1);
+    if (!buf) { fclose(f); return fallback_port; }
+    size_t nread = fread(buf, 1, (size_t)len, f);
+    buf[nread] = '\0';
+    fclose(f);
+
+    int port = 0;
+    nanobot_config_webui_info(buf, &port, out_secret, secret_cap);
+    if (out_port && port > 0)
+        *out_port = port;
+    SecureZeroMemory(buf, (size_t)len + 1);
+    free(buf);
+    return port > 0 ? port : fallback_port;
+}
+
 int nanobot_read_gateway_state(nm_gateway_state* out) {
     if (!out) return -1;
     out->found = 0;

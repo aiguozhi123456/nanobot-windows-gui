@@ -33,7 +33,7 @@ static void test_defaults(void) {
     TEST_CHECK(cfg.stay_in_tray == 0);
     TEST_CHECK(cfg.hotkey_enabled == 1);
     TEST_CHECK(cfg.health_check_port == 18790);
-    TEST_CHECK(cfg.webui_port == 8765);
+    TEST_CHECK(cfg.webui_port == 0);   /* 0 = auto-detect from nanobot config */
     TEST_CHECK(cfg.theme_mode == 0);
     TEST_CHECK(strcmp(cfg.language, "zh") == 0);
     config_free(&cfg);
@@ -59,6 +59,22 @@ static void test_parse_partial_invalid_and_null(void) {
     TEST_CHECK(cfg.webui_port == 7777);
     TEST_CHECK(config_parse_json(NULL, "{}") == -1);
     TEST_CHECK(config_parse_json(&cfg, NULL) == -1);
+    config_free(&cfg);
+}
+
+static void test_webui_port_auto_sentinel(void) {
+    app_config cfg;
+    config_apply_defaults(&cfg);
+    /* Managers before auto-detect always serialized 8765 (the old default,
+     * equal to nanobot's own default): normalize it to the auto sentinel so
+     * pre-existing configs keep following nanobot's config. */
+    TEST_CHECK(config_parse_json(&cfg, "{\"webui_port\":8765}") == 0);
+    TEST_CHECK(cfg.webui_port == 0);
+    /* Explicit 0 stays 0; any other port passes through untouched. */
+    TEST_CHECK(config_parse_json(&cfg, "{\"webui_port\":0}") == 0);
+    TEST_CHECK(cfg.webui_port == 0);
+    TEST_CHECK(config_parse_json(&cfg, "{\"webui_port\":18791}") == 0);
+    TEST_CHECK(cfg.webui_port == 18791);
     config_free(&cfg);
 }
 
@@ -156,6 +172,7 @@ TEST_LIST = {
     { "config_defaults", test_defaults },
     { "config_parse_full", test_parse_full },
     { "config_partial_invalid_null", test_parse_partial_invalid_and_null },
+    { "config_webui_port_auto_sentinel", test_webui_port_auto_sentinel },
     { "config_ports_theme", test_ports_and_theme },
     { "config_roundtrips", test_roundtrips },
     { "config_language_path", test_language_and_path },

@@ -34,6 +34,8 @@ static int       g_hotkey_registered = 0;
 static int       g_focus_chat_pending = 0;
 static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
+static int       g_effective_webui_port = 8765;
+static char      g_effective_webui_secret[128] = {0};
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
@@ -306,6 +308,39 @@ static void refresh_effective_health_port(void) {
     page_set_int("port", g_effective_health_port);
 }
 
+/* The WebUI port and bootstrap secret nanobot actually serves live in its own
+ * config (channels.websocket.{port,tokenIssueSecret,token}); the manager's
+ * webui_port is a fallback (0/empty input = auto) and a non-zero value stays
+ * an explicit override so users can pin it. The auto-read secret is only a
+ * fallback too -- an explicit Credential Manager entry always wins. Re-derived
+ * on boot, on RUNNING transitions, and after settings apply -- never per
+ * health tick (the file read is not free). */
+static void refresh_effective_webui(void) {
+    int detected_port = 0;
+    SecureZeroMemory(g_effective_webui_secret, sizeof(g_effective_webui_secret));
+    nanobot_detect_webui(&detected_port, g_effective_webui_secret,
+                         sizeof(g_effective_webui_secret), 0);
+    if (g_cfg.webui_port > 0)
+        g_effective_webui_port = g_cfg.webui_port;
+    else if (detected_port > 0)
+        g_effective_webui_port = detected_port;
+    else
+        g_effective_webui_port = 8765;
+}
+
+/* Effective bootstrap secret: Credential Manager (explicit) first, then the
+ * secret auto-read from nanobot's config, else none. Single funnel for every
+ * chat_set_endpoint call so the precedence stays in one place. */
+static void set_chat_endpoint_effective(int reconnect) {
+    char secret[128] = {0};
+    credential_load(secret, sizeof(secret), NULL);
+    if (!secret[0] && g_effective_webui_secret[0])
+        memcpy(secret, g_effective_webui_secret, sizeof(secret));
+    chat_set_endpoint(g_effective_webui_port, secret);
+    SecureZeroMemory(secret, sizeof(secret));
+    if (reconnect) chat_reconnect_async();
+}
+
 /* --- Status i18n (single-source keys) ---------------------------------------
  * core-ui exposes ui_page_load_language_string / $t('key') for .uix templates
  * but has no C++ key→string lookup API. Status text is pushed from C++ via
@@ -450,15 +485,16 @@ static void apply_health_result(int running, int actual_port) {
         set_status_i18n("running", "status_running", "status_running_sub");
         if (v.start_tick == 0)
             nm_state_set_start_tick(GetTickCount64());
-        if (!was_running)
+        if (!was_running) {
             start_uptime_timer((int)v.pid);
+            /* nanobot's config may have appeared or changed while the gateway
+             * was down; re-read the WebUI endpoint once per RUNNING transition. */
+            refresh_effective_webui();
+        }
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
         if (chat_needs_connect() && chat_ui_can_auto_connect()) {
-            char secret[128] = {0};
-            credential_load(secret, sizeof(secret), NULL);
-            chat_set_endpoint(g_cfg.webui_port, secret);
-            SecureZeroMemory(secret, sizeof(secret));
+            set_chat_endpoint_effective(0);
             chat_connect();
         }
         return;
@@ -1154,18 +1190,64 @@ static void on_change_path(UiWidget w, void* ud) {
     }
 }
 
+/* Percent-encode every byte outside the RFC 3986 unreserved set (mirrors
+ * Python urllib quote(secret, safe='') used by nanobot's own browser URL).
+ * Returns 0 on success, non-zero when the secret contains CR/LF or does not
+ * fit (caller falls back to the plain URL). */
+static int percent_encode_secret(const char* secret, char* out, size_t cap) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t o = 0;
+    if (!secret || !out || cap == 0) return -1;
+    for (const unsigned char* p = (const unsigned char*)secret; *p; p++) {
+        unsigned char c = *p;
+        if (c == '\r' || c == '\n') return -1;
+        if (o + 4 > cap) return -1;      /* worst case "%XY" + NUL */
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' ||
+            c == '~') {
+            out[o++] = (char)c;
+        } else {
+            out[o++] = '%';
+            out[o++] = hex[c >> 4];
+            out[o++] = hex[c & 0xF];
+        }
+    }
+    out[o] = '\0';
+    return 0;
+}
+
 static void on_open_webui(UiWidget w, void* ud) {
     (void)w; (void)ud;
+    int webui_port = g_effective_webui_port > 0 ? g_effective_webui_port : 8765;
+    /* Mirror nanobot's _webui_browser_url: appending the bootstrap secret lets
+     * the browser land pre-authenticated. No usable secret (or an unsafe one)
+     * -> plain URL, the WebUI handles its own auth flow. */
+    if (g_effective_webui_secret[0]) {
+        char enc[512];
+        char url_a[512];
+        if (percent_encode_secret(g_effective_webui_secret, enc, _countof(enc)) == 0 &&
+            snprintf(url_a, sizeof(url_a),
+                     "http://localhost:%d/#/?bootstrapSecret=%s",
+                     webui_port, enc) > 0) {
+            wchar_t url[512];
+            if (MultiByteToWideChar(CP_UTF8, 0, url_a, -1, url, _countof(url)) > 0) {
+                ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+                return;
+            }
+        }
+    }
     wchar_t url[128];
-    int webui_port = g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765;
     swprintf_s(url, _countof(url), L"http://localhost:%d", webui_port);
     ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 }
 
 static void restore_webui_port_input(void) {
     wchar_t port[16];
-    swprintf_s(port, _countof(port), L"%d",
-               g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
+    /* Empty input = auto-detect (the 0 sentinel in config.json). */
+    if (g_cfg.webui_port > 0)
+        swprintf_s(port, _countof(port), L"%d", g_cfg.webui_port);
+    else
+        port[0] = L'\0';
     ui_page_set_text(g_page, "webuiPort", port);
 }
 
@@ -1187,12 +1269,23 @@ static int read_port_input(const char* name, int* out_port) {
     return valid;
 }
 
-static void set_chat_endpoint_from_credential(int reconnect) {
-    char secret[128] = {0};
-    credential_load(secret, sizeof(secret), NULL);
-    chat_set_endpoint(g_cfg.webui_port, secret);
-    SecureZeroMemory(secret, sizeof(secret));
-    if (reconnect) chat_reconnect_async();
+/* Like read_port_input but an empty value is valid and yields 0, the
+ * auto-detect sentinel stored in config.json. */
+static int read_webui_port_input(int* out_port) {
+    char* raw = ui_page_get_json(g_page, "webuiPort");
+    if (!raw) return 0;
+    cJSON* value = cJSON_Parse(raw);
+    ui_page_free(raw);
+    if (!value) return 0;
+    int valid = cJSON_IsString(value) && value->valuestring != NULL;
+    if (valid) {
+        if (!value->valuestring[0])
+            *out_port = 0;
+        else
+            valid = config_parse_port(value->valuestring, out_port);
+    }
+    cJSON_Delete(value);
+    return valid;
 }
 
 static void update_credential_ui(void) {
@@ -1296,7 +1389,7 @@ static void on_manage_credential(UiWidget w, void* ud) {
     char secret[128] = {0};
     if (!prompt_for_credential((HWND)ui_window_hwnd(g_win), secret)) return;
     DWORD error = ERROR_SUCCESS;
-    if (credential_store(secret, &error) == 0) { set_chat_endpoint_from_credential(1); update_credential_ui(); }
+    if (credential_store(secret, &error) == 0) { set_chat_endpoint_effective(1); update_credential_ui(); }
     else {
         wchar_t message[160];
         swprintf_s(message, _countof(message), is_zh() ? L"无法保存认证密钥（错误 %lu）。" : L"Could not save credential (error %lu).", (unsigned long)error);
@@ -1310,7 +1403,7 @@ static void on_clear_credential(UiWidget w, void* ud) {
     HWND owner = (HWND)ui_window_hwnd(g_win);
     if (MessageBoxW(owner, is_zh() ? L"确定要清除已保存的认证密钥吗？" : L"Clear the saved bootstrap secret?", is_zh() ? L"确认" : L"Confirm", MB_YESNO | MB_ICONWARNING) != IDYES) return;
     DWORD error = ERROR_SUCCESS;
-    if (credential_delete(&error) == 0) { chat_set_endpoint(g_cfg.webui_port, ""); chat_reconnect_async(); update_credential_ui(); }
+    if (credential_delete(&error) == 0) { set_chat_endpoint_effective(1); update_credential_ui(); }
     else {
         wchar_t message[160];
         swprintf_s(message, _countof(message), is_zh() ? L"无法清除认证密钥（错误 %lu）。" : L"Could not clear credential (error %lu).", (unsigned long)error);
@@ -1322,7 +1415,7 @@ static void on_clear_credential(UiWidget w, void* ud) {
 static void on_apply_network(UiWidget w, void* ud) {
     (void)w; (void)ud;
     int new_health_port = 0, new_webui_port = 0;
-    if (!read_port_input("healthPort", &new_health_port) || !read_port_input("webuiPort", &new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
+    if (!read_port_input("healthPort", &new_health_port) || !read_webui_port_input(&new_webui_port)) { restore_health_port_input(); restore_webui_port_input(); return; }
     nm_state lifecycle = nm_state_get();
     if (new_health_port != g_cfg.health_check_port && !can_edit_gateway_port()) {
         restore_health_port_input();
@@ -1352,8 +1445,9 @@ static void on_apply_network(UiWidget w, void* ud) {
         refresh_effective_health_port();
     }
     restore_health_port_input(); restore_webui_port_input();
-    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
-    if (webui_changed) set_chat_endpoint_from_credential(1);
+    refresh_effective_webui();
+    chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
+    if (webui_changed) set_chat_endpoint_effective(1);
 }
 
 static void on_btn_apply_network_mount(UiPage p, UiWidget w, void* ud) {
@@ -1821,7 +1915,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_gateway_port=Gateway 端口\n"
             "setting_gateway_port_sub=用于 /health；下次启动生效\n"
             "setting_webui_port=WebUI 端口\n"
-            "setting_webui_port_sub=仅 Manager 连接覆盖，与 Gateway 端口独立\n"
+            "setting_webui_port_sub=留空 = 自动读取 nanobot 配置的端口（默认 8765）；填入端口号可强制覆盖\n"
             "setting_credential_status=认证密钥\n"
             "setting_credential_manage=管理\n"
             "setting_credential_clear=清除\n"
@@ -1859,7 +1953,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             "setting_gateway_port=Gateway Port\n"
             "setting_gateway_port_sub=Used for /health; applies on next start\n"
             "setting_webui_port=WebUI Port\n"
-            "setting_webui_port_sub=Manager connection override only; independent of Gateway port\n"
+            "setting_webui_port_sub=Leave empty to auto-read the port from nanobot's config (fallback 8765); enter a port to override\n"
             "setting_credential_status=Bootstrap Secret\n"
             "setting_credential_manage=Manage\n"
             "setting_credential_clear=Clear\n"
@@ -1922,13 +2016,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         page_set("nanobotPath", is_zh() ? "自动检测" : "Auto-detect");
     }
 
-    /* WebUI port and Credential Manager state initial values. */
-    {
-        wchar_t wpw[16];
-        swprintf_s(wpw, _countof(wpw), L"%d",
-                   g_cfg.webui_port > 0 ? g_cfg.webui_port : 8765);
-        ui_page_set_text(g_page, "webuiPort", wpw);
-    }
+    /* WebUI port/secret and Credential Manager state initial values. The
+     * settings input shows the configured override (empty = auto); the
+     * effective endpoint used to connect is resolved from nanobot's config. */
+    refresh_effective_webui();
+    restore_webui_port_input();
     update_credential_ui();
 
     apply_theme(g_cfg.theme_mode);
@@ -1947,7 +2039,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
 
     /* Chat initial state */
     chat_ui_bind(g_page, is_zh);
-    chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
+    chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
     chat_ui_reset_idle();
     chat_ui_configure_history(config_get_active_path());
 
@@ -1993,7 +2085,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_cfg.hotkey_enabled)
         hotkey_register(hwnd);
 
-    set_chat_endpoint_from_credential(0);
+    set_chat_endpoint_effective(0);
     chat_init(hwnd, WM_CHAT_EVENT);
 
     /* Initial detect (or start, for silent-tray) off the UI thread. UI shows

@@ -1,5 +1,6 @@
 #include "nm_test.h"
 #include "process.h"
+#include <stdio.h>
 #include <stdlib.h>   /* _countof */
 #include <string.h>
 
@@ -284,6 +285,77 @@ static void test_candidates_managed_venv_empty_override_equals_unset(void) {
     venv_env_restore();
 }
 
+/* --- WebUI endpoint policy (pure parser: port + bootstrap secret) ---------- */
+
+static void test_config_webui_info_reads_port_and_secret(void) {
+    int port = 0;
+    char secret[128] = {0};
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"enabled\":true,\"host\":\"127.0.0.1\","
+        "\"port\":18791,\"path\":\"/ws\",\"token\":\"  tok  \"}}}",
+        &port, secret, sizeof(secret)) == 1);
+    TEST_CHECK(port == 18791);
+    TEST_CHECK(strcmp(secret, "tok") == 0);      /* trimmed */
+
+    /* tokenIssueSecret wins over token; enabled omitted counts as on. */
+    port = 0; secret[0] = '\0';
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"port\":9001,"
+        "\"token\":\"tok\",\"tokenIssueSecret\":\"issue\"}}}",
+        &port, secret, sizeof(secret)) == 1);
+    TEST_CHECK(port == 9001);
+    TEST_CHECK(strcmp(secret, "issue") == 0);
+
+    /* Over-long secret truncates to the 127+NUL consumer cap. */
+    char long_json[512];
+    snprintf(long_json, sizeof(long_json),
+             "{\"channels\":{\"websocket\":{\"port\":1,\"token\":\"%0*d\"}}}",
+             200, 0);
+    port = 0; secret[0] = '\0';
+    TEST_CHECK(nanobot_config_webui_info(long_json, &port, secret,
+                                         sizeof(secret)) == 1);
+    TEST_CHECK(port == 1);
+    TEST_CHECK(strlen(secret) == 127);
+}
+
+static void test_config_webui_info_rejects_unusable_values(void) {
+    int port = -1;
+    char secret[128] = "x";
+    /* No websocket channel at all. */
+    TEST_CHECK(nanobot_config_webui_info("{}", &port, secret, sizeof(secret)) == 0);
+    TEST_CHECK(port == 0);
+    TEST_CHECK(secret[0] == '\0');
+    /* Explicitly disabled channel serves no WebUI: no port, no secret. */
+    port = -1; strcpy(secret, "x");
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"enabled\":false,\"port\":1,\"token\":\"t\"}}}",
+        &port, secret, sizeof(secret)) == 0);
+    TEST_CHECK(port == 0);
+    TEST_CHECK(secret[0] == '\0');
+    /* Out-of-range port still yields a usable secret. */
+    port = -1; secret[0] = '\0';
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"port\":65536,\"token\":\"t\"}}}",
+        &port, secret, sizeof(secret)) == 1);
+    TEST_CHECK(port == 0);
+    TEST_CHECK(strcmp(secret, "t") == 0);
+    /* Whitespace-only secret yields an empty one. */
+    port = 0; secret[0] = '\0';
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"port\":8765,\"token\":\"   \"}}}",
+        &port, secret, sizeof(secret)) == 1);
+    TEST_CHECK(port == 8765);
+    TEST_CHECK(secret[0] == '\0');
+    /* Malformed / empty / NULL input; NULL out params are safe. */
+    TEST_CHECK(nanobot_config_webui_info("not json", &port, NULL, 0) == 0);
+    TEST_CHECK(nanobot_config_webui_info("", &port, NULL, 0) == 0);
+    TEST_CHECK(nanobot_config_webui_info(NULL, &port, NULL, 0) == 0);
+    port = -1;
+    TEST_CHECK(nanobot_config_webui_info(
+        "{\"channels\":{\"websocket\":{\"port\":1234}}}", NULL, NULL, 0) == 1);
+    TEST_CHECK(port == -1);                      /* untouched when out_port NULL */
+}
+
 TEST_LIST = {
     { "owned_candidate_requires_all_evidence", test_owned_candidate_requires_all_evidence },
     { "owned_candidate_must_not_predate_launcher", test_owned_candidate_must_not_predate_launcher },
@@ -291,5 +363,7 @@ TEST_LIST = {
     { "candidates_managed_venv_python_only", test_candidates_managed_venv_python_only },
     { "candidates_managed_venv_absent", test_candidates_managed_venv_absent },
     { "candidates_managed_venv_empty_override_equals_unset", test_candidates_managed_venv_empty_override_equals_unset },
+    { "config_webui_info_reads_port_and_secret", test_config_webui_info_reads_port_and_secret },
+    { "config_webui_info_rejects_unusable_values", test_config_webui_info_rejects_unusable_values },
     { NULL, NULL }
 };

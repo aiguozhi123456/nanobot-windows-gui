@@ -57,6 +57,17 @@ int   nanobot_check_running(int port);
 /* Detect a live gateway, preferring the verified port in gateway.json and
  * falling back to configured_port once (without probing it twice). */
 int   nanobot_detect_running_port(int configured_port, int* out_port);
+/* WebUI endpoint policy: nanobot's own config (~\.nanobot\config.json,
+ * channels.websocket) is authoritative for where the UI listens and which
+ * bootstrap secret it expects. The pure parser fills out_port (1..65535, or 0
+ * when absent, invalid, or the channel is disabled) and out_secret (first
+ * non-empty trimmed of tokenIssueSecret/token, capped, "" when none) from one
+ * document and returns 1 when an enabled websocket channel exists. The detector
+ * reads the shared file once and returns the detected port or fallback_port. */
+int   nanobot_config_webui_info(const char* json, int* out_port,
+                                char* out_secret, size_t secret_cap);
+int   nanobot_detect_webui(int* out_port, char* out_secret, size_t secret_cap,
+                           int fallback_port);
 /* Starts the background launcher and adopts the verified gateway state. The
  * configured health_port remains the next-launch preference; out_effective_health_port
  * receives the authoritative state-file port when valid. */
