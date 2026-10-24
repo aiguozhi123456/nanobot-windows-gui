@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* Translucent-window backdrop ------------------------------------------------
  * The UIX <window translucent> switch renders through DirectComposition with
@@ -77,6 +78,7 @@ static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manage
 #define TIMER_FOCUS_CHAT 1005
 #define TIMER_AMBIENT 1006
 #define TIMER_PULSE 1007
+#define TIMER_FIELD_DRIFT 1008
 /* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
  * and each flush costs an O(rendered-history) serialize + JSON parse. */
 #define CHAT_UI_FRAME_MS 66
@@ -408,6 +410,42 @@ static VOID CALLBACK on_timer_pulse(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick
         KillTimer(hwnd, id);
         g_pulse_phase = 0;
         break;
+    }
+}
+
+/* Backdrop color-field drift: the three gradient blobs slide on slow
+ * Lissajous paths (17-31s periods so they de-phase) — the "liquid" in the
+ * liquid-glass look. Positions go out as reactive floats; :left/:top bindings
+ * move the absolutely-positioned fields. Delta-skipped: near a turn point the
+ * sample barely moves and a set_float would only buy a wasted layout pass. */
+typedef struct {
+    const char* xk; const char* yk;
+    double bx, by, ax, ay, px, py, phx;
+} field_drift_t;
+static const field_drift_t g_field_drift[3] = {
+    { "fieldAx", "fieldAy", -20.0,  26.0, 26.0, 20.0, 23.0, 17.0, 1.2 },
+    { "fieldBx", "fieldBy", 152.0, 200.0, 30.0, 24.0, 29.0, 19.0, 2.1 },
+    { "fieldCx", "fieldCy", 168.0, 310.0, 22.0, 18.0, 31.0, 23.0, 4.0 },
+};
+static double g_field_last[3][2];
+
+static VOID CALLBACK on_timer_field_drift(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    if (!g_page || !g_hwnd) return;
+    if (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) return;
+    double t = (double)GetTickCount64() / 1000.0;
+    for (int i = 0; i < 3; i++) {
+        const field_drift_t* d = &g_field_drift[i];
+        double x = d->bx + d->ax * sin(t * 6.28318530717958647692 / d->px + d->phx);
+        double y = d->by + d->ay * sin(t * 6.28318530717958647692 / d->py + d->phx * 0.6);
+        if (fabs(x - g_field_last[i][0]) > 0.35) {
+            g_field_last[i][0] = x;
+            ui_page_set_float(g_page, d->xk, x);
+        }
+        if (fabs(y - g_field_last[i][1]) > 0.35) {
+            g_field_last[i][1] = y;
+            ui_page_set_float(g_page, d->yk, y);
+        }
     }
 }
 
@@ -2181,6 +2219,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
+    SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
     if (g_tray_enabled_effective)
         tray_add(hwnd);
     if (g_cfg.hotkey_enabled)
@@ -2234,6 +2273,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     /* KillTimer on an idle id is a harmless no-op (pulse is one-shot-ish). */
     KillTimer(hwnd, TIMER_AMBIENT);
     KillTimer(hwnd, TIMER_PULSE);
+    KillTimer(hwnd, TIMER_FIELD_DRIFT);
     chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);

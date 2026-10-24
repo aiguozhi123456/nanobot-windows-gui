@@ -35,7 +35,15 @@ export default {
       chatStatus: "",
       hover: "",
       ambientGlow: 1,
-      ringSize: 16
+      ringSize: 16,
+      /* Backdrop field drift positions (DIP). main.cpp's TIMER_FIELD_DRIFT
+         pushes Lissajous samples into these; :left/:top move the blobs. */
+      fieldAx: -20,
+      fieldAy: 26,
+      fieldBx: 152,
+      fieldBy: 200,
+      fieldCx: 168,
+      fieldCy: 310
     };
   },
   computed: {
@@ -73,33 +81,29 @@ export default {
      constraints shape the markup: radial-gradient silently IGNORES an `at`
      position prefix (center stays at default), and multi-layer comma
      backgrounds are unsupported (the value tokenizer splits function-arg
-     commas). So each field is one single-layer gradient at its default
-     center, and the net-zero flow div's RECT is what positions the blob. */
+     commas). So each field is one single-layer gradient. They drift on
+     Lissajous paths: absolutely positioned (no flow arithmetic — the old
+     net-zero margins were one bug away from a phantom band), left/top bound
+     to reactive fields that a main.cpp timer nudges. */
   .backdrop-a {
+    position: absolute;
     width: 300px;
     height: 300px;
-    margin-bottom: -300px;
-    background: radial-gradient(rgba(58, 128, 152, 0.42), rgba(58, 128, 152, 0) 70%);
+    background: radial-gradient(rgba(58, 128, 152, 0.32), rgba(58, 128, 152, 0) 70%);
   }
 
   .backdrop-b {
+    position: absolute;
     width: 300px;
     height: 300px;
-    margin-top: 220px;
-    /* -520 = -(220 margin-top + 300 height): net-zero flow, else the +20
-       residue pushes TitleBar and .body down and a phantom band shows
-       above the title bar. */
-    margin-bottom: -520px;
-    align-self: flex-end;
-    background: radial-gradient(rgba(106, 94, 188, 0.36), rgba(106, 94, 188, 0) 70%);
+    background: radial-gradient(rgba(106, 94, 188, 0.28), rgba(106, 94, 188, 0) 70%);
   }
 
   .backdrop-c {
+    position: absolute;
     width: 260px;
     height: 240px;
-    margin-bottom: -240px;
-    align-self: flex-end;
-    background: radial-gradient(rgba(96, 148, 90, 0.32), rgba(96, 148, 90, 0) 70%);
+    background: radial-gradient(rgba(96, 148, 90, 0.25), rgba(96, 148, 90, 0) 70%);
   }
 
   .titlebar-left {
@@ -767,11 +771,15 @@ export default {
     justify-content: center;
     align-items: center;
     color: var(--fg-3);
-    background: var(--btn-bg);
+    /* Smoke glass, not a solid slab: solid --btn-bg reads as a flat tile on
+       the frosted card. Active state lifts via a denser fill + border. */
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.14);
   }
 
   .theme-btn-active {
-    background: var(--bg-2);
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.34);
     color: var(--fg);
   }
 
@@ -787,12 +795,15 @@ export default {
     cursor: pointer;
     font-size: 12px;
     color: var(--fg-3);
-    background: var(--btn-bg);
+    /* Same smoke glass as .theme-btn (no solid slabs on the glass card). */
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.14);
     font-weight: 500;
   }
 
   .lang-btn-active {
-    background: var(--bg-2);
+    background: rgba(255, 255, 255, 0.18);
+    border: 1px solid rgba(255, 255, 255, 0.34);
     color: var(--fg);
     font-weight: 600;
   }
@@ -825,9 +836,9 @@ export default {
 
 <template>
   <div class="root">
-    <div class="backdrop-a"></div>
-    <div class="backdrop-b"></div>
-    <div class="backdrop-c"></div>
+    <div class="backdrop-a" :left="fieldAx" :top="fieldAy"></div>
+    <div class="backdrop-b" :left="fieldBx" :top="fieldBy"></div>
+    <div class="backdrop-c" :left="fieldCx" :top="fieldCy"></div>
     <TitleBar title="">
       <div class="titlebar-left">
         <label class="titlebar-title">{{ $t('app_title') }}</label>
