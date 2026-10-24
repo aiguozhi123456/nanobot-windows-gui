@@ -167,9 +167,9 @@ Reactive fields have defaults in `data()`, but the source of truth at startup is
 
 `ui_page_set_text` takes a `wchar_t*`; format numbers wide with `swprintf_s`. The credential status (`hasCredential` / `credentialStatus`) is pushed separately from the Credential Manager read — it is a boolean + label, never the secret itself.
 
-### i18n: inline UTF-8 byte-escaped strings in main.cpp
+### i18n: zh/en UTF-8 literals in src/i18n.c
 
-UI copy lives in **two** places and both must change together. The `.uix` references keys via `$t('settings_network')`, `$t('setting_gateway_port')`, `$t('setting_webui_port')`, `$t('setting_apply')` (plus their `_sub` variants). The actual strings are defined in `main.cpp` in zh and en blocks, with Chinese embedded as raw UTF-8 (or `\xXX` byte-escaped UTF-8 in older entries — project convention, not external `.lang` files):
+UI copy lives in **two** places and both must change together. The `.uix` references keys via `$t('settings_network')`, `$t('setting_gateway_port')`, `$t('setting_webui_port')`, `$t('setting_apply')` (plus their `_sub` variants). The actual strings are defined in `src/i18n.c` (`s_prefix_zh` / `s_prefix_en`), with Chinese embedded as raw UTF-8 (or `\xXX` byte-escaped UTF-8 in older entries — project convention, not external `.lang` files):
 
 ```c
 /* zh block */
@@ -307,9 +307,9 @@ webuiPort: "8765",
 
 - `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — **why the bootstrap secret is not a text input**: it lives in Windows Credential Manager with migrate-verify-delete and an elevated scrub helper. Read this before adding any secret field.
 - `docs/solutions/architecture-patterns/native-websocket-chat-integration.md` — the chat subsystem that *consumes* `webui_port` via `chat_set_endpoint` / `chat_ui_set_gateway`; the `ui_page_get_json` read pattern originates there (the draft input read at `chat_ui.c:208`).
-- `docs/solutions/conventions/i18n-embedded-literals-not-lang-files.md` — the project's i18n convention (embedded literals in `main.cpp`, not `.lang` files) referenced by the i18n guidance above.
+- `docs/solutions/conventions/i18n-embedded-literals-not-lang-files.md` — the project's i18n convention (embedded literals in `src/i18n.c`, not `.lang` files) referenced by the i18n guidance above.
 - `nanobot-manager/src/config.h` — `app_config` struct (`webui_port`, `health_check_port`); the legacy `legacy_webui_auth` field is migration-only and never serialized.
-- `nanobot-manager/src/main.cpp` — `on_apply_network` handler, `read_port_input` / `restore_*_port_input` helpers, the credential Manage/Clear handlers, i18n zh/en blocks, and the startup value-push block. Also `page_set` / `page_set_int` helpers.
+- `nanobot-manager/src/main.cpp` — `on_apply_network` handler, `read_port_input` / `restore_*_port_input` helpers, the credential Manage/Clear handlers, the i18n consumers (`ui_page_load_language_string` calls + `t_status` wrapper), and the startup value-push block. Also `page_set` / `page_set_int` helpers.
 - `nanobot-manager/src/chat_ui.c` — the original `ui_page_get_json` + `ui_page_free` read-on-action pattern (the send handler reading `draft`).
 - `nanobot-manager/ui/dashboard.uix` — the Network settings section markup and CSS (`.setting-col`, `.port-input`, `.apply-row`, `.apply-btn`).
 - `core-ui/docs/uix-ai-guide.md` — core-ui SFC reference (`data()`, `v-model`, `$t()`); `core-ui/include/ui_core.h` is the authoritative source for the missing `ui_text_input_on_changed` and the `type="password"` limitation.

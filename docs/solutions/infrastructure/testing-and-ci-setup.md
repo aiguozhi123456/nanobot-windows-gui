@@ -28,7 +28,7 @@ This documents how a pragmatic unit-test layer + CTest + GitHub Actions CI were 
 
 ### Pick the cleanly testable surface, then grow it
 
-The suite started with two modules and has since grown to six test executables. The testability picture is now:
+The suite started with two modules and has since grown to seven test executables. The testability picture is now:
 
 | Module | Testable? | Why |
 |---|---|---|
@@ -38,10 +38,11 @@ The suite started with two modules and has since grown to six test executables. 
 | `process.c` | ✅ `test_process` | The pure-logic helpers (PID-reuse guards, `FILETIME` comparisons, port parsing, uptime math) are unit-testable; the network/spawn side is still exercised manually. (Originally deferred — the extractable helpers were carved out later.) |
 | `chat_history.c` | ✅ `test_chat_history` | Local history persistence (append/trim/resume, size caps). File-format logic without the transport. |
 | `chat_protocol.c` | ✅ `test_chat_protocol` | The WebSocket JSON frame protocol, decoded independently of WinHTTP. Compiles `chat_history.c` alongside it. |
+| `i18n.c` | ✅ `test_i18n` | Pure string-table assembly: parses both assembled zh/en tables for line shape and key parity (prints the exact missing key), and checks every `status_*` key resolves in both languages (anti-drift). No platform deps. |
 | `chat.c` (transport) | ❌ no | WinHTTP WebSocket + connect/recv threads. The JSON frame-parsing logic now lives in `chat_protocol.c` (tested); the threaded transport remains manual. |
 | `main.cpp` | ❌ no | `WinMain`, tray, UI callbacks, message loop. Integration-test territory, not unit. |
 
-The ROI pattern: extract pure logic into a sibling file (`chat_protocol.c`, `chat_history.c`) and test *that*, leaving the I/O-heavy parent (`chat.c`) for manual verification. Six executables now, grown incrementally as logic was carved out — not a big-bang effort.
+The ROI pattern: extract pure logic into a sibling file (`chat_protocol.c`, `chat_history.c`) and test *that*, leaving the I/O-heavy parent (`chat.c`) for manual verification. Seven executables now, grown incrementally as logic was carved out — not a big-bang effort.
 
 ### Use a self-contained framework instead of vendoring one
 
@@ -102,6 +103,9 @@ target_link_libraries(test_chat_history PRIVATE cjson)
 
 nm_add_test(test_chat_protocol ${CMAKE_SOURCE_DIR}/src/chat_protocol.c ${CMAKE_SOURCE_DIR}/src/chat_history.c)
 target_link_libraries(test_chat_protocol PRIVATE cjson)
+
+nm_add_test(test_i18n ${CMAKE_SOURCE_DIR}/src/i18n.c)
+target_include_directories(test_i18n PRIVATE ${CMAKE_SOURCE_DIR}/src)
 ```
 
 Two non-obvious points:

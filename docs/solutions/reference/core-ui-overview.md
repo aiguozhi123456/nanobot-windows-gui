@@ -182,7 +182,7 @@ ui_slider_on_changed / ui_toggle_on_changed / ui_combobox_on_changed;
 ### i18n
 
 ```c
-ui_page_load_language_string(const char* locale, const char* utf8_content);  /* manager 用此嵌入 main.cpp 字面量 */
+ui_page_load_language_string(const char* locale, const char* utf8_content);  /* manager 用此传入 i18n.c 组装的语言表 */
 ui_page_load_language_file(const char* locale, const char* path);
 ui_page_load_translations(...);
 ui_page_set_locale(const char* locale);   /* 切换 → $t() 自动重 fire */
@@ -325,7 +325,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 | 响应式 JS→C | `get_json` + `free`（如读取 draft / webuiPort / webuiAuth） |
 | 生命周期回调 | 13 个 `ui_page_on_widget_mount` 挂 native click（`btn_start` / `btn_stop` / `toggle_*` / `btn_change_path` / `btn_webui` / `btn_apply_network` / `btn_send` / `theme_*` / `lang_*`） |
 | 主题 | `set_mode` / `set_cjk_font`（Segoe UI + Microsoft YaHei UI）/ `set_accent_hex("#4a7a8c")` |
-| i18n | `load_language_string` 嵌入 `main.cpp` 的 zh / en UTF-8 字面量（**非外部 `.lang` 文件**）；`set_locale` |
+| i18n | `load_language_string` 接收 `src/i18n.c` 组装的 zh / en 语言表（**非外部 `.lang` 文件**）；`set_locale` |
 
 ### 未利用的能力（潜在扩展点）
 
@@ -384,7 +384,8 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 
 | 文件 | 作用 |
 |------|------|
-| `nanobot-manager/src/main.cpp` | UI 挂载回调、tray、主题 / locale、健康定时器、chat UI 接线、嵌入式 i18n 字面量 |
+| `nanobot-manager/src/main.cpp` | UI 挂载回调、tray、主题 / locale、健康定时器、chat UI 接线 |
+| `nanobot-manager/src/i18n.c` | zh / en 语言表字面量 + status 单一来源表（组装后喂 `load_language_string`） |
 | `nanobot-manager/src/chat_ui.c` | 聊天 UI 状态层（`ui_page_get_json` / `set_json` 模式范例） |
 | `nanobot-manager/CMakeLists.txt` | core-ui 消费方式（`add_subdirectory` + link + POST_BUILD 拷贝） |
 | `nanobot-manager/ui/dashboard.uix` | 核心 UI SFC（布局 + 响应式状态 + 聊天页） |

@@ -128,6 +128,19 @@ The framework's binding of its text-measurement context to the active renderer, 
 
 Layout triggered outside that scope runs with no measure context, so text measurement silently degrades: multi-line text reports a single-line height and caret geometry reports zero advance. Event callbacks must therefore only request a layout (mark it dirty) and let the next frame's scoped layout pass perform it, never invoke layout synchronously. This is the same unbound-measure hazard named under IME Caret Position.
 
+## UI Text & Localization
+
+### Language Table
+The bilingual key-to-copy mapping the UI resolves `$t()` lookups against, assembled from one source and handed to the UI framework at startup; its Chinese and English sides must contain exactly the same keys.
+*Avoid:* language blob, language strings
+
+A key missing from the active language renders as the raw key, so zh/en parity is enforced by a unit test rather than review discipline.
+
+### Status Key
+A UI state wording key (running, stopped, starting, stopping, and their sub-lines) that is consumed through two paths at once: template `$t()` lookups and direct C++ status pushes.
+
+Because of that dual consumption, each Status Key's wording is defined exactly once and the Language Table's status entries are generated from that definition; hand-writing status wording anywhere else creates a second source that can drift.
+
 ## Window Management
 
 ### System Tray
