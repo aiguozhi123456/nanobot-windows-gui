@@ -37,6 +37,7 @@ static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
 static int       g_effective_webui_port = 8765;
 static char      g_effective_webui_secret[128] = {0};
+static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manager-activate") */
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
@@ -68,7 +69,10 @@ static void update_webui_port_sub(void);
 static void update_gateway_port_sub(void);
 static void update_credential_ui(void);
 
-static void show_main_window(void) {
+/* Surface + foreground only: restore, raise, hand over foreground -- no page
+ * switch, no input focus.  Used when a second instance asks the running one
+ * to come forward: the user keeps whatever page they were on. */
+static void surface_main_window(void) {
     if (!g_win) return;
 
     /* SW_RESTORE restores a minimized window to its previous size/position,
@@ -97,11 +101,15 @@ static void show_main_window(void) {
     }
 
     ui_window_show(g_win);
+}
 
-    /* Always land on the chat page and focus the input so the user can
-     * start typing immediately after the window surfaces (tray double-
-     * click, hotkey toggle).  The v-if remount needs a frame, so the
-     * actual focus is deferred to a one-shot timer. */
+/* Summon semantics (tray double-click, hotkey toggle): surface the window,
+ * then always land on the chat page and focus the input so the user can
+ * start typing immediately.  The v-if remount needs a frame, so the
+ * actual focus is deferred to a one-shot timer. */
+static void show_main_window(void) {
+    surface_main_window();
+
     ui_page_set_text(g_page, "page", L"chat");
     if (!g_focus_chat_pending) {
         g_focus_chat_pending = 1;
@@ -962,6 +970,13 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         ui_window_hide(g_win);
         return 0;
     }
+    if (g_msg_activate && msg == g_msg_activate) {
+        /* Second instance asked us to come forward: raise only -- keep the
+         * current page and never steal keyboard focus (that is summon
+         * semantics, reserved for tray/hotkey via show_main_window). */
+        surface_main_window();
+        return 0;
+    }
     if (msg == WM_ASYNC_RESOLVE_DONE) {
         on_resolve_done((resolve_payload*)lp, (int)wp);
         return 0;
@@ -1773,6 +1788,43 @@ static int run_autostart_mode(void) {
     return 0;
 }
 
+/* Returns 1 when this process owns the single-instance mutex and may start;
+ * returns 0 when another instance is already running (caller must exit).
+ * The existing instance is surfaced unless `autostart` -- a logon launch
+ * must never pop UI behind the user's back.  The mutex handle is
+ * intentionally leaked: the OS releases it on process exit, which is
+ * exactly the ownership lifetime we want.  RegisterWindowMessageW returns
+ * the same value for the same string in every process, so the message can
+ * be posted cross-process. */
+static int single_instance_begin(int autostart) {
+    if (!g_msg_activate)
+        g_msg_activate = RegisterWindowMessageW(L"nanobot-manager-activate");
+
+    HANDLE mutex = CreateMutexW(NULL, TRUE,
+        L"Local\\nanobot-manager-single-instance");
+    if (!mutex)
+        return 1; /* fail-open: a broken kernel object beats a blocked start */
+    if (GetLastError() != ERROR_ALREADY_EXISTS)
+        return 1;
+
+    CloseHandle(mutex);
+    if (autostart)
+        return 0;
+
+    /* Hidden (tray) windows are still found by FindWindow.  If the lookup
+     * fails the first instance is likely still creating its window -- the
+     * mutex is already taken either way, so fall back to a plain hint. */
+    HWND prev = FindWindowW(L"UiCore_Window", L"nanobot manager");
+    if (prev) {
+        PostMessageW(prev, g_msg_activate, 0, 0);
+    } else {
+        MessageBoxW(NULL,
+            L"nanobot-manager 已经在运行。\nnanobot-manager is already running.",
+            L"nanobot-manager", MB_OK | MB_ICONINFORMATION);
+    }
+    return 0;
+}
+
 int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     (void)hInst; (void)hPrev; (void)cmdLine; (void)nShow;
 
@@ -1785,6 +1837,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (has_arg(GetCommandLineW(), L"--scrub-adjacent-legacy-auth")) {
         return config_scrub_adjacent_legacy_auth() == 0 ? 0 : 1;
     }
+
+    /* Single instance: a second GUI/autostart launch exits here, before any
+     * config read or credential migration.  The maintenance modes above stay
+     * available while the GUI runs (uninstaller paths rely on them). */
+    if (!single_instance_begin(has_arg(GetCommandLineW(), L"--autostart")))
+        return 0;
 
     if (config_load(&g_cfg) != 0) {
         wchar_t message[MAX_PATH + 256];
