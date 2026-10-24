@@ -84,7 +84,10 @@ export default {
      commas). So each field is one single-layer gradient. They drift on
      Lissajous paths: absolutely positioned (no flow arithmetic — the old
      net-zero margins were one bug away from a phantom band), left/top bound
-     to reactive fields that a main.cpp timer nudges. */
+     to reactive fields that a main.cpp timer nudges. hitTransparent is
+     MANDATORY here: HitTest probes absolute children first (overlay layer),
+     so without it the field rects swallow every click/wheel aimed at the
+     content underneath. */
   .backdrop-a {
     position: absolute;
     width: 300px;
@@ -836,9 +839,9 @@ export default {
 
 <template>
   <div class="root">
-    <div class="backdrop-a" :left="fieldAx" :top="fieldAy"></div>
-    <div class="backdrop-b" :left="fieldBx" :top="fieldBy"></div>
-    <div class="backdrop-c" :left="fieldCx" :top="fieldCy"></div>
+    <div class="backdrop-a" :left="fieldAx" :top="fieldAy" hitTransparent="true"></div>
+    <div class="backdrop-b" :left="fieldBx" :top="fieldBy" hitTransparent="true"></div>
+    <div class="backdrop-c" :left="fieldCx" :top="fieldCy" hitTransparent="true"></div>
     <TitleBar title="">
       <div class="titlebar-left">
         <label class="titlebar-title">{{ $t('app_title') }}</label>
