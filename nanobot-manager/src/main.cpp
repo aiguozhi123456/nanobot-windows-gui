@@ -31,6 +31,9 @@
 #ifndef DWMWA_SYSTEMBACKDROP_TYPE
 #define DWMWA_SYSTEMBACKDROP_TYPE 38
 #endif
+#ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
+#define DWMWA_USE_IMMERSIVE_DARK_MODE 20
+#endif
 #ifndef DWMSBT_TRANSIENTWINDOW
 #define DWMSBT_TRANSIENTWINDOW 3   /* acrylic */
 #endif
@@ -131,8 +134,21 @@ static int apply_accent_acrylic(HWND hwnd, int dark) {
     return 1;
 }
 
+/* The system-backdrop material (acrylic fog brightness) follows this flag,
+ * not the app theme — without it a dark-themed window gets the LIGHT
+ * acrylic variant: dark wallpaper through a white fog = "broken dark mode".
+ * Attribute 20 on 22621+, same flag under 19 on older builds. */
+static void set_immersive_dark(HWND hwnd, int dark) {
+    BOOL val = dark ? TRUE : FALSE;
+    if (SUCCEEDED(DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                                        &val, sizeof(val))))
+        return;
+    DwmSetWindowAttribute(hwnd, 19, &val, sizeof(val));
+}
+
 static int apply_window_backdrop(HWND hwnd, int dark) {
     if (!hwnd) return 0;
+    set_immersive_dark(hwnd, dark);
     int backdrop = DWMSBT_TRANSIENTWINDOW;
     HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
                                        &backdrop, sizeof(backdrop));
@@ -144,9 +160,12 @@ static int apply_window_backdrop(HWND hwnd, int dark) {
 }
 
 static void backdrop_reapply_for_theme(int dark) {
-    /* Win11 system backdrops restyle themselves; only the accent-policy tint
-     * embeds a literal color that must follow the theme. */
-    if (g_backdrop_kind == 2 && g_hwnd)
+    if (!g_hwnd) return;
+    /* kind 1: the material tint follows the immersive-dark flag — re-set it.
+     * kind 2: the accent policy embeds a literal tint color — re-apply it. */
+    if (g_backdrop_kind == 1)
+        set_immersive_dark(g_hwnd, dark);
+    else if (g_backdrop_kind == 2)
         apply_accent_acrylic(g_hwnd, dark);
 }
 

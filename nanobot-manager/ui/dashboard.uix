@@ -67,8 +67,10 @@ export default {
     gap: 0;
   }
 
-  /* Color-field backdrop the glass surfaces blur against. Two core-ui
-     constraints shape this: radial-gradient silently IGNORES an `at`
+  /* Hue-accent fields OVER the acrylic backdrop (kept faint: on a translucent
+     window the blurred desktop is the real backdrop, and dense fields read as
+     an opaque pastel wash — the "not transparent at all" effect). Two core-ui
+     constraints shape the markup: radial-gradient silently IGNORES an `at`
      position prefix (center stays at default), and multi-layer comma
      backgrounds are unsupported (the value tokenizer splits function-arg
      commas). So each field is one single-layer gradient at its default
@@ -77,7 +79,7 @@ export default {
     width: 300px;
     height: 300px;
     margin-bottom: -300px;
-    background: radial-gradient(rgba(58, 128, 152, 0.85), rgba(58, 128, 152, 0) 70%);
+    background: radial-gradient(rgba(58, 128, 152, 0.32), rgba(58, 128, 152, 0) 70%);
   }
 
   .backdrop-b {
@@ -89,7 +91,7 @@ export default {
        above the title bar. */
     margin-bottom: -520px;
     align-self: flex-end;
-    background: radial-gradient(rgba(106, 94, 188, 0.75), rgba(106, 94, 188, 0) 70%);
+    background: radial-gradient(rgba(106, 94, 188, 0.28), rgba(106, 94, 188, 0) 70%);
   }
 
   .backdrop-c {
@@ -97,7 +99,7 @@ export default {
     height: 240px;
     margin-bottom: -240px;
     align-self: flex-end;
-    background: radial-gradient(rgba(96, 148, 90, 0.70), rgba(96, 148, 90, 0) 70%);
+    background: radial-gradient(rgba(96, 148, 90, 0.25), rgba(96, 148, 90, 0) 70%);
   }
 
   .titlebar-left {

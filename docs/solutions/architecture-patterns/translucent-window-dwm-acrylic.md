@@ -35,12 +35,18 @@ tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha
 
 - `dashboard.uix`：`<window … translucent="true"/>`。
 - `g_win` 就绪后取 HWND（`ui_window_hwnd`，ui_core.h:218）打 DWM 背景，降级链：
-  1. `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)`（Win11 22621+ 文档 API，主题自适应，切换主题无需重涂）；
+  1. 先 `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE, 应用主题)`（属性 20；22621 前的版本同义旗标在 19），**再** `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)`（Win11 22621+ 文档 API）；
   2. 失败 → `SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND)`（Win10 1803+ 未文档化；tint 烧死了主题色，`apply_theme` 里 `backdrop_reapply_for_theme` 重涂）；
   3. 都失败或 config 关闭 → `ui_window_set_translucent(g_win, 0)` 回不透明清屏。
+- 主题切换时 `backdrop_reapply_for_theme`：kind=1 重打 immersive-dark 旗标（材质雾的深浅跟着它走），kind=2 重涂 accent tint。
 - 逃生开关：config `window_transparent`（默认 1），驱动/安全软件冲突时改 0。
 
-**不打 DWM 背景的透窗窗口透出的是纯黑**——core-ui 的透明清屏和 DWM 亚克力必须成对出现，这也是日志里 `acrylic backdrop kind=1/2` 与 `opaque fallback` 两类信息的由来。
+**两个必须成对/跟随的关系：**
+
+- **不打 DWM 背景的透窗窗口透出的是纯黑**——core-ui 的透明清屏和 DWM 亚克力必须成对出现（日志 `acrylic backdrop kind=1/2` vs `opaque fallback` 的由来）。
+- **系统亚克力材质的深浅跟随 immersive-dark 旗标，不跟随应用主题**。只设 `DWMWA_SYSTEMBACKDROP_TYPE` 时材质按系统默认（多为浅色）渲染——深色主题的应用后面是一层亮白雾，深色壁纸透出来被洗成粉彩，用户看到的就是"暗色模式坏了"。`DwmSetWindowAttribute` 返回 S_OK 只说明 API 接受了，不代表视觉正确。
+
+**色场 alpha 纪律**：透窗后"玻璃要糊的对象"是真实桌面，窗内色场（`radial-gradient` 色块）只能当色相点缀——alpha ≤ 0.32 左右。本项目首版沿用不透明时代的 0.85/0.75/0.70，盖满窗口后亚克力透出的画面被搅成不透明粉彩糊，用户观感"压根没透"（管线其实在工作）。
 
 ## Why This Works
 
@@ -48,9 +54,16 @@ tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha
 
 ## Verification
 
-- 壁纸可见性：截图空白区应透出模糊壁纸色彩（视觉模型确认了壁纸山峦轮廓）；用 **CopyFromScreen 拷屏**而不是 PrintWindow——NOREDIRECTIONBITMAP 窗口没有重定向表面，PrintWindow 抓不到（见 ui-bugs/core-ui-silent-rendering-traps.md 采集条目）。
-- 回归清单：聊天页悬浮 composer、输入法键入、最小化→恢复（DComp 表面不破损）、深浅主题切换（accent tint 重涂）。
-- 日志断言：启动出现 `[app] translucent window: acrylic backdrop kind=1`。
+**目检会被骗**：窗内色场本身就是彩色渐变，深色壁纸透出来也是彩色渐变——"看起来像透"和"真的透"在肉眼层面无法区分（本项目就因此把浅色雾误判成壁纸透出放行了）。透窗验证必须用 A/B 像素对照：
+
+1. **CopyFromScreen 拷屏**（不是 PrintWindow——NOREDIRECTIONBITMAP 窗口没有重定向表面，见 ui-bugs/core-ui-silent-rendering-traps.md 采集条目）抓窗口矩形；
+2. `SetWindowPos` 把窗口平移 ~600px，等 600ms 让亚克力稳定，抓**同一屏幕区域**的纯桌面参照，再移回；
+3. 分区求均值对比：真透窗的"玻璃区"窗口均值应与桌面均值强相关（本项目实测：中心区 129,79,37 vs 桌面 144,88,37；右缘 107,75,59 vs 114,82,66——只差一层薄罩）；不透时窗口区是自己的主题色，与桌面无关。
+4. 放大目检用 2-3x 最近邻裁片，别看整窗缩略图。
+
+回归清单：聊天页悬浮 composer、输入法键入、最小化→恢复（DComp 表面不破损）、深浅主题切换（immersive-dark 旗标重打 / accent tint 重涂）、设置页 ScrollView 滚动（注意：注入滚轮的 delta 要放 `mouse_event` 第 4 参 dwData，放第 3 参 dy 等于滚 0）。
+
+日志断言：启动出现 `[app] translucent window: acrylic backdrop kind=1`。**注意 S_OK ≠ 视觉正确**——kind=1 只证明 API 接受，材质是否真的深色要靠 A/B 截图确认。
 
 ## Related Issues
 
