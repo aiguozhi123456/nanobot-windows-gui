@@ -121,6 +121,11 @@ The platform input-method UI that shows in-progress composition (for example pin
 ### Candidate Window
 The platform input-method UI that lists conversion candidates; it should follow the IME Caret Position rather than defaulting to the client origin when the host is a Custom-Drawn Text Input.
 
+### Hit-Transparent Overlay
+An absolutely positioned widget that is skipped as a hit result when nothing in its own subtree matches, so a decorative layer floating over content never intercepts clicks or wheel events.
+
+Absolute positioning in Core UI carries overlay semantics for painting and hit-testing alike: such children draw above flow content and are probed for hits before it. A purely decorative overlay therefore needs the hit-transparent switch; overlays meant to take input (floating input bars, context menus) leave it off.
+
 ## Core UI Layout & Text Measurement
 
 ### Measure Context Scope
@@ -149,6 +154,13 @@ Hover and similar state animations therefore route through the binding trampolin
 The rule that binding applications landing before a subtree's first paint are set instantly rather than animated, so an entrance animation cannot start from its invisible initial state without a forced blank beat.
 
 Because page scripts expose no timers, there is no flicker-free mount-animation path; entrance effects are avoided rather than engineered around the gate.
+
+## Liquid Glass Backdrop
+
+### Backdrop Hue Field
+One of the large, faint gradient blobs that form the liquid-glass dashboard's backdrop, lending the acrylic blur hue and depth.
+
+The blurred desktop is the real backdrop, so fields stay translucent accents — dense fields read as an opaque wash — and they must never intercept input: they paint over content but sit outside the hit chain.
 
 ## UI Text & Localization
 
