@@ -80,7 +80,7 @@ static int is_python_space(unsigned int codepoint) {
         codepoint == 0x3000;
 }
 
-static int is_ascii_bot_suffix(unsigned char value) {
+static int is_ascii_token_char(unsigned char value) {
     return (value >= 'A' && value <= 'Z') || (value >= 'a' && value <= 'z') ||
         (value >= '0' && value <= '9') || value == '_';
 }
@@ -135,7 +135,7 @@ int chat_history_is_new_command(const char* text) {
         (bytes[start + 3] != 'w' && bytes[start + 3] != 'W') || bytes[start + 4] != '@')
         return 0;
     for (offset = start + 5; offset < end; offset++)
-        if (!is_ascii_bot_suffix(bytes[offset])) return 0;
+        if (!is_ascii_token_char(bytes[offset])) return 0;
     return 1;
 }
 
@@ -148,21 +148,35 @@ int chat_history_path_from_config(const wchar_t* config_path, wchar_t* out_path,
     directory_length = slash ? (size_t)(slash - config_path + 1) : 0;
     if (directory_length + wcslen(L"chat-history.json") + 1 > out_count) return -1;
     if (directory_length) memcpy(out_path, config_path, directory_length * sizeof(wchar_t));
-    wcscpy(out_path + directory_length, L"chat-history.json");
+    wcscpy_s(out_path + directory_length, out_count - directory_length, L"chat-history.json");
     return 0;
 }
 
+/* Exactly the two named keys, each present exactly once. */
 static int exact_members(const cJSON* object, const char* first, const char* second) {
     const cJSON* child;
-    int count = 0;
+    int has_first = 0;
+    int has_second = 0;
     if (!cJSON_IsObject(object)) return 0;
     for (child = object->child; child; child = child->next) {
-        if (!child->string || (strcmp(child->string, first) != 0 && strcmp(child->string, second) != 0))
+        if (!child->string) return 0;
+        if (strcmp(child->string, first) == 0) {
+            if (has_first) return 0;   /* duplicate key */
+            has_first = 1;
+        } else if (strcmp(child->string, second) == 0) {
+            if (has_second) return 0;  /* duplicate key */
+            has_second = 1;
+        } else {
             return 0;
-        count++;
+        }
     }
-    return count == 2;
+    return has_first && has_second;
 }
+
+/* A single message must always be able to fit inside the total-text budget,
+ * or the drop-oldest trim below can never converge. */
+typedef char chat_history_static_assert_message_fits_total[
+    (CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES <= CHAT_HISTORY_MAX_TOTAL_TEXT_BYTES) ? 1 : -1];
 
 static int copy_normalized_messages(const cJSON* source, cJSON** out_messages, int strict) {
     cJSON* result;
@@ -172,8 +186,13 @@ static int copy_normalized_messages(const cJSON* source, cJSON** out_messages, i
     if (!out_messages || !cJSON_IsArray(source)) return -1;
     *out_messages = NULL;
     count = cJSON_GetArraySize(source);
-    if (count < 0 || (strict && count > CHAT_HISTORY_MAX_MESSAGES)) return -1;
-    first = !strict && count > CHAT_HISTORY_MAX_MESSAGES ? count - CHAT_HISTORY_MAX_MESSAGES : 0;
+    if (count < 0) return -1;
+    /* Size caps are a normalization policy, not a validity rule: trim to the
+     * newest CHAT_HISTORY_MAX_MESSAGES on load exactly like the serializer
+     * does, so an oversized-but-valid history is truncated and reused instead
+     * of being quarantined. `strict` stays responsible for structure, roles
+     * and ids only. */
+    first = count > CHAT_HISTORY_MAX_MESSAGES ? count - CHAT_HISTORY_MAX_MESSAGES : 0;
     for (int index = first; index < count; index++) {
         const cJSON* item = cJSON_GetArrayItem(source, index);
         const cJSON* role;
@@ -188,11 +207,15 @@ static int copy_normalized_messages(const cJSON* source, cJSON** out_messages, i
         text_length = strlen(text->valuestring);
         if (text_length > CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES) return -1;
         if (text_length > CHAT_HISTORY_MAX_TOTAL_TEXT_BYTES - total_text) {
-            if (strict) return -1;
             while (text_length > CHAT_HISTORY_MAX_TOTAL_TEXT_BYTES - total_text) {
-                const cJSON* oldest = cJSON_GetArrayItem(source, first++);
-                const cJSON* oldest_text = cJSON_GetObjectItemCaseSensitive(oldest, "text");
+                const cJSON* oldest;
+                const cJSON* oldest_text;
+                if (first > index) return -1;   /* cannot free enough budget */
+                oldest = cJSON_GetArrayItem(source, first);
+                oldest_text = oldest ? cJSON_GetObjectItemCaseSensitive(oldest, "text") : NULL;
+                if (!oldest_text || !oldest_text->valuestring) return -1;
                 total_text -= strlen(oldest_text->valuestring);
+                first++;
             }
         }
         total_text += text_length;
@@ -249,14 +272,16 @@ int chat_history_is_valid_chat_id(const char* chat_id) {
     if (length < 1 || length > 64) return 0;
     for (size_t i = 0; i < length; i++) {
         unsigned char c = (unsigned char)chat_id[i];
-        if (!is_ascii_bot_suffix(c) && c != ':' && c != '-')
+        if (!is_ascii_token_char(c) && c != ':' && c != '-')
             return 0;
     }
     return 1;
 }
 
 int chat_history_document_can_resume(const chat_history_document* document, int webui_port) {
-    return document && document->version == 2 && document->webui_port == webui_port &&
+    return document && document->version == 2 && cJSON_IsArray(document->messages) &&
+        document->webui_port >= 1 && document->webui_port <= 65535 &&
+        document->webui_port == webui_port &&
         document->resume_safe && chat_history_is_valid_chat_id(document->chat_id);
 }
 
@@ -270,7 +295,10 @@ int chat_history_parse_json(const char* json, chat_history_document* out_documen
     cJSON* chat_id;
     cJSON* resume_safe;
     if (!json || !out_document) return -1;
-    chat_history_document_init(out_document);
+    /* Release any previously owned tree so re-parsing into the same document
+     * cannot leak it. out_document must be initialized (or zeroed) by the
+     * caller — see chat_history.h. */
+    chat_history_document_free(out_document);
     length = strlen(json);
     if (json_contains_decoded_nul_escape(json, length)) return -1;
     root = cJSON_ParseWithLengthOpts(json, length, &end, 0);
@@ -316,7 +344,10 @@ int chat_history_parse_json(const char* json, chat_history_document* out_documen
     }
     out_document->version = 2;
     out_document->webui_port = port->valueint;
-    strcpy_s(out_document->chat_id, sizeof(out_document->chat_id), chat_id->valuestring);
+    if (strcpy_s(out_document->chat_id, sizeof(out_document->chat_id), chat_id->valuestring) != 0) {
+        cJSON_Delete(root);
+        return -1;
+    }
     out_document->resume_safe = cJSON_IsTrue(resume_safe) ? 1 : 0;
     cJSON_Delete(root);
     return 0;

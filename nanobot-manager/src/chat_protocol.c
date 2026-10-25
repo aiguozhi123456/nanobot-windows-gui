@@ -6,7 +6,9 @@
 int chat_protocol_resolve_attached(const char* pending_id, const char* attached_id,
     int attached_id_present, char* resolved_id, size_t resolved_id_size) {
     const char* resolved;
-    if (!chat_history_is_valid_chat_id(pending_id) || !resolved_id || resolved_id_size == 0)
+    if (!resolved_id || resolved_id_size == 0) return 0;
+    resolved_id[0] = '\0';   /* output stays defined even on rejection */
+    if (!chat_history_is_valid_chat_id(pending_id))
         return 0;
     if (attached_id_present) {
         if (!chat_history_is_valid_chat_id(attached_id) || strcmp(pending_id, attached_id) != 0)
@@ -21,6 +23,8 @@ int chat_protocol_resolve_attached(const char* pending_id, const char* attached_
 }
 
 uint64_t chat_protocol_next_generation(uint64_t generation) {
+    /* Wraps to 0 at UINT64_MAX; uniqueness is only reused after a full wrap,
+     * which cannot coincide with any in-flight event in practice. */
     return generation + 1;
 }
 

@@ -32,11 +32,17 @@ static cJSON* g_fresh_messages = NULL;
 static int g_fresh_pending = 0;
 static int g_attach_pending = 0;
 static ULONGLONG g_attach_deadline = 0;
+/* Inactivity watchdog for an in-flight turn: armed on send, re-armed on every
+ * DELTA/MESSAGE/STREAM_END frame, and expired by chat_ui_tick. Without it a
+ * gateway that accepts a frame but never answers (silent hang, dropped
+ * stream, protocol mismatch) leaves canSend disabled forever. */
+static ULONGLONG g_turn_deadline = 0;
 static int g_auto_connect_blocked = 0;
 static UiWidget g_chat_scroll = 0;
 static int g_messages_ui_dirty = 0;
 
 #define CHAT_ATTACH_TIMEOUT_MS 10000ULL
+#define CHAT_TURN_TIMEOUT_MS   60000ULL
 #define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
 /* UI renders at most the newest N messages so per-push work (serialize + JSON
  * parse + v-for rebind) stays bounded on long histories. The full array is
@@ -401,6 +407,7 @@ static void terminal_failure(const char* zh, const char* en, const char* detail)
     flush_messages_ui();
     g_attach_pending = 0;
     g_attach_deadline = 0;
+    g_turn_deadline = 0;
     g_chat_streaming = 0;
     restore_new_history_backup();
     discard_fresh_session();
@@ -424,6 +431,7 @@ static void discard_new_history_backup(void) {
 static void restore_new_history_backup(void) {
     if (g_turn_state != CHAT_TURN_NEW_WAIT_ACK) return;
     g_turn_state = CHAT_TURN_IDLE;
+    g_turn_deadline = 0;
     if (!g_new_history_backup) return;
     g_history_document.messages = NULL;
     cJSON_Delete(g_messages);
@@ -494,6 +502,7 @@ void chat_ui_reset_idle(void) {
     g_msg_next_id = 1;
     g_chat_streaming = 0;
     g_turn_state = CHAT_TURN_IDLE;
+    g_turn_deadline = 0;
     g_revision = 0;
     g_saved_revision = 0;
     if (g_page) {
@@ -522,6 +531,7 @@ void chat_ui_shutdown(void) {
     g_history_path[0] = L'\0';
     g_history_read_error = 0;
     g_turn_state = CHAT_TURN_IDLE;
+    g_turn_deadline = 0;
 }
 
 void chat_ui_on_gateway_stopped(void) {
@@ -529,6 +539,7 @@ void chat_ui_on_gateway_stopped(void) {
     g_auto_connect_blocked = 0;
     g_attach_pending = 0;
     g_attach_deadline = 0;
+    g_turn_deadline = 0;
     g_chat_streaming = 0;
     restore_new_history_backup();
     g_turn_state = CHAT_TURN_IDLE;
@@ -540,6 +551,8 @@ void chat_ui_on_gateway_stopped(void) {
 void chat_ui_tick(ULONGLONG now) {
     if (g_attach_pending && now >= g_attach_deadline)
         terminal_failure("恢复会话超时", "Session restore timed out", NULL);
+    else if (g_turn_state != CHAT_TURN_IDLE && g_turn_deadline && now >= g_turn_deadline)
+        terminal_failure("等待回复超时", "Timed out waiting for a reply", NULL);
 }
 
 void chat_ui_publish_tick(void) {
@@ -560,6 +573,11 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
     case CHAT_EVT_CONNECTED:
         /* CONNECTED can be queued behind ATTACHED; never regress a ready UI. */
         if (!chat_is_ready()) {
+            /* Cover the CONNECTED -> READY window too: if the gateway completes
+             * the upgrade but never offers a session, the attach deadline would
+             * otherwise never be armed. attach_after_ready re-arms it on READY. */
+            g_attach_pending = 1;
+            g_attach_deadline = GetTickCount64() + CHAT_ATTACH_TIMEOUT_MS;
             chat_ui_status_i18n("已连接…", "Connected…");
             set_can_send(0);
         }
@@ -615,6 +633,7 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
         flush_messages_ui();
         g_attach_pending = 0;
         g_attach_deadline = 0;
+        g_turn_deadline = 0;
         if (g_turn_state != CHAT_TURN_IDLE) persist_binding(0);
         g_chat_streaming = 0;
         restore_new_history_backup();
@@ -627,8 +646,11 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
     case CHAT_EVT_DELTA:
         if (g_turn_state == CHAT_TURN_NORMAL_WAIT_ACTIVITY)
             g_turn_state = CHAT_TURN_NORMAL_ACTIVE;
-        if (g_turn_state == CHAT_TURN_NORMAL_ACTIVE && detail && !append_delta(detail))
-            chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
+        if (g_turn_state == CHAT_TURN_NORMAL_ACTIVE) {
+            g_turn_deadline = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
+            if (detail && !append_delta(detail))
+                chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
+        }
         break;
     case CHAT_EVT_MESSAGE:
         if (g_turn_state == CHAT_TURN_NEW_WAIT_ACK) {
@@ -636,6 +658,7 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
                 g_chat_streaming = 0;
                 discard_new_history_backup();
                 g_turn_state = CHAT_TURN_IDLE;
+                g_turn_deadline = 0;
                 persist_binding(1);
                 set_can_send(can_send_now());
             }
@@ -644,9 +667,11 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
                 chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
             g_chat_streaming = 0;
             g_turn_state = CHAT_TURN_IDLE;
+            g_turn_deadline = 0;
             persist_binding(1);
             set_can_send(can_send_now());
         } else if (g_turn_state == CHAT_TURN_NORMAL_ACTIVE) {
+            g_turn_deadline = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
             if (detail && !set_last_assistant(detail, 0))
                 chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
             save_if_dirty();
@@ -657,6 +682,9 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
         if (g_turn_state == CHAT_TURN_NORMAL_WAIT_ACTIVITY)
             g_turn_state = CHAT_TURN_NORMAL_ACTIVE;
         if (g_turn_state == CHAT_TURN_NORMAL_ACTIVE) {
+            /* TURN_END (or a terminal MESSAGE) must follow shortly; keep the
+             * watchdog armed for that gap. */
+            g_turn_deadline = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
             if (detail && !set_last_assistant(detail, 1))
                 chat_ui_status_i18n("回复过长，已保留可保存的内容", "Reply is too long; the saved portion was kept");
             else if (!detail)
@@ -671,6 +699,7 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
             break;
         g_chat_streaming = 0;
         g_turn_state = CHAT_TURN_IDLE;
+        g_turn_deadline = 0;
         persist_binding(1);
         set_can_send(can_send_now());
         break;
@@ -761,6 +790,7 @@ void chat_ui_on_send(int health_running) {
         return;
     }
     g_turn_state = is_new ? CHAT_TURN_NEW_WAIT_ACK : CHAT_TURN_NORMAL_WAIT_ACTIVITY;
+    g_turn_deadline = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
     g_chat_streaming = 0;
     set_can_send(0);
     if (is_new) {

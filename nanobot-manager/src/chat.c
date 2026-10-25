@@ -62,8 +62,6 @@ static int g_shutting_down = 0;
 
 static char g_chat_id[128] = {0};
 static char g_attach_id[128] = {0};
-static char g_ws_path[256] = "/";
-static char g_token[512] = {0};
 
 static int chat_connect_locked(UINT64 generation);
 static void chat_disconnect_internal(int invalidate_events);
@@ -170,7 +168,6 @@ static void destroy_connection_handles_unlocked(void) {
     g_attached = 0;
     g_chat_id[0] = '\0';
     g_attach_id[0] = '\0';
-    SecureZeroMemory(g_token, sizeof(g_token));
 }
 
 static void reap_finished_threads_unlocked(void) {
@@ -629,7 +626,6 @@ static DWORD WINAPI connect_thread(LPVOID param) {
     g_session = session;
     g_connect = connect;
     g_websocket = websocket;
-    chat_copy_str(g_ws_path, sizeof(g_ws_path), ws_path);
     /* Publish readiness before the worker can observe an immediate peer close. */
     InterlockedExchange(&g_ready, 1);
 
@@ -824,6 +820,11 @@ void chat_set_endpoint(int webui_port, const char* bootstrap_secret) {
     LeaveCriticalSection(&g_cs);
 }
 
+/* Start a connect. generation == 0 bumps the generation lazily AFTER the
+ * early-return guards: bumping before them would orphan every event still
+ * queued for a live connection and contradict the "idempotent if already
+ * connected/connecting" contract. A non-zero generation is used verbatim
+ * (the lifecycle reconnect path has already bumped and announced it). */
 static int chat_connect_locked(UINT64 generation) {
     connect_context* context;
     if (!chat_lifecycle_operational_unlocked())
@@ -834,6 +835,8 @@ static int chat_connect_locked(UINT64 generation) {
         return 0;
 
     InterlockedExchange(&g_stop, 0);
+    if (!generation)
+        generation = invalidate_generation();
     context = (connect_context*)malloc(sizeof(*context));
     if (!context) { InterlockedExchange(&g_connecting, 0); return -1; }
     context->generation = generation;
@@ -866,7 +869,7 @@ int chat_connect(void) {
         ReleaseSRWLockExclusive(&g_disconnect_lock);
         return 0;
     }
-    result = chat_connect_locked(invalidate_generation());
+    result = chat_connect_locked(0);   /* 0: bump only if a connect really starts */
     LeaveCriticalSection(&g_cs);
     ReleaseSRWLockExclusive(&g_disconnect_lock);
     return result;
@@ -919,6 +922,7 @@ int chat_attach(const char* chat_id) {
     HINTERNET ws;
     DWORD err;
     if (!chat_history_is_valid_chat_id(chat_id)) return -1;
+    if (!g_cs_inited) return -1;
     EnterCriticalSection(&g_cs);
     if (!InterlockedCompareExchange(&g_ready, 0, 0) || !g_websocket ||
         InterlockedCompareExchange(&g_stop, 0, 0)) { LeaveCriticalSection(&g_cs); return -1; }
@@ -941,6 +945,7 @@ int chat_attach(const char* chat_id) {
 
 int chat_send(const char* utf8_text) {
     if (!utf8_text || !utf8_text[0]) return -1;
+    if (!g_cs_inited) return -1;
 
     char chat_id[128];
     HINTERNET ws;
@@ -1023,7 +1028,6 @@ void chat_shutdown(void) {
     g_lifecycle_thread = NULL;
     g_lifecycle_event = NULL;
     SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-    SecureZeroMemory(g_token, sizeof(g_token));
     LeaveCriticalSection(&g_cs);
     DeleteCriticalSection(&g_cs);
     g_cs_inited = 0;

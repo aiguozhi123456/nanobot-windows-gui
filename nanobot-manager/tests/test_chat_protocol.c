@@ -10,6 +10,23 @@ static void test_attached_resolution(void) {
     TEST_CHECK(chat_protocol_resolve_attached("session_1", "session_1", 1, resolved, sizeof(resolved)));
     TEST_CHECK(!chat_protocol_resolve_attached("session_1", "other", 1, resolved, sizeof(resolved)));
     TEST_CHECK(!chat_protocol_resolve_attached("session_1", NULL, 1, resolved, sizeof(resolved)));
+
+    /* Guard paths: NULL/zero-sized output, NULL/invalid pending id. */
+    TEST_CHECK(!chat_protocol_resolve_attached("session_1", NULL, 0, NULL, sizeof(resolved)));
+    TEST_CHECK(!chat_protocol_resolve_attached("session_1", NULL, 0, resolved, 0));
+    TEST_CHECK(!chat_protocol_resolve_attached(NULL, NULL, 0, resolved, sizeof(resolved)));
+    TEST_CHECK(strcmp(resolved, "") == 0);   /* output cleared on rejection */
+
+    /* Max-length id (64 chars): exact fit succeeds, one byte short fails. */
+    {
+        static const char max_id[65] =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        char too_small[64];
+        TEST_CHECK(chat_protocol_resolve_attached(max_id, NULL, 0, resolved, sizeof(resolved)));
+        TEST_CHECK(strcmp(resolved, max_id) == 0);
+        TEST_CHECK(!chat_protocol_resolve_attached(max_id, NULL, 0, too_small, sizeof(too_small)));
+        TEST_CHECK(too_small[0] == '\0');
+    }
 }
 
 static void test_generation_reservation(void) {

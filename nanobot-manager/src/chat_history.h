@@ -38,6 +38,8 @@ chat_history_load_result chat_history_load(const wchar_t* path, chat_history_doc
 int chat_history_quarantine_invalid(const wchar_t* path, DWORD* out_error);
 int chat_history_archive(const wchar_t* path, DWORD* out_error);
 int chat_history_copy_to_archive(const wchar_t* path, wchar_t* out_archive_path, size_t out_count, DWORD* out_error);
+/* out_document must be initialized (chat_history_document_init / zeroed) by
+ * the caller; any messages tree it still owns is released first. */
 int chat_history_parse_json(const char* json, chat_history_document* out_document);
 char* chat_history_serialize(const chat_history_document* document);
 int chat_history_save(const wchar_t* path, const chat_history_document* document, DWORD* out_error);

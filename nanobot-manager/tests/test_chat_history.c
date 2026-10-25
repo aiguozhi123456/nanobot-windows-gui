@@ -267,6 +267,21 @@ static void test_aggregate_and_path_contracts(void) {
     TEST_CHECK(error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND);
 }
 
+static void test_can_resume_requires_messages(void) {
+    chat_history_document d;
+    /* Valid v2 header but no messages tree: an incomplete document must not
+     * look resumable. */
+    make_v2(&d, NULL);
+    TEST_CHECK(!chat_history_document_can_resume(&d, 8765));
+    /* Port range must match the serializer's 1..65535 contract. */
+    d.messages = cJSON_CreateArray();
+    d.webui_port = 0;
+    TEST_CHECK(!chat_history_document_can_resume(&d, 0));
+    d.webui_port = 65536;
+    TEST_CHECK(!chat_history_document_can_resume(&d, 65536));
+    cJSON_Delete(d.messages);
+}
+
 TEST_LIST = {
     { "v1_is_legacy", test_v1_is_legacy },
     { "v2_round_trip", test_v2_round_trip },
@@ -280,5 +295,6 @@ TEST_LIST = {
     { "file_roundtrip_and_empty_overwrite", test_file_roundtrip_and_empty_overwrite },
     { "limits_and_escaped_size", test_limits_and_escaped_size },
     { "aggregate_and_path_contracts", test_aggregate_and_path_contracts },
+    { "can_resume_requires_messages", test_can_resume_requires_messages },
     { NULL, NULL }
 };
