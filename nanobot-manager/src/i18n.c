@@ -2,6 +2,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <windows.h>   /* INIT_ONCE */
 
 /* Capacity of the assembled tables. The prefix is ~1.4 KB and the status
  * table adds ~30 short lines; 8192 matches the WinMain stack buffers this
@@ -48,8 +49,7 @@ static const char s_prefix_zh[] =
     "setting_credential_status=认证密钥\n"
     "setting_credential_manage=管理\n"
     "setting_credential_clear=清除\n"
-    "setting_apply=应用\n"
-    "auto_detect=自动检测\n";
+    "setting_apply=应用\n";
 
 static const char s_prefix_en[] =
     "app_title=nanobot manager\n"
@@ -86,15 +86,15 @@ static const char s_prefix_en[] =
     "setting_credential_status=Bootstrap Secret\n"
     "setting_credential_manage=Manage\n"
     "setting_credential_clear=Clear\n"
-    "setting_apply=Apply\n"
-    "auto_detect=Auto-detect\n";
+    "setting_apply=Apply\n";
 
 /* --- Status keys: single wording source ---------------------------------------
  * Status text is both $t('status_*') in the template and pushed directly from
  * C++ via page_set. This table is the ONLY wording source: i18n_status()
  * resolves keys for the C++ push, and build_table() generates the status_*
  * portion of the blob passed to ui_page_load_language_string — the two sides
- * read one table and cannot drift. */
+ * read one table and cannot drift. Non-status keys that are pushed from C++
+ * rather than $t() live here for the same single-source reason. */
 typedef struct { const char* key; const char* zh; const char* en; } status_i18n_entry;
 
 static const status_i18n_entry g_status_i18n[] = {
@@ -118,14 +118,15 @@ static const status_i18n_entry g_status_i18n[] = {
     { "status_probe_failed",         "检测失败",                       "Detection failed" },
     { "status_probe_failed_sub",     "无法检测 nanobot 的 gateway --background 支持", "Could not probe nanobot gateway --background support" },
     { "status_start_fail",           "启动失败",                       "Start failed" },
-    { "status_not_installed",        "未安装",                         "Not installed" },
-    { "status_not_installed_sub",    "nanobot 未安装",                 "nanobot is not installed" },
     { "status_fail_no_statefile_sub","后台启动器未写入状态文件",
                                      "Background launcher did not write state file" },
     { "status_fail_open_failed_sub", "OpenProcess 失败",               "OpenProcess failed" },
     { "status_fail_stale_pid_sub",   "状态文件中的 PID 已失效",        "State file PID is stale" },
     { "status_fail_launcher_sub",    "后台启动器异常退出，未发现有效网关进程", "Background launcher exited without a valid gateway process" },
     { "status_fail_unverified_state_sub", "状态记录身份无法验证",       "State record identity cannot be verified" },
+    /* Non-status key: the nanobotPath "Auto-detect" label is pushed from C++
+     * (main.cpp), not rendered via $t() — the table keeps it single-source. */
+    { "auto_detect",                 "自动检测",                       "Auto-detect" },
 };
 
 const char* i18n_status(const char* key, int zh) {
@@ -159,12 +160,16 @@ static int append_status_i18n_lang(char* buf, size_t cap, size_t* used, int zh) 
 
 static char s_table_zh[I18N_TABLE_CAP];
 static char s_table_en[I18N_TABLE_CAP];
-static int s_tables_built = 0;
+static int  s_tables_complete = 0;
+static INIT_ONCE s_tables_once = INIT_ONCE_STATIC_INIT;
 
-/* Copy prefix, then append the status_* lines from g_status_i18n. On overflow
- * (unreachable with the current key set) fall back to the prefix alone so the
- * UI still boots — status keys then fall back to their key in $t(). */
-static void build_table(char* buf, size_t cap, const char* prefix, int zh) {
+/* Copy prefix, then append the status_* lines from g_status_i18n. Returns 1
+ * when everything fit; on overflow (unreachable with the current key set)
+ * returns 0 after emitting only the complete prefix lines that fit, so the
+ * UI still boots and every emitted line keeps the key=value\n shape — status
+ * keys then fall back to their key in $t(). */
+static int build_table(char* buf, size_t cap, const char* prefix, int zh) {
+    if (cap == 0) return 0;
     size_t used = 0;
     size_t n = strlen(prefix);
     int ok = (n + 1 <= cap);
@@ -172,20 +177,35 @@ static void build_table(char* buf, size_t cap, const char* prefix, int zh) {
     if (ok) ok = append_status_i18n_lang(buf, cap, &used, zh);
     if (!ok) {
         n = strlen(prefix);
-        if (n + 1 > cap) n = cap - 1;   /* defensive; cannot happen today */
+        if (n >= cap) n = cap - 1;
+        while (n > 0 && prefix[n - 1] != '\n') n--;   /* keep complete lines only */
         memcpy(buf, prefix, n);
         buf[n] = '\0';
     }
+    return ok;
+}
+
+static BOOL CALLBACK build_tables_once(PINIT_ONCE once, PVOID param, PVOID* ctx) {
+    (void)once; (void)param; (void)ctx;
+    int ok_zh = build_table(s_table_zh, sizeof(s_table_zh), s_prefix_zh, 1);
+    int ok_en = build_table(s_table_en, sizeof(s_table_en), s_prefix_en, 0);
+    s_tables_complete = ok_zh && ok_en;
+    return TRUE;
+}
+
+static void ensure_tables_built(void) {
+    InitOnceExecuteOnce(&s_tables_once, build_tables_once, NULL, NULL);
 }
 
 const char* i18n_table(const char* locale) {
     if (!locale) return NULL;
-    if (!s_tables_built) {
-        build_table(s_table_zh, sizeof(s_table_zh), s_prefix_zh, 1);
-        build_table(s_table_en, sizeof(s_table_en), s_prefix_en, 0);
-        s_tables_built = 1;
-    }
+    ensure_tables_built();
     if (strcmp(locale, "zh") == 0) return s_table_zh;
     if (strcmp(locale, "en") == 0) return s_table_en;
     return NULL;
+}
+
+int i18n_tables_complete(void) {
+    ensure_tables_built();
+    return s_tables_complete;
 }

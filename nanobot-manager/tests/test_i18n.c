@@ -14,11 +14,20 @@
 #define MAX_KEYS 128
 #define MAX_KEY_LEN 64
 
+static int has_key(char keys[][MAX_KEY_LEN], int count, const char* key) {
+    for (int i = 0; i < count; i++)
+        if (strcmp(keys[i], key) == 0) return 1;
+    return 0;
+}
+
 /* Parse a "key=value\n" table into its key names. Every line must contain '='
- * with a non-empty key and value, and the table must end with '\n' (the same
- * shape ui_page_load_language_string expects). Returns 0 on any violation. */
+ * with a non-empty key and value, the table must end with '\n' (the same
+ * shape ui_page_load_language_string expects), and no key may appear twice —
+ * a duplicate would make core-ui's first-wins/last-wins behavior part of the
+ * contract. Returns 0 on any violation (including a NULL table). */
 static int parse_keys(const char* table, char keys[][MAX_KEY_LEN], int* count) {
     *count = 0;
+    if (!table) return 0;
     const char* p = table;
     while (*p) {
         const char* eol = strchr(p, '\n');
@@ -29,18 +38,14 @@ static int parse_keys(const char* table, char keys[][MAX_KEY_LEN], int* count) {
         if (klen == 0 || klen >= MAX_KEY_LEN) return 0;
         if (eq + 1 == eol) return 0;        /* empty value */
         if (*count >= MAX_KEYS) return 0;
-        memcpy(keys[*count], p, klen);
-        keys[*count][klen] = '\0';
-        (*count)++;
+        char key[MAX_KEY_LEN];
+        memcpy(key, p, klen);
+        key[klen] = '\0';
+        if (has_key(keys, *count, key)) return 0;   /* duplicate key */
+        strcpy(keys[(*count)++], key);
         p = eol + 1;
     }
     return 1;
-}
-
-static int has_key(char keys[][MAX_KEY_LEN], int count, const char* key) {
-    for (int i = 0; i < count; i++)
-        if (strcmp(keys[i], key) == 0) return 1;
-    return 0;
 }
 
 static void test_tables_parse(void) {
@@ -122,11 +127,28 @@ static void test_unknown_locale(void) {
     TEST_CHECK(i18n_table("en") != NULL);
 }
 
+/* Anti-drift for the table capacity: if the key set ever outgrows
+ * I18N_TABLE_CAP, build_table silently falls back to a prefix subset and
+ * every status label degrades to its raw key while all other tests stay
+ * green (zh/en parity still holds on the truncated tables). The completeness
+ * flag plus a direct spot-check close that hole. */
+static void test_tables_complete(void) {
+    TEST_CHECK(i18n_tables_complete() == 1);
+    const char* zh = i18n_table("zh");
+    const char* en = i18n_table("en");
+    TEST_CHECK(zh != NULL && strstr(zh, "status_running=") != NULL);
+    TEST_CHECK(en != NULL && strstr(en, "status_running=") != NULL);
+    /* Non-status C++-pushed keys ride in the same table. */
+    TEST_CHECK(zh != NULL && strstr(zh, "auto_detect=") != NULL);
+    TEST_CHECK(en != NULL && strstr(en, "auto_detect=") != NULL);
+}
+
 TEST_LIST = {
     { "tables_parse",        test_tables_parse },
     { "key_parity",          test_key_parity },
     { "status_single_source", test_status_single_source },
     { "status_fallbacks",    test_status_fallbacks },
     { "unknown_locale",      test_unknown_locale },
+    { "tables_complete",     test_tables_complete },
     { NULL, NULL }
 };

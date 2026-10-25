@@ -58,7 +58,6 @@ static UiWindow  g_win   = 0;
 static app_config g_cfg  = {0};
 static UINT_PTR  g_uptime_timer = 0;
 static UINT_PTR  g_chat_ui_timer = 0;
-static int       g_theme_mode = 0;
 static int       g_tray_enabled_effective = 0;
 static int       g_allow_exit = 0;
 static int       g_tray_added = 0;
@@ -194,21 +193,21 @@ static void surface_main_window(void) {
      * global hotkey).  AttachThreadInput temporarily shares the input
      * queue with the foreground thread so the call succeeds. */
     HWND fg = GetForegroundWindow();
-    int attached = 0;
+    DWORD fg_tid = 0;
     if (fg && fg != g_hwnd) {
-        DWORD fg_tid = GetWindowThreadProcessId(fg, NULL);
-        if (fg_tid != GetCurrentThreadId()) {
+        fg_tid = GetWindowThreadProcessId(fg, NULL);
+        if (fg_tid != GetCurrentThreadId())
             AttachThreadInput(GetCurrentThreadId(), fg_tid, TRUE);
-            attached = 1;
-        }
+        else
+            fg_tid = 0;   /* our own thread: nothing was attached */
     }
     SetForegroundWindow(g_hwnd);
     SetActiveWindow(g_hwnd);
-    if (attached) {
-        AttachThreadInput(GetCurrentThreadId(),
-                          GetWindowThreadProcessId(GetForegroundWindow(), NULL),
-                          FALSE);
-    }
+    /* Detach from the thread we attached to. Querying the foreground here
+     * would return our own window after a successful steal and the detach
+     * would be a silent no-op, leaking the input-queue attachment. */
+    if (fg_tid)
+        AttachThreadInput(GetCurrentThreadId(), fg_tid, FALSE);
 
     ui_window_show(g_win);
 }
@@ -706,8 +705,11 @@ static void apply_health_result(int running, int actual_port) {
         if (!was_running) {
             start_uptime_timer((int)v.pid);
             /* nanobot's config may have appeared or changed while the gateway
-             * was down; re-read the WebUI endpoint once per RUNNING transition. */
+             * was down; re-read the WebUI endpoint once per RUNNING transition.
+             * chat_ui's binding port must follow the same refresh or history
+             * resume stays keyed on the stale startup port. */
             refresh_effective_webui();
+            chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
         }
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
@@ -1021,10 +1023,8 @@ static void on_resolve_done(resolve_payload* p, int start_intent) {
             else if (rc == NANOBOT_START_UNVERIFIED_STATE)
                 hint_key = "status_fail_unverified_state_sub";
             char buf[256];
-            if (is_zh())
-                snprintf(buf, sizeof(buf), "启动失败 (错误 %d)", rc);
-            else
-                snprintf(buf, sizeof(buf), "Start failed (error %d)", rc);
+            snprintf(buf, sizeof(buf), is_zh() ? "%s (错误 %d)" : "%s (error %d)",
+                     t_status("status_start_fail"), rc);
             /* M2: start failed -> settle to IDLE (clears RESOLVING). */
             nm_state_set_state(NM_STATE_IDLE);
             set_status("stopped", buf, t_status(hint_key));
@@ -1334,7 +1334,11 @@ static void on_stop(UiWidget w, void* ud) {
     nm_state_set_state(NM_STATE_STOPPING);
 
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
-    CreateThread(NULL, 0, stop_worker, (LPVOID)hwnd, 0, NULL);
+    /* Nobody waits on this thread; closing our handle avoids leaking one
+     * kernel object per Stop cycle (the pattern kick_*_worker use). */
+    HANDLE stop_thread = CreateThread(NULL, 0, stop_worker, (LPVOID)hwnd, 0, NULL);
+    if (stop_thread)
+        CloseHandle(stop_thread);
 }
 
 static void on_refresh(UiWidget w, void* ud) {
@@ -1344,8 +1348,10 @@ static void on_refresh(UiWidget w, void* ud) {
 
 static void on_autostart_toggle(UiWidget w, int val, void* ud) {
     (void)w; (void)ud;
-    char exe_path[MAX_PATH];
-    GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+    /* Wide path end-to-end: an ANSI round-trip would corrupt non-ASCII
+     * install paths and silently break logon autostart. */
+    wchar_t exe_path[MAX_PATH] = {0};
+    GetModuleFileNameW(NULL, exe_path, MAX_PATH);
 
     if (val) {
         autostart_enable(exe_path);
@@ -1728,7 +1734,6 @@ static void apply_theme(int mode) {
      * is read straight from JSON; an out-of-range value would index past the
      * labels[] array below. */
     if (mode < 0 || mode > 2) mode = 0;
-    g_theme_mode = mode;
     g_cfg.theme_mode = mode;
     int dark = 1;
     if (mode == 1)
@@ -2130,7 +2135,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         if (MultiByteToWideChar(CP_UTF8, 0, g_cfg.nanobot_path, -1, wpath, MAX_PATH) > 0)
             ui_page_set_text(g_page, "nanobotPath", wpath);
     } else {
-        page_set("nanobotPath", is_zh() ? "自动检测" : "Auto-detect");
+        page_set("nanobotPath", t_status("auto_detect"));
     }
 
     /* WebUI port/secret and Credential Manager state initial values. The
