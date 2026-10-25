@@ -442,6 +442,7 @@ void ChatUi::onAttached(const char* attached_id) {
     }
     statusKey("chat_status_connected");
     setCanSend(canSendNow() ? 1 : 0);
+    flushMessagesUi();
 }
 
 void ChatUi::onDisconnected() {
@@ -670,6 +671,7 @@ void ChatUi::configureHistory(const wchar_t* config_path) {
         statusKey("chat_status_history_read_failed");
     }
     chat_history_document_free(&loaded);
+    flushMessagesUi();
 }
 
 void ChatUi::resetIdle() {
