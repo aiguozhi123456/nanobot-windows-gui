@@ -160,6 +160,8 @@ static const status_i18n_entry g_status_i18n[] = {
     { "chat_status_attach_timeout",  "恢复会话超时",                    "Session restore timed out" },
     { "chat_status_turn_timeout",    "等待回复超时",                    "Timed out waiting for a reply" },
     { "chat_status_agent_working",   "正在执行任务…",                   "Working on it…" },
+    { "chat_cancel_wait",            "停止等待",                        "Stop waiting" },
+    { "chat_status_wait_cancelled",  "已停止等待，回复若稍后到达将被忽略", "Stopped waiting; a late reply will be ignored" },
 };
 
 const char* i18n_status(const char* key, int zh) {

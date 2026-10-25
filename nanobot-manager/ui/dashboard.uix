@@ -33,6 +33,7 @@ export default {
       messages: [],
       draft: "",
       canSend: true,
+      turnWaiting: false,
       chatStatusKey: "chat_status_start_nanobot",
       chatStatusDetail: "",
       hover: "",
@@ -938,10 +939,10 @@ export default {
               v-model="draft"
               :placeholder="$t('chat_placeholder')"
             />
-            <div id="btn_send" class="btn-send" focusable="true" :enabled="canSend"
-                 :opacity="hover=='btn_send' && canSend && page=='chat' ? 0.92 : 1"
+            <div id="btn_send" class="btn-send" focusable="true" :enabled="canSend || turnWaiting"
+                 :opacity="hover=='btn_send' && (canSend || turnWaiting) && page=='chat' ? 0.92 : 1"
                  @mouseenter="hin('btn_send')" @mouseleave="hout('btn_send')">
-              <label class="btn-send-label">{{ $t('chat_send') }}</label>
+              <label class="btn-send-label">{{ $t(turnWaiting ? 'chat_cancel_wait' : 'chat_send') }}</label>
             </div>
           </div>
         </div>

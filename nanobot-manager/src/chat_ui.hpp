@@ -68,6 +68,14 @@ public:
     /* False after a terminal chat failure until an explicit user retry. */
     bool canAutoConnect() const { return !auto_connect_blocked_; }
 
+    /* True while a turn is in flight: the send button doubles as a
+     * "stop waiting" control. */
+    bool turnWaiting() const { return turn_state_ != ChatTurnState::Idle; }
+    /* User-initiated soft abort of the in-flight turn (see terminalFailure
+     * soft path): fixate any partial reply, keep the socket, re-enable
+     * sending. */
+    void cancelWait();
+
     /* Send-gate predicates + scroll attach/detach, used by the mount
      * trampolines below. */
     bool canSendNow() const;
@@ -105,13 +113,17 @@ private:
 
     /* --- derived state ---------------------------------------------------- */
     void setCanSend(int enabled);
+    /* Single mutation point for the turn state: keeps the turnWaiting page
+     * field (send button label/enabled binding) in sync. */
+    void setTurnState(ChatTurnState s);
     void statusKey(const char* key);
     void statusDetail(const char* utf8);
     void attachAfterReady(const char* offered_id);
     /* hard: protocol/attach failures - tear down and block auto-connect.
-     * soft: turn timeout - keep the socket, re-enable sending (a slow tool
-     * phase must not poison a healthy connection). */
+     * soft: turn timeout / user stop - keep the socket, re-enable sending
+     * (a slow tool phase must not poison a healthy connection). */
     void terminalFailure(const char* key, const char* detail, bool hard);
+    void softAbortTurn(const char* key);
 
     /* --- per-event handlers (CHAT_EVT_*) ---------------------------------- */
     void onConnected();

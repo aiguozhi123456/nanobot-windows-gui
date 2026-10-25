@@ -9,12 +9,14 @@
 #include <string.h>
 
 #define CHAT_ATTACH_TIMEOUT_MS 10000ULL
-/* True-silence threshold for an in-flight turn: armed on send and re-armed
- * by EVERY gateway frame while the turn is open (deltas/messages re-arm via
- * their handlers, tool/progress/reasoning/other interim frames via
- * onActivity). 90 s of total silence means the agent is genuinely hung;
- * slow tools keep emitting interim frames and never trip this. */
-#define CHAT_TURN_TIMEOUT_MS   90000ULL
+/* True-silence ceiling for an in-flight turn: armed on send, re-armed by
+ * every gateway frame (deltas/messages via their handlers, any other event
+ * via onActivity). Upstream sends NO websocket traffic during tool
+ * execution (tool events are unimplemented upstream), and tool chains with
+ * flaky network retries observed > 5 minutes of pure silence - so the
+ * ceiling is generous. A genuinely hung gateway costs at most this long;
+ * the send button turns into a "stop waiting" control meanwhile. */
+#define CHAT_TURN_TIMEOUT_MS   600000ULL
 #define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
 /* UI renders at most the newest N messages so per-push work (serialize +
  * JSON parse + v-for rebind) stays bounded on long histories. The full
@@ -269,7 +271,7 @@ void ChatUi::discardNewHistoryBackup() {
 
 void ChatUi::restoreNewHistoryBackup() {
     if (turn_state_ != ChatTurnState::NewWaitAck) return;
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
     if (new_history_backup_.empty()) return;
     messages_ = std::move(new_history_backup_);
@@ -332,6 +334,11 @@ void ChatUi::setCanSend(int enabled) {
     if (page_) ui_page_set_bool(page_, "canSend", enabled ? 1 : 0);
 }
 
+void ChatUi::setTurnState(ChatTurnState s) {
+    turn_state_ = s;
+    if (page_) ui_page_set_bool(page_, "turnWaiting", s != ChatTurnState::Idle ? 1 : 0);
+}
+
 void ChatUi::statusKey(const char* key) {
     nm_page_set_utf8(page_, "chatStatusKey", key ? key : "");
 }
@@ -374,35 +381,55 @@ void ChatUi::attachAfterReady(const char* offered_id) {
     statusKey("chat_status_restoring");
 }
 
-void ChatUi::terminalFailure(const char* key, const char* detail, bool hard) {
+/* Soft abort shared by the turn watchdog and the user's "stop waiting":
+   the turn is abandoned but the socket and session stay up. Late frames are
+   ignored by the Idle state; sending is available again immediately. */
+void ChatUi::softAbortTurn(const char* key) {
     int had_fresh = fresh_pending_ ? 1 : 0;
     if (draft_.active)
-        commitCanonical(NULL);   /* fixate the partial reply before teardown */
+        commitCanonical(NULL);   /* fixate the partial reply */
     flushMessagesUi();
     attach_pending_ = false;
     attach_deadline_ = 0;
     turn_deadline_ = 0;
     restoreNewHistoryBackup();
     discardFreshSession();
-    turn_state_ = ChatTurnState::Idle;
-    /* Only an attempted message makes the binding unsafe. Attachment and
-       connection failures preserve a previously safe resume point. */
+    setTurnState(ChatTurnState::Idle);
+    /* Only an attempted message makes the binding unsafe. */
     if (chat_protocol_should_persist_unsafe(had_fresh, history_.resume_safe))
+        persistBinding(0);
+    if (key && key[0]) statusKey(key);
+    setCanSend(canSendNow() ? 1 : 0);
+    flushMessagesUi();
+}
+
+void ChatUi::terminalFailure(const char* key, const char* detail, bool hard) {
+    if (!hard) {
+        softAbortTurn(key);
+        return;
+    }
+    flushMessagesUi();
+    attach_pending_ = false;
+    attach_deadline_ = 0;
+    turn_deadline_ = 0;
+    restoreNewHistoryBackup();
+    discardFreshSession();
+    setTurnState(ChatTurnState::Idle);
+    /* Attachment and connection failures preserve a previously safe resume
+       point; only an attempted message makes it unsafe. */
+    if (!fresh_pending_ && chat_protocol_should_persist_unsafe(0, history_.resume_safe))
         persistBinding(0);
     if (detail && detail[0]) statusDetail(detail);
     else statusKey(key);
-    if (hard) {
-        /* Protocol/attach failure: the socket is not trustworthy. */
-        auto_connect_blocked_ = true;
-        setCanSend(0);
-        chat_client().disconnectAsync();
-    } else {
-        /* Soft turn timeout: the gateway was silent for the whole window but
-         * the socket itself never errored. Keep it; late frames are ignored
-         * by the Idle state, and sending is available again immediately. */
-        setCanSend(canSendNow() ? 1 : 0);
-        flushMessagesUi();
-    }
+    /* Protocol/attach failure: the socket is not trustworthy. */
+    auto_connect_blocked_ = true;
+    setCanSend(0);
+    chat_client().disconnectAsync();
+}
+
+void ChatUi::cancelWait() {
+    if (turn_state_ == ChatTurnState::Idle) return;
+    softAbortTurn("chat_status_wait_cancelled");
 }
 
 /* --- per-event handlers ------------------------------------------------------ */
@@ -482,7 +509,7 @@ void ChatUi::onDisconnected() {
         persistBinding(0);
     }
     restoreNewHistoryBackup();
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     saveIfDirty();
     if (!auto_connect_blocked_)
         statusKey("chat_status_disconnected");
@@ -491,7 +518,7 @@ void ChatUi::onDisconnected() {
 
 void ChatUi::onDelta(const char* chunk) {
     if (turn_state_ == ChatTurnState::NormalWaitActivity)
-        turn_state_ = ChatTurnState::NormalActive;
+        setTurnState(ChatTurnState::NormalActive);
     if (turn_state_ != ChatTurnState::NormalActive) return;
     turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
     if (!chunk) return;
@@ -506,7 +533,7 @@ void ChatUi::onMessage(const char* detail) {
         if (detail && strcmp(detail, "New session started.") == 0) {
             draft_.clear();
             discardNewHistoryBackup();
-            turn_state_ = ChatTurnState::Idle;
+            setTurnState(ChatTurnState::Idle);
             turn_deadline_ = 0;
             persistBinding(1);
             setCanSend(canSendNow() ? 1 : 0);
@@ -514,7 +541,7 @@ void ChatUi::onMessage(const char* detail) {
     } else if (turn_state_ == ChatTurnState::NormalWaitActivity) {
         if (detail && !commitCanonical(detail))
             statusKey("chat_status_reply_too_long");
-        turn_state_ = ChatTurnState::Idle;
+        setTurnState(ChatTurnState::Idle);
         turn_deadline_ = 0;
         persistBinding(1);
         setCanSend(canSendNow() ? 1 : 0);
@@ -529,7 +556,7 @@ void ChatUi::onMessage(const char* detail) {
 
 void ChatUi::onStreamEnd(const char* detail) {
     if (turn_state_ == ChatTurnState::NormalWaitActivity)
-        turn_state_ = ChatTurnState::NormalActive;
+        setTurnState(ChatTurnState::NormalActive);
     if (turn_state_ != ChatTurnState::NormalActive) return;
     /* TURN_END (or a terminal MESSAGE) must follow shortly; keep the
      * watchdog armed for that gap. */
@@ -546,7 +573,7 @@ void ChatUi::onTurnEnd() {
     if (turn_state_ != ChatTurnState::NormalActive) return;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate a stream without canonical text */
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
     persistBinding(1);
     setCanSend(canSendNow() ? 1 : 0);
@@ -714,7 +741,7 @@ void ChatUi::resetIdle() {
     messages_.clear();
     next_msg_id_ = 1;
     draft_.clear();
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
     revision_ = 0;
     saved_revision_ = 0;
@@ -744,7 +771,7 @@ void ChatUi::shutdown() {
     health_fn_ = NULL;
     history_path_[0] = L'\0';
     history_read_error_ = false;
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
 }
 
@@ -757,7 +784,7 @@ void ChatUi::onGatewayStopped() {
     if (draft_.active)
         commitCanonical(NULL);   /* fixate a half-streamed reply */
     restoreNewHistoryBackup();
-    turn_state_ = ChatTurnState::Idle;
+    setTurnState(ChatTurnState::Idle);
     saveIfDirty();
     statusKey("chat_status_start_nanobot");
     setCanSend(0);
@@ -780,6 +807,10 @@ static void on_send_click(UiWidget widget, void* userdata) {
     (void)widget;
     (void)userdata;
     ChatUi& ui = chat_ui();
+    if (ui.turnWaiting()) {
+        ui.cancelWait();   /* the send button doubles as "stop waiting" */
+        return;
+    }
     if (ui.canSendNow() || ui.canRetryNow())
         ui.onSend(ui.gatewayRunning() ? 1 : 0);
 }
