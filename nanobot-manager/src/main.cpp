@@ -78,9 +78,14 @@ static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manage
 #define TIMER_AMBIENT 1006
 #define TIMER_PULSE 1007
 #define TIMER_FIELD_DRIFT 1008
+#define TIMER_BG_TRIM 1009
 /* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
  * and each flush costs an O(rendered-history) serialize + JSON parse. */
 #define CHAT_UI_FRAME_MS 66
+/* Background working-set re-trim cadence: while hidden/minimized, lazily
+ * re-faulted pages are handed back to the OS on this cadence. The timer runs
+ * always but only acts when the window is not on screen. */
+#define BG_TRIM_INTERVAL_MS 60000
 /* Running-state LED heartbeat period. The .status-dot opacity transition is
  * the same duration, so each toggle animates one full sine-like cycle. */
 #define LED_HEARTBEAT_MS 1400
@@ -177,6 +182,8 @@ static VOID CALLBACK on_timer_focus_chat(HWND, UINT, UINT_PTR, DWORD);
 static void update_webui_port_sub(void);
 static void update_gateway_port_sub(void);
 static void update_credential_ui(void);
+static void on_window_hidden(void);
+static void on_window_shown(void);
 
 /* Surface + foreground only: restore, raise, hand over foreground -- no page
  * switch, no input focus.  Used when a second instance asks the running one
@@ -210,6 +217,7 @@ static void surface_main_window(void) {
         AttachThreadInput(GetCurrentThreadId(), fg_tid, FALSE);
 
     ui_window_show(g_win);
+    on_window_shown();
 }
 
 /* Summon semantics (tray double-click, hotkey toggle): surface the window,
@@ -519,6 +527,51 @@ static VOID CALLBACK on_timer_ambient(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
     }
     dimmed = !dimmed;
     ui_page_set_float(g_page, "ambientGlow", dimmed ? 0.45f : 1.0f);
+}
+
+/* --- Background memory trim ------------------------------------------------
+ * While hidden to tray / minimized, SetProcessWorkingSetSize(-1,-1) hands the
+ * resident pages back to the OS; they return as soft faults on demand, so
+ * nothing needs restoring on show. The two purely decorative timers are
+ * paused while hidden: drift wakes the UI thread ~30x/s only to early-return
+ * and both timers re-dirty pages behind the trim. The 66ms chat publish tick
+ * and the uptime timer keep running -- background stream output must keep
+ * draining. */
+static int g_decor_paused = 0;
+
+static void pause_decorative_timers(void) {
+    if (!g_hwnd || g_decor_paused) return;
+    KillTimer(g_hwnd, TIMER_AMBIENT);
+    KillTimer(g_hwnd, TIMER_FIELD_DRIFT);
+    g_decor_paused = 1;
+}
+
+static void on_window_hidden(void) {
+    if (!g_hwnd || g_decor_paused) return;
+    pause_decorative_timers();
+    if (SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1))
+        nm_log(NM_LOG_DEBUG, "app", "working set trimmed (hidden)");
+    else
+        nm_log(NM_LOG_DEBUG, "app", "working set trim failed: %lu", GetLastError());
+}
+
+static void on_window_shown(void) {
+    if (!g_hwnd || !g_decor_paused) return;
+    /* Drift positions are sampled from absolute time and the heartbeat is a
+     * two-state static, so restarting here is visually seamless. */
+    SetTimer(g_hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
+    SetTimer(g_hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
+    g_decor_paused = 0;
+}
+
+/* Steady-state re-trim: acts only while hidden/minimized, no-op when the
+ * window is on screen, so it needs no start/stop management across the
+ * visibility transitions above. */
+static VOID CALLBACK on_timer_bg_trim(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)hwnd; (void)msg; (void)id; (void)tick;
+    if (g_hwnd && (!IsWindowVisible(g_hwnd) || IsIconic(g_hwnd)) &&
+        SetProcessWorkingSetSize(GetCurrentProcess(), (SIZE_T)-1, (SIZE_T)-1))
+        nm_log(NM_LOG_DEBUG, "app", "working set re-trimmed (background)");
 }
 
 static int can_edit_gateway_port(void) {
@@ -1178,8 +1231,17 @@ static void on_btn_install_mount(UiPage p, UiWidget w, void* ud) {
 static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
                                       UINT_PTR uid, DWORD_PTR ref) {
     (void)uid; (void)ref;
+    if (msg == WM_SIZE) {
+        /* Observation only -- the message must still reach core-ui's own
+         * proc for layout. Minimize/restore drive the background trim. */
+        if (wp == SIZE_MINIMIZED)
+            on_window_hidden();
+        else if (wp == SIZE_RESTORED || wp == SIZE_MAXIMIZED)
+            on_window_shown();
+    }
     if (msg == WM_CLOSE && g_tray_enabled_effective && !g_allow_exit) {
         ui_window_hide(g_win);
+        on_window_hidden();
         return 0;
     }
     if (g_msg_activate && msg == g_msg_activate) {
@@ -1284,6 +1346,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) {
             ui_window_hide(g_win);
             ShowWindow(g_hwnd, SW_HIDE);
+            on_window_hidden();
         } else {
             show_main_window();
         }
@@ -2230,6 +2293,9 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
+    SetTimer(hwnd, TIMER_BG_TRIM, BG_TRIM_INTERVAL_MS, on_timer_bg_trim);
+    if (!IsWindowVisible(hwnd))
+        on_window_hidden();   /* autostart-silent mounts the page unshown */
     if (g_tray_enabled_effective)
         tray_add(hwnd);
     if (g_cfg.hotkey_enabled)
@@ -2284,6 +2350,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     KillTimer(hwnd, TIMER_AMBIENT);
     KillTimer(hwnd, TIMER_PULSE);
     KillTimer(hwnd, TIMER_FIELD_DRIFT);
+    KillTimer(hwnd, TIMER_BG_TRIM);
     chat_ui_shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);
