@@ -50,27 +50,35 @@ static void test_owned_candidate_must_not_predate_launcher(void) {
  * temp dir, lay down stub Scripts\ exes, then restore the original value. */
 
 static wchar_t* g_venv_saved_value;
-static int      g_venv_was_set;
+static int      g_venv_was_set;    /* the value existed before the test */
+static int      g_venv_saved_ok;   /* its bytes were successfully captured */
 
 static void venv_env_save(void) {
     DWORD need = GetEnvironmentVariableW(L"NANOBOT_VENV", NULL, 0);
-    g_venv_was_set = 0;
+    /* Latch "was set" from the first query so a later malloc/read failure can
+     * never downgrade a pre-existing value to "absent" (restore would then
+     * DELETE it instead of restoring it). */
+    g_venv_was_set = (need > 0);
+    g_venv_saved_ok = 0;
     if (need == 0) return;                 /* unset (or empty == unset)        */
     g_venv_saved_value = (wchar_t*)malloc((size_t)need * sizeof(wchar_t));
     if (!g_venv_saved_value) return;
-    g_venv_was_set =
+    g_venv_saved_ok =
         GetEnvironmentVariableW(L"NANOBOT_VENV", g_venv_saved_value, need)
         == need - 1;                       /* chars copied, excl. NUL          */
 }
 
 static void venv_env_restore(void) {
-    if (g_venv_was_set)
+    if (g_venv_saved_ok)
         SetEnvironmentVariableW(L"NANOBOT_VENV", g_venv_saved_value);
-    else
+    else if (!g_venv_was_set)
         SetEnvironmentVariableW(L"NANOBOT_VENV", NULL);
+    /* was set but not captured: leave the variable alone -- we cannot restore
+     * it, and deleting it would only make the corruption worse. */
     free(g_venv_saved_value);
     g_venv_saved_value = NULL;
     g_venv_was_set = 0;
+    g_venv_saved_ok = 0;
 }
 
 /* Create an empty marker file at <dir>\<rel>; parent dirs must exist. */

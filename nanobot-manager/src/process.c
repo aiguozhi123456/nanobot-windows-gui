@@ -240,7 +240,8 @@ static output_result output_has_background_token(const wchar_t* path) {
             matched++;
             if (matched == 12) {
                 int next = fgetc(file);
-                found = next == EOF || !token_char((unsigned char)next);
+                if (!found)   /* sticky: a later "--background-mode" token must not unfind it */
+                    found = next == EOF || !token_char((unsigned char)next);
                 if (next != EOF) ungetc(next, file);
                 matched = 0;
             }
@@ -379,9 +380,13 @@ int nanobot_resolve(const app_config* cfg, nm_resolution* out, int quick) {
     if (cfg && cfg->nanobot_path && cfg->nanobot_path[0]) {
         wchar_t configured_path[MAX_PATH];
         if (!MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, cfg->nanobot_path,
-                                 -1, configured_path, _countof(configured_path)) ||
-            GetFileAttributesW(configured_path) == INVALID_FILE_ATTRIBUTES ||
-            (GetFileAttributesW(configured_path) & FILE_ATTRIBUTE_DIRECTORY)) {
+                                 -1, configured_path, _countof(configured_path))) {
+            out->status = NM_RES_PROBE_FAILED;
+            return 0;
+        }
+        DWORD configured_attributes = GetFileAttributesW(configured_path);
+        if (configured_attributes == INVALID_FILE_ATTRIBUTES ||
+            (configured_attributes & FILE_ATTRIBUTE_DIRECTORY)) {
             out->status = NM_RES_PROBE_FAILED;
             return 0;
         }
@@ -720,7 +725,13 @@ void nm_state_set_wait_handle(HANDLE v) {
  * The callback only uses its own heap-allocated ctx (hwnd+msg) and frees it
  * exactly once (WT_EXECUTEONLYONCE guarantees single-fire).
  */
-struct wait_ctx { HWND hwnd; UINT msg; };   /* heap; owned by the callback */
+struct wait_ctx { HWND hwnd; UINT msg; };   /* heap; owned by the armed wait */
+
+/* ctx of the currently armed wait. Cleared by wait_callback when it consumes
+ * it, and by nanobot_unwatch_handle when a cancelled (never-fired) one-shot
+ * leaves the ctx otherwise orphaned. Not part of g_state, but the same
+ * arm/drain ordering discipline applies: unwatch drains before clearing. */
+static struct wait_ctx* g_wait_ctx = NULL;
 
 static VOID CALLBACK wait_callback(PVOID param, BOOLEAN timeout) {
     (void)timeout;                         /* INFINITE wait -- timeout is always FALSE      */
@@ -729,6 +740,7 @@ static VOID CALLBACK wait_callback(PVOID param, BOOLEAN timeout) {
     /* Post, don't send -- the callback runs on a thread-pool thread that must
      * not block on the UI thread's message pump. */
     PostMessageW(ctx->hwnd, ctx->msg, 0, 0);
+    if (g_wait_ctx == ctx) g_wait_ctx = NULL;   /* consumed; unwatch must not free it */
     free(ctx);                             /* single-fire => freed exactly once             */
 }
 
@@ -747,6 +759,13 @@ int nanobot_watch_handle(HWND hwnd, UINT msg) {
     ctx->hwnd = hwnd;
     ctx->msg  = msg;
 
+    /* Self-defense: never orphan an already-armed registration (it would leak
+     * and could double-post WM_CHILD_EXITED). Unregister BEFORE arming the
+     * replacement so both can never fire for the same signal; the drain inside
+     * unwatch also guarantees the old callback consumed/cleared g_wait_ctx. */
+    if (nm_state_get_wait_handle() != NULL)
+        nanobot_unwatch_handle();
+
     HANDLE wait = NULL;
     BOOL ok = RegisterWaitForSingleObject(&wait, h, wait_callback, ctx, INFINITE,
                   WT_EXECUTEONLYONCE | WT_EXECUTEINPERSISTENTTHREAD);
@@ -757,6 +776,7 @@ int nanobot_watch_handle(HWND hwnd, UINT msg) {
         return (int)err ? (int)err : 1;
     }
 
+    g_wait_ctx = ctx;
     nm_state_set_wait_handle(wait);
     nm_log(NM_LOG_DEBUG, "process", "watch_handle: armed one-shot wait");
     return 0;
@@ -774,6 +794,15 @@ void nanobot_unwatch_handle(void) {
      * the callback could fire into a closed handle). */
     UnregisterWaitEx(w, INVALID_HANDLE_VALUE);
     nm_state_set_wait_handle(NULL);
+    /* The drain above guarantees the callback is not running: either it fired
+     * and cleared g_wait_ctx itself, or it never will and the ctx is ours to
+     * free (this is the normal shutdown path -- nm_state_clear unwatches a
+     * still-alive gateway, cancelling the one-shot). */
+    if (g_wait_ctx) {
+        struct wait_ctx* ctx = g_wait_ctx;
+        g_wait_ctx = NULL;
+        free(ctx);
+    }
     nm_log(NM_LOG_DEBUG, "process", "watch_handle: unregistered");
 }
 
@@ -798,9 +827,12 @@ void nm_state_close_handle(void) {
 /* Shutdown helper. Idempotent. Closing an OpenProcess handle does NOT kill the
  * process -- safe to call when stop_on_exit is off (gateway stays running). */
 void nm_state_clear(void) {
+    FILETIME zero;
+    ZeroMemory(&zero, sizeof(zero));
     nm_state_close_handle();              /* unwatch + close, serialized            */
     nm_state_set_pid(0);
     nm_state_set_start_tick(0);
+    nm_state_set_create_ft(&zero);        /* reuse guard must not outlive the handle */
 }
 
 /* --- P5b: attach to an already-running gateway we didn't start ---------------
@@ -827,9 +859,9 @@ int nanobot_attach_running(void) {
     if (nanobot_read_gateway_state(&gs) != 0 || !gs.found || gs.pid == 0)
         return -1;                       /* no state -> nothing to attach         */
 
-    /* 3. OpenProcess with the rights the wait + query path need. */
-    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
-                           FALSE, gs.pid);
+    /* 3. OpenProcess with the rights the wait + query + stop paths need. */
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION |
+                           PROCESS_TERMINATE, FALSE, gs.pid);
     if (!h) {
         nm_log(NM_LOG_WARN, "process", "attach: OpenProcess failed pid=%u err=%lu",
             (unsigned)gs.pid, (unsigned long)GetLastError());
@@ -927,11 +959,15 @@ static int identity_to_filetime(const char* id, FILETIME* out) {
         if (sep && sep > id && sep[1]) {
             char left[32], right[32];
             size_t llen = (size_t)(sep - id);
-            if (llen < sizeof(left)) {
+            size_t rlen = strlen(sep + 1);
+            /* Reject (rather than truncate) an over-long side: a silently
+             * truncated number would parse as valid and turn a parse failure
+             * into a confident, WRONG create time. */
+            if (llen < sizeof(left) && rlen < sizeof(right)) {
                 memcpy(left, id, llen);
                 left[llen] = '\0';
-                strncpy(right, sep + 1, sizeof(right) - 1);
-                right[sizeof(right) - 1] = '\0';
+                memcpy(right, sep + 1, rlen);
+                right[rlen] = '\0';
                 char* end_l = NULL;
                 char* end_r = NULL;
                 unsigned long hi = strtoul(left, &end_l, 0);
@@ -1001,18 +1037,21 @@ static int iso8601_parse(const char* iso, SYSTEMTIME* st,
     if (*p == '+' || *p == '-') {
         int sign = (*p == '+') ? 1 : -1;
         int oh = 0, om = 0;
+        /* Clamp the zone before any arithmetic: oh/om come straight from a
+         * state-file string and large values would overflow the minute math
+         * (or make sscanf itself undefined). Real zones are <= +14:00. */
         /* +HH:MM or +HHMM */
-        if (sscanf_s(p + 1, "%d:%d", &oh, &om) == 2) {
+        if (sscanf_s(p + 1, "%d:%d", &oh, &om) == 2 && oh >= 0 && oh <= 14 && om >= 0 && om <= 59) {
             *has_zone = 1;
             *offset_min = sign * (oh * 60 + om);
             return 1;
         }
-        if (sscanf_s(p + 1, "%2d%2d", &oh, &om) == 2) {
+        if (sscanf_s(p + 1, "%2d%2d", &oh, &om) == 2 && oh >= 0 && oh <= 14 && om >= 0 && om <= 59) {
             *has_zone = 1;
             *offset_min = sign * (oh * 60 + om);
             return 1;
         }
-        if (sscanf_s(p + 1, "%d", &oh) == 1) {
+        if (sscanf_s(p + 1, "%d", &oh) == 1 && oh >= 0 && oh <= 14) {
             *has_zone = 1;
             *offset_min = sign * (oh * 60);
             return 1;
@@ -1154,7 +1193,7 @@ int nanobot_detect_webui(int* out_port, char* out_secret, size_t secret_cap,
         return fallback_port;
     }
     wchar_t wpath[MAX_PATH];
-    int n = swprintf_s(wpath, _countof(wpath),
+    int n = _snwprintf_s(wpath, _countof(wpath), _TRUNCATE,
         L"%s\\.nanobot\\config.json", profile);
     CoTaskMemFree(profile);             /* always free, even on truncation-fail */
     if (n <= 0) return fallback_port;
@@ -1202,7 +1241,7 @@ int nanobot_read_gateway_state(nm_gateway_state* out) {
     }
 
     wchar_t wpath[MAX_PATH];
-    int n = swprintf_s(wpath, _countof(wpath),
+    int n = _snwprintf_s(wpath, _countof(wpath), _TRUNCATE,
         L"%s\\.nanobot\\run\\gateway.json", profile);
     CoTaskMemFree(profile);             /* always free, even on truncation-fail */
     if (n <= 0) return -1;
@@ -1324,17 +1363,24 @@ static int gateway_state_pid_is_verified_live(const nm_gateway_state* state) {
 }
 
 int nanobot_detect_running_port(int configured_port, int* out_port) {
-    if (out_port) *out_port = 0;
     nm_gateway_state state;
+    int state_probed;
+    if (out_port) *out_port = 0;
     ZeroMemory(&state, sizeof(state));
-    if (nanobot_read_gateway_state(&state) == 0 && state.found &&
+    /* Only suppress the configured-port probe when the state branch actually
+     * probed that port: a state file whose port EQUALS the configured port but
+     * whose pid fails verification (stale/pid-reused) must not hide a live
+     * gateway running on the configured port. */
+    state_probed = nanobot_read_gateway_state(&state) == 0 && state.found &&
         state.port >= 1 && state.port <= 65535 &&
-        gateway_state_pid_is_verified_live(&state) && nanobot_check_running(state.port)) {
+        gateway_state_pid_is_verified_live(&state);
+    if (state_probed && nanobot_check_running(state.port)) {
         if (out_port) *out_port = state.port;
         return 1;
     }
     if (configured_port >= 1 && configured_port <= 65535 &&
-        (!state.found || state.port != configured_port) && nanobot_check_running(configured_port)) {
+        (!state_probed || state.port != configured_port) &&
+        nanobot_check_running(configured_port)) {
         if (out_port) *out_port = configured_port;
         return 1;
     }
@@ -1365,7 +1411,8 @@ static HANDLE open_gateway_log_handle(void) {
     wchar_t* slash = wcsrchr(exe, L'\\');
     if (!slash) return NULL;
     *slash = L'\0';
-    if (swprintf_s(path, _countof(path), L"%s\\nanobot-gateway.log", exe) <= 0)
+    if (_snwprintf_s(path, _countof(path), _TRUNCATE,
+                     L"%s\\nanobot-gateway.log", exe) < 0)
         return NULL;
 
     WIN32_FILE_ATTRIBUTE_DATA fad;
@@ -1374,7 +1421,8 @@ static HANDLE open_gateway_log_handle(void) {
         sz.LowPart = fad.nFileSizeLow;
         sz.HighPart = fad.nFileSizeHigh;
         if (sz.QuadPart > 512LL * 1024LL &&
-            swprintf_s(bak, _countof(bak), L"%s\\nanobot-gateway.bak", exe) > 0) {
+            _snwprintf_s(bak, _countof(bak), _TRUNCATE,
+                         L"%s\\nanobot-gateway.bak", exe) >= 0) {
             MoveFileExW(path, bak, MOVEFILE_REPLACE_EXISTING);
         }
     }
@@ -1436,6 +1484,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     siex.StartupInfo.wShowWindow = SW_HIDE;
 
     LPPROC_THREAD_ATTRIBUTE_LIST attributes = NULL;
+    int attributes_initialized = 0;   /* Delete* must never run on an uninitialized list */
     if (gateway_log) {
         siex.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
         siex.StartupInfo.hStdOutput = gateway_log;
@@ -1444,8 +1493,10 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
         SIZE_T attribute_size = 0;
         InitializeProcThreadAttributeList(NULL, 1, 0, &attribute_size);
         attributes = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attribute_size);
-        if (attributes &&
-            InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size)) {
+        if (attributes)
+            attributes_initialized =
+                InitializeProcThreadAttributeList(attributes, 1, 0, &attribute_size);
+        if (attributes_initialized) {
             HANDLE inheritable_handles[1];
             inheritable_handles[0] = gateway_log;
             if (!UpdateProcThreadAttribute(attributes, 0,
@@ -1454,6 +1505,7 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
                 DeleteProcThreadAttributeList(attributes);
                 free(attributes);
                 attributes = NULL;
+                attributes_initialized = 0;
             } else {
                 siex.lpAttributeList = attributes;
             }
@@ -1543,9 +1595,12 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     for (int attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) Sleep(200);    /* let the launcher overwrite stale file */
 
-        DWORD process_access = SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
-        if (gs.port >= 1 && gs.port <= 65535 && gs.port != health_port)
-            process_access |= PROCESS_TERMINATE;
+        /* PROCESS_TERMINATE is ALWAYS required: nanobot_stop's tier-1 hard
+         * kill runs TerminateProcess on this published handle in the common
+         * (port-matching) case too — without it Stop fails with
+         * ERROR_ACCESS_DENIED while the UI still flips to IDLE. */
+        DWORD process_access = SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION |
+                               PROCESS_TERMINATE;
         h = OpenProcess(process_access, FALSE, gs.pid);
         if (!h) {
             nm_log(NM_LOG_ERROR, "process", "nanobot_start: OpenProcess(pid=%d) failed err=%d",
@@ -1919,8 +1974,13 @@ int nanobot_stop(void) {
     temp_file[0] = L'\0';
     DWORD tplen = GetTempPathW(MAX_PATH, temp_path);
     if (tplen > 0 && tplen < MAX_PATH) {
-        swprintf_s(temp_file, _countof(temp_file),
-            L"%snanobot-stop-%d.txt", temp_path, (int)effective_pid);
+        /* Unique name (same pattern as run_probe): a predictable
+         * %TEMP%\nanobot-stop-<pid>.txt can be pre-created by anything with
+         * temp-dir write access, and a fixed name breaks on overlapping
+         * stops. GetTempFileNameW reserves the name; CREATE_ALWAYS below
+         * re-opens it for the child. */
+        if (!GetTempFileNameW(temp_path, L"nms", 0, temp_file))
+            temp_file[0] = L'\0';   /* too long / no temp: spawn without capture */
     }
 
     SECURITY_ATTRIBUTES sa;
@@ -1930,8 +1990,10 @@ int nanobot_stop(void) {
 
     HANDLE stdout_file = NULL;
     if (temp_file[0]) {
+        /* FILE_SHARE_DELETE so a stop CLI that outlives the wait cannot keep
+         * its inherited handle blocking the later DeleteFileW cleanup. */
         stdout_file = CreateFileW(temp_file,
-            GENERIC_WRITE, FILE_SHARE_READ, &sa,
+            GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
             CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
         if (stdout_file == INVALID_HANDLE_VALUE) {
             nm_log(NM_LOG_WARN, "process", "nanobot stop: CreateFileW(temp) failed err=%d",
@@ -2072,6 +2134,14 @@ cleanup:
     nm_state_close_handle();
     nm_state_set_pid(0);
     nm_state_set_start_tick(0);
+    {
+        /* A stale create_ft would make a later stop that adopts a state-file
+         * pid suspect "pid reuse" against the OLD creation time and skip the
+         * kill while still reporting success. */
+        FILETIME zero_ft;
+        ZeroMemory(&zero_ft, sizeof(zero_ft));
+        nm_state_set_create_ft(&zero_ft);
+    }
     /* NOTE: do NOT nm_state_set_state(NM_STATE_IDLE) here. The state was set to
      * STOPPING by on_stop() on the UI thread, and the WM_ASYNC_STOP_DONE handler
      * owns the STOPPING->IDLE flip. Clearing it here would race with a pending

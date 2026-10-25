@@ -162,15 +162,20 @@ typedef struct {
     nm_state    state;
     int         installed;
     DWORD       pid;
-    HANDLE      handle;
+    HANDLE      handle;             /* borrowed copy: valid only while the state
+                                       machine still tracks it (see snapshot note) */
     ULONGLONG   start_tick;
-    FILETIME    create_ft;          /* PID-reuse guard (P4); zeroed when handle==NULL */
+    FILETIME    create_ft;          /* PID-reuse guard (P4); cleared together with
+                                       the handle by nm_state_close_handle/_clear */
 } nm_process_view;
 
 /* Call once at WinMain start, before any worker thread exists. */
 void nm_state_init(void);
 
-/* Snapshot under CS (copies all fields). */
+/* Snapshot under CS (copies all fields). out->handle is a BORROWED copy: its
+ * validity ends when the owning state machine closes it (nm_state_close_handle
+ * / nm_state_clear). Use it only while holding the lifecycle invariant (e.g.
+ * the STOPPING window in main.cpp) or OpenProcess a fresh handle instead. */
 void nm_state_snapshot(nm_process_view* out);
 
 /* Quick peek (no full snapshot). */
@@ -188,7 +193,7 @@ ULONGLONG nm_state_get_start_tick(void);
 void      nm_state_set_start_tick(ULONGLONG v);
 
 /* P3a additions backing the OpenProcess'd real gateway handle. */
-void nm_state_get_create_ft(FILETIME* out);                 /* zeroes *out if NULL     */
+void nm_state_get_create_ft(FILETIME* out);                 /* returns early if out==NULL */
 void nm_state_set_create_ft(const FILETIME* v);              /* no-op if v==NULL        */
 void nm_state_get_resolved_exe(char* buf, size_t buf_size);  /* fills caller's buffer   */
 void nm_state_set_resolved_exe(const char* exe);
