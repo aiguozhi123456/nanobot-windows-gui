@@ -140,6 +140,12 @@ NORMAL_ACTIVE
 
 A normal request distinguishes a complete first `message` from a streaming response. A first `message` is sufficient to finish a non-stream or inline command, including commands whose inline path does not publish `turn_end`. A first `delta` or `stream_end` establishes streaming activity and advances to `NORMAL_ACTIVE`; only then may `turn_end` complete the turn. This prevents a delayed old terminal event from re-enabling send during the next streamed turn.
 
+### Watchdog on True Silence, Not on Tool Latency
+
+An agent turn can legitimately run minutes: MCP tools (web fetches, shell) and reasoning phases happen before the first content frame. Interim frames — `message` frames with `kind: tool_hint/progress/reasoning` and every other unhandled event (`reasoning_delta`, `goal_status`, `file_edit`, ...) — are not rendered, but each one is posted as `CHAT_EVT_ACTIVITY` and re-arms the in-flight-turn watchdog (when the turn is still waiting for its first content frame, the status bar also shows a "working" hint). The watchdog therefore means *N seconds with zero frames of any kind*, not *N seconds without a reply*: a 45 s MCP fetch that times out and is retried no longer reads as a hung gateway.
+
+When the watchdog does fire, the turn aborts SOFTLY: the partial draft is fixated, the binding is marked unsafe, the status shows the timeout — but the socket stays up and sending re-enables immediately (no disconnect, no auto-connect block). A genuinely dead socket surfaces on the next send or via the receive worker; killing a healthy connection over a slow turn, as an earlier hard-timeout did, lost the eventual reply entirely.
+
 Current upstream behavior gives `/new` the exact acknowledgement on both dispatch paths. The ordinary path then emits `turn_end`; the active-queue inline path does not emit a command-specific terminal event. The state machine therefore commits `/new` only on its acknowledgement and ignores `turn_end` while waiting for it.
 
 The normal-turn branch additionally depends on two verified protocol properties: events from one WebSocket are delivered in receive order, and a streamed normal turn produces `delta` or `stream_end` before its `turn_end`. If the gateway ever permits a valid `turn_end`-only normal turn, sends a complete `message` before continuing the same turn, or interleaves multiple turns on one connection, local state alone cannot prove ownership; preserve `chat_id` plus a turn/stream identifier through the transport event and correlate explicitly.

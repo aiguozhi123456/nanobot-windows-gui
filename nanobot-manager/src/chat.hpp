@@ -23,7 +23,10 @@ enum ChatEventKind {
     CHAT_EVT_READY = 7,           /* detail: offered default chat_id; not attached */
     CHAT_EVT_DISCONNECT_DONE = 8, /* async disconnect finished */
     CHAT_EVT_TURN_END = 9,
-    CHAT_EVT_ATTACHED = 10        /* detail: matching attached chat_id */
+    CHAT_EVT_ATTACHED = 10,       /* detail: matching attached chat_id */
+    CHAT_EVT_ACTIVITY = 11        /* interim frame (tool/progress/reasoning/
+                                     other unhandled events): no detail, only
+                                     proves the agent is alive mid-turn */
 };
 
 struct chat_event {

@@ -9,7 +9,12 @@
 #include <string.h>
 
 #define CHAT_ATTACH_TIMEOUT_MS 10000ULL
-#define CHAT_TURN_TIMEOUT_MS   60000ULL
+/* True-silence threshold for an in-flight turn: armed on send and re-armed
+ * by EVERY gateway frame while the turn is open (deltas/messages re-arm via
+ * their handlers, tool/progress/reasoning/other interim frames via
+ * onActivity). 90 s of total silence means the agent is genuinely hung;
+ * slow tools keep emitting interim frames and never trip this. */
+#define CHAT_TURN_TIMEOUT_MS   90000ULL
 #define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
 /* UI renders at most the newest N messages so per-push work (serialize +
  * JSON parse + v-for rebind) stays bounded on long histories. The full
@@ -337,17 +342,17 @@ void ChatUi::detachScroll(UiWidget widget) {
 void ChatUi::attachAfterReady(const char* offered_id) {
     const char* wanted = offered_id;
     if (!chat_history_is_valid_chat_id(offered_id)) {
-        terminalFailure("chat_status_invalid_session", NULL);
+        terminalFailure("chat_status_invalid_session", NULL, true);
         return;
     }
     if (canResume())
         wanted = history_.chat_id;
     else if (!prepareFreshSession()) {
-        terminalFailure("chat_status_prepare_failed", NULL);
+        terminalFailure("chat_status_prepare_failed", NULL, true);
         return;
     }
     if (chat_client().attach(wanted) != 0) {
-        terminalFailure("chat_status_attach_failed", NULL);
+        terminalFailure("chat_status_attach_failed", NULL, true);
         return;
     }
     attach_pending_ = true;
@@ -356,7 +361,7 @@ void ChatUi::attachAfterReady(const char* offered_id) {
     statusKey("chat_status_restoring");
 }
 
-void ChatUi::terminalFailure(const char* key, const char* detail) {
+void ChatUi::terminalFailure(const char* key, const char* detail, bool hard) {
     int had_fresh = fresh_pending_ ? 1 : 0;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate the partial reply before teardown */
@@ -371,11 +376,20 @@ void ChatUi::terminalFailure(const char* key, const char* detail) {
        connection failures preserve a previously safe resume point. */
     if (chat_protocol_should_persist_unsafe(had_fresh, history_.resume_safe))
         persistBinding(0);
-    auto_connect_blocked_ = true;
     if (detail && detail[0]) statusDetail(detail);
     else statusKey(key);
-    setCanSend(0);
-    chat_client().disconnectAsync();
+    if (hard) {
+        /* Protocol/attach failure: the socket is not trustworthy. */
+        auto_connect_blocked_ = true;
+        setCanSend(0);
+        chat_client().disconnectAsync();
+    } else {
+        /* Soft turn timeout: the gateway was silent for the whole window but
+         * the socket itself never errored. Keep it; late frames are ignored
+         * by the Idle state, and sending is available again immediately. */
+        setCanSend(canSendNow() ? 1 : 0);
+        flushMessagesUi();
+    }
 }
 
 /* --- per-event handlers ------------------------------------------------------ */
@@ -416,7 +430,7 @@ void ChatUi::onAttached(const char* attached_id) {
             chat_history_save(history_path_, &fresh, NULL) != 0) {
             fresh.messages = NULL;
             cJSON_Delete(array);
-            terminalFailure("chat_status_save_failed", NULL);
+            terminalFailure("chat_status_save_failed", NULL, true);
             return;
         }
         history_.messages = NULL;
@@ -437,7 +451,7 @@ void ChatUi::onAttached(const char* attached_id) {
     strcpy_s(history_.chat_id, sizeof(history_.chat_id), attached_id);
     history_.resume_safe = turn_state_ == ChatTurnState::Idle ? 1 : 0;
     if (!fresh_committed && !persistBinding(history_.resume_safe)) {
-        terminalFailure("chat_status_save_failed", NULL);
+        terminalFailure("chat_status_save_failed", NULL, true);
         return;
     }
     statusKey("chat_status_connected");
@@ -527,7 +541,14 @@ void ChatUi::onTurnEnd() {
 }
 
 void ChatUi::onError(const char* detail) {
-    terminalFailure("chat_status_connection_failed", detail);
+    terminalFailure("chat_status_connection_failed", detail, true);
+}
+
+void ChatUi::onActivity() {
+    if (turn_state_ == ChatTurnState::Idle) return;
+    turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* agent alive */
+    if (turn_state_ == ChatTurnState::NormalWaitActivity)
+        statusKey("chat_status_agent_working");
 }
 
 /* --- event dispatch ----------------------------------------------------------- */
@@ -550,6 +571,7 @@ void ChatUi::onEvent(WPARAM kind, chat_event* event) {
     case CHAT_EVT_STREAM_END:      onStreamEnd(detail); break;
     case CHAT_EVT_TURN_END:        onTurnEnd(); break;
     case CHAT_EVT_ERROR:           onError(detail); break;
+    case CHAT_EVT_ACTIVITY:        onActivity(); break;
     default: break;
     }
     chat_event_free(event);
@@ -730,9 +752,9 @@ void ChatUi::onGatewayStopped() {
 
 void ChatUi::tick(ULONGLONG now) {
     if (attach_pending_ && now >= attach_deadline_)
-        terminalFailure("chat_status_attach_timeout", NULL);
+        terminalFailure("chat_status_attach_timeout", NULL, true);
     else if (turn_state_ != ChatTurnState::Idle && turn_deadline_ && now >= turn_deadline_)
-        terminalFailure("chat_status_turn_timeout", NULL);
+        terminalFailure("chat_status_turn_timeout", NULL, false);
 }
 
 void ChatUi::publishTick() {

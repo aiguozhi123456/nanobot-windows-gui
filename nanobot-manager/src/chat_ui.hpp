@@ -108,7 +108,10 @@ private:
     void statusKey(const char* key);
     void statusDetail(const char* utf8);
     void attachAfterReady(const char* offered_id);
-    void terminalFailure(const char* key, const char* detail);
+    /* hard: protocol/attach failures - tear down and block auto-connect.
+     * soft: turn timeout - keep the socket, re-enable sending (a slow tool
+     * phase must not poison a healthy connection). */
+    void terminalFailure(const char* key, const char* detail, bool hard);
 
     /* --- per-event handlers (CHAT_EVT_*) ---------------------------------- */
     void onConnected();
@@ -120,6 +123,7 @@ private:
     void onStreamEnd(const char* detail);
     void onTurnEnd();
     void onError(const char* detail);
+    void onActivity();
 
     UiPage page_ = 0;
     int (*health_fn_)(void) = nullptr;

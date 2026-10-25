@@ -410,10 +410,14 @@ void ChatClient::handleJsonFrame(uint64_t generation, const char* json, size_t l
     } else if (strcmp(event, "message") == 0) {
         cJSON* kind = cJSON_GetObjectItem(root, "kind");
         const char* kind_name = (kind && cJSON_IsString(kind)) ? kind->valuestring : NULL;
-        /* These are interim activity frames, not completed assistant turns. */
-        if (!kind_name || (strcmp(kind_name, "tool_hint") != 0 &&
-                           strcmp(kind_name, "progress") != 0 &&
-                           strcmp(kind_name, "reasoning") != 0)) {
+        /* These are interim activity frames, not completed assistant turns:
+         * not rendered, but they keep the turn watchdog alive (a slow tool
+         * must not read as a hung gateway). */
+        if (kind_name && (strcmp(kind_name, "tool_hint") == 0 ||
+                          strcmp(kind_name, "progress") == 0 ||
+                          strcmp(kind_name, "reasoning") == 0)) {
+            postEvent(CHAT_EVT_ACTIVITY, generation, NULL);
+        } else {
             cJSON* text = cJSON_GetObjectItem(root, "text");
             if (!text) text = cJSON_GetObjectItem(root, "content");
             if (text && cJSON_IsString(text) && text->valuestring)
@@ -436,6 +440,11 @@ void ChatClient::handleJsonFrame(uint64_t generation, const char* json, size_t l
         const char* msg = (detail && cJSON_IsString(detail) && detail->valuestring)
             ? detail->valuestring : "error";
         postEvent(CHAT_EVT_ERROR, generation, chat_strdup(msg));
+    } else {
+        /* Any other event (reasoning_delta, goal_status, file_edit,
+         * session_updated, ...) is not rendered, but still proves the
+         * agent is alive mid-turn. */
+        postEvent(CHAT_EVT_ACTIVITY, generation, NULL);
     }
 
     cJSON_Delete(root);

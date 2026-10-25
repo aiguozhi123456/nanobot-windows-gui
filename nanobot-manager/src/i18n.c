@@ -159,6 +159,7 @@ static const status_i18n_entry g_status_i18n[] = {
     { "chat_status_send_failed",     "发送失败",                        "Send failed" },
     { "chat_status_attach_timeout",  "恢复会话超时",                    "Session restore timed out" },
     { "chat_status_turn_timeout",    "等待回复超时",                    "Timed out waiting for a reply" },
+    { "chat_status_agent_working",   "正在执行任务…",                   "Working on it…" },
 };
 
 const char* i18n_status(const char* key, int zh) {
