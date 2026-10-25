@@ -25,10 +25,20 @@ The upstream-owned rendezvous record that identifies one background Nanobot Gate
 ### Gateway Process Identity
 The process-creation identity paired with a Gateway State Record's PID so stale state cannot target a different process after Windows reuses that PID.
 
+### Gateway Handle
+The manager-owned process handle on the real Nanobot Gateway — the instance identified by the Gateway State Record — published once and shared by every lifecycle consumer: liveness watch, uptime, and stop.
+
+Its access rights are fixed when it is opened and cannot be elevated later, so that single open must already grant everything those consumers need, most critically the ability to terminate. It is closed only through the centralized close path, which disarms the death-watch callback before closing, and the Gateway Process Identity guard is cleared together with it so a stale identity can never be paired with a later PID. It must never be the background launcher's handle: that process exits moments after a successful start, which would read as an instant crash.
+
 ### Gateway Lifecycle State
 The manager's coordinated status for resolving, idle, startup, running, stopping, and terminal unavailability, used to assign ownership of asynchronous transitions and distinguish an invited stop from an unsolicited failure.
 
 Terminal unavailability can be reached by a process-exit event or sustained failed readiness; it does not by itself prove that the process has exited.
+
+### Stop Escalation
+The ordered fallback that stops a running Nanobot Gateway: request the gateway's own stop interface first, then fall back to progressively stronger termination, ending at hard termination through the Gateway Handle.
+
+Each tier runs only when the previous one failed to end the process; a tier that fails without surfacing its failure makes the whole stop read as success while the gateway survives.
 
 ### Managed Venv Install
 The on-disk form of nanobot's official Windows one-click install: an isolated venv at `~\.nanobot\venv` (or `%NANOBOT_VENV%`) with entry points `Scripts\nanobot.exe` / `Scripts\python.exe -m nanobot`.
