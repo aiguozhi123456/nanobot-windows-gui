@@ -42,7 +42,8 @@ static const char* nm_current_test_name;
     do {                                                                    \
         if (!(cond)) {                                                      \
             nm_check_failed = 1;                                            \
-            printf("  [FAIL] %s:%d: TEST_CHECK(%s)\n",                      \
+            printf("  [FAIL] %s: %s:%d: TEST_CHECK(%s)\n",                  \
+                   nm_current_test_name ? nm_current_test_name : "?",       \
                    __FILE__, __LINE__, #cond);                              \
         }                                                                   \
     } while (0)
@@ -62,6 +63,9 @@ extern nm_test_entry nm_test_list[];
 #ifndef NM_TEST_NO_MAIN
 int main(int argc, char** argv) {
     (void)argc; (void)argv;
+    /* CTest pipes are fully buffered; unbuffered output keeps the [RUN]/[FAIL]
+     * trail diagnosable when a test aborts or hangs until the job timeout. */
+    setvbuf(stdout, NULL, _IONBF, 0);
     int total = 0, failed = 0;
     for (nm_test_entry* e = nm_test_list; e->name != NULL; e++) {
         total++;
