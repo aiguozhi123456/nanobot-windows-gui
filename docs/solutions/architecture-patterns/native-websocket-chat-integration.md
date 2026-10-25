@@ -1,7 +1,7 @@
 ---
 title: Native WebSocket Chat Integration in a Win32/C++ GUI Application
 date: 2026-07-11
-last_updated: 2026-07-14
+last_updated: 2026-10-26
 category: architecture-patterns
 module: nanobot-manager/chat
 problem_type: architecture_pattern
@@ -31,16 +31,29 @@ The durable design therefore separates transport, UI turn state, local history s
 
 | Boundary | Files | Responsibility |
 |----------|-------|----------------|
-| Transport | `chat.c` / `chat.h` | Bootstrap, WinHTTP WebSocket connect/send/receive, lifecycle threads, JSON frame parsing, window-message delivery |
-| UI state | `chat_ui.c` / `chat_ui.h` | Draft and message state, turn state machine, `/new` prepare/commit/compensation, reactive UI updates |
+| Transport | `chat.cpp` / `chat.hpp` (`ChatClient`, singleton `chat_client()`) | Bootstrap, WinHTTP WebSocket connect/send/receive, lifecycle threads, JSON frame parsing, window-message delivery, CAS connection state machine, `nm_log` observability |
+| UI state | `chat_ui.cpp` / `chat_ui.hpp` (`ChatUi`, singleton `chat_ui()`), `chat_draft.hpp` | `std::vector<ChatMsg>` message model, streaming `ChatDraft`, turn state machine, `/new` prepare/commit/compensation, publish pipeline, i18n status keys |
+| Pure decisions | `chat_protocol.cpp` / `chat_protocol.h` | Attachment resolution, generation wrapping, retry eligibility, persistence-unsafe policy, lifecycle guards |
 | History storage | `chat_history.c` / `chat_history.h` | Versioned schema, bounded normalization, load/save status, invalid-file quarantine, atomic replacement |
 | App wiring | `main.cpp` | Page/window setup, widget mounts, config-derived history location, gateway health and shutdown ordering |
 
 The transport never touches widgets or history files. The storage module never depends on Core UI or WinHTTP. The UI state layer owns the policy for when a message becomes durable and which protocol event may complete the current operation.
 
+### Express Connection Readiness as a CAS State Machine
+
+The transport's readiness was once three volatile flags (`g_ready`, `g_attached`, `g_connecting`) whose valid combinations were only implicit. They are now one `std::atomic<ChatConnState>` (`Idle / Connecting / Connected / Attached`) moved by `compare_exchange_strong` transitions. A lost CAS — a connect completing while a disconnect lands — is one of the benign races the flag set tolerated, logged at DEBUG and swallowed, never an assertion. `g_stop` (worker cancellation) and the generation counter (stale-event guard) remain separate concerns; folding them in would couple different lifetimes.
+
+Every transition, connect attempt, bootstrap result, and dispatched frame logs through the unified `nm_log` pipeline (module `chat`), so `log_level: debug` makes the transport observable end to end. Workers are `std::thread` members joined in the destructor; because `std::thread` has no try-join, each worker sets a `finished_` flag as its last statement and reaping joins only `joinable() && finished` threads — the same semantics the old `WaitForSingleObject(0)` reaping provided.
+
+### Accumulate Streams in a Draft, Publish Through One Path
+
+The message model is a `std::vector<ChatMsg{id, role, text}>`; cJSON survives only at the history-file boundary and the publish boundary. Streaming deltas append to a `ChatDraft` (amortized O(1); the previous implementation re-copied the whole accumulated text per chunk) which is NOT part of the model: it renders as a virtual trailing bubble and is never persisted mid-stream. Canonical `message`/`stream_end` text commits the draft through one `commitCanonical` path that keeps a turn to one bubble — streamed text and the server's canonical rewrite render as the same message, replacing content instead of appending a duplicate.
+
+Every model change only sets a dirty flag. The 66 ms UI timer (`publishTick`), the scroll mount hook, and shutdown are the only flush entry points; terminal events flush at the end of their handler. Status text is key-based: `ChatUi` pushes a `chat_status_*` key into `chatStatusKey` and the template renders `$t(chatStatusKey)` (locale switches re-resolve immediately); raw server error text rides a separate `chatStatusDetail` field the template prefers when non-empty.
+
 ### Marshal Network Events to the UI Thread
 
-The receive thread parses complete WebSocket frames and posts a custom window message. Any optional UTF-8 detail is heap-owned by the event and freed by `chat_ui_on_event` after processing:
+The receive thread parses complete WebSocket frames and posts a custom window message. Any optional UTF-8 detail is heap-owned by the event and freed by ``ChatUi::onEvent` after processing:
 
 ```c
 static void post_event(WPARAM kind, char* detail) {
@@ -51,7 +64,7 @@ static void post_event(WPARAM kind, char* detail) {
 
 /* Window subclass, on the UI thread. */
 if (msg == WM_CHAT_EVENT) {
-    chat_ui_on_event(wparam, (char*)lparam);
+    chat_ui().onEvent(wparam, (chat_event*)lparam);
     return 0;
 }
 ```
@@ -78,7 +91,7 @@ Use an atomic replacement sequence:
 
 An invalid history file is moved to a unique `.invalid.*` backup before a clean history may replace it. A true I/O read error instead closes a write gate: sending retries the read, and no subsequent save may overwrite an unreadable source until it is recovered, confirmed absent, or successfully quarantined.
 
-Streaming deltas update memory and mark the snapshot dirty, but do not write on every chunk. Stable boundaries such as a sent user message, complete response, stream end, turn end, compensation, disconnect, and shutdown call `save_if_dirty`. A failed save leaves the revision dirty so a later boundary can retry.
+Streaming deltas update memory and mark the snapshot dirty, but do not write on every chunk. Stable boundaries such as a sent user message, complete response, stream end, turn end, compensation, disconnect, and shutdown call `save_if_dirty`. A failed save leaves the revision dirty so a later boundary can retry. (With the `ChatDraft` model, the streamed text itself becomes durable only when it is committed — canonical text, fixation at `TURN_END`/disconnect, or teardown — so each turn lands on disk as one atomic content update.)
 
 ### Treat `/new` as a Process-Local Compensating Transition
 
@@ -135,7 +148,7 @@ The normal-turn branch additionally depends on two verified protocol properties:
 
 `stream_end` and `turn_end` answer different questions:
 
-- `stream_end` finalizes assistant content. Its optional `text`/`content` may contain the server's canonical final text, including rewritten media URLs, so it replaces the last assistant bubble instead of appending a duplicate.
+- `stream_end` finalizes assistant content. Its optional `text`/`content` may contain the server's canonical final text, including rewritten media URLs, so it replaces the turn's bubble instead of appending a duplicate.
 - `turn_end` says a normal active turn has finished and may re-enable sending when the state machine permits it.
 
 The legacy `done` alias maps to two ordered UI events: `STREAM_END` first, then `TURN_END`. Content is therefore finalized before the turn becomes idle.
@@ -181,11 +194,12 @@ Rendering both streamed text and canonical final text as separate bubbles misrep
 
 ### Startup Wiring
 
-```c
-chat_ui_bind(g_page, is_zh);
-chat_ui_set_gateway(health_running_thunk, g_cfg.webui_port);
-chat_ui_reset_idle();
-chat_ui_configure_history(config_get_active_path());
+```cpp
+chat_ui().bind(g_page);
+chat_ui().setGateway(health_running_thunk, g_effective_webui_port);
+chat_ui().resetIdle();
+chat_ui().configureHistory(config_get_active_path());
+chat_client().init(hwnd, WM_CHAT_EVENT);
 ```
 
 The config module remains the authority for installed-versus-portable location selection; chat history only derives a sibling path from the selected config path.
@@ -206,7 +220,7 @@ A normal user bubble is appended only after the transport accepts the send. A `/
 
 ### Verification Boundaries
 
-`test_chat_history` covers schema and Unicode round trips; upstream-compatible `/new` normalization; invalid document shapes and an overlong message; file round trips and empty replacement; physical and escaped NUL rejection; invalid-file quarantine; rolling retention by count and total serialized text; escaped-text file sizing; path derivation; missing files; and invalid-parameter error contracts.
+`test_chat_history` covers schema and Unicode round trips; `test_chat_draft` covers the bounded streaming buffer (accumulation, empty-chunk no-op, overflow rejection, restart); upstream-compatible `/new` normalization; invalid document shapes and an overlong message; file round trips and empty replacement; physical and escaped NUL rejection; invalid-file quarantine; rolling retention by count and total serialized text; escaped-text file sizing; path derivation; missing files; and invalid-parameter error contracts.
 
 Release verification also includes the full Windows build and CTest suite. The UI/WebSocket state machine does not yet have an automated harness; the missing inline-command completion case was found by manual testing with existing history. Real read faults, oversized-file loading, strict aggregate-load limits, quarantine failure, the UI write gate, and crash recovery are also not covered by the current unit tests. Future state-machine extraction should cover exact acknowledgement, stale content while waiting for acknowledgement, content after acknowledgement, message-only inline completion, delayed `turn_end`, `done`, disconnect/shutdown compensation, and `stream_end.text` replacement.
 
