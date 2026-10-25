@@ -65,7 +65,6 @@ static int       g_tray_icon_owned = 0;
 static HICON     g_tray_icon = NULL;
 static HWND      g_hwnd = NULL;
 static int       g_hotkey_registered = 0;
-static int       g_focus_chat_pending = 0;
 static int       g_autostart_silent = 0;
 static int       g_effective_health_port = 18790;
 static int       g_effective_webui_port = 8765;
@@ -87,12 +86,11 @@ static HANDLE    g_ui_surface_event = NULL;
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
-#define TIMER_FOCUS_CHAT 1005
-#define TIMER_AMBIENT 1006
-#define TIMER_PULSE 1007
-#define TIMER_FIELD_DRIFT 1008
-#define TIMER_BG_TRIM 1009
-#define TIMER_BACKDROP_KICK 1010
+#define TIMER_AMBIENT 1005
+#define TIMER_PULSE 1006
+#define TIMER_FIELD_DRIFT 1007
+#define TIMER_BG_TRIM 1008
+#define TIMER_BACKDROP_KICK 1009
 /* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
  * and each flush costs an O(rendered-history) serialize + JSON parse. */
 #define CHAT_UI_FRAME_MS 66
@@ -221,7 +219,6 @@ static void backdrop_kick_schedule(HWND hwnd) {
 static void tray_remove(void);
 static int has_arg(LPCWSTR cmd, const wchar_t* arg);
 static int can_edit_gateway_port(void);
-static VOID CALLBACK on_timer_focus_chat(HWND, UINT, UINT_PTR, DWORD);
 static void update_webui_port_sub(void);
 static void update_gateway_port_sub(void);
 static void update_credential_ui(void);
@@ -267,16 +264,17 @@ static void surface_main_window(void) {
 
 /* Summon semantics (tray double-click, hotkey toggle): surface the window,
  * then always land on the chat page and focus the input so the user can
- * start typing immediately.  The v-if remount needs a frame, so the
- * actual focus is deferred to a one-shot timer. */
+ * start typing immediately. Entering the chat page remounts chat_input via
+ * v-if and its mount hook focuses it; when already on the chat page there is
+ * no remount, so focus it directly — the widget is live in the tree now. */
 static void show_main_window(void) {
     surface_main_window();
 
     ui_page_set_text(g_page, "page", L"chat");
-    if (!g_focus_chat_pending) {
-        g_focus_chat_pending = 1;
-        SetTimer(g_hwnd, TIMER_FOCUS_CHAT, 50, on_timer_focus_chat);
-    }
+    UiWidget root = ui_page_root(g_page);
+    UiWidget input = ui_widget_find_by_id(root, "chat_input");
+    if (input)
+        ui_window_focus_widget(g_win, input);
 }
 
 static void tray_show_menu(HWND hwnd) {
@@ -536,22 +534,6 @@ static void set_status(const char* status, const char* text, const char* sub) {
 static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)id; (void)tick;
     chat_ui_publish_tick();
-}
-
-/* One-shot: after the page reactive variable flips to "chat", the v-if
- * remount needs a frame to materialize chat_input in the widget tree.
- * SetTimer creates a REPEATING timer, so KillTimer here makes it one-shot.
- * Without this the timer fired every 50ms for the whole session, repeatedly
- * yanking focus back to chat_input and burning CPU on the UI thread. */
-static VOID CALLBACK on_timer_focus_chat(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
-    (void)msg; (void)tick;
-    g_focus_chat_pending = 0;
-    KillTimer(hwnd, id);
-    if (!g_win || !g_page) return;
-    UiWidget root = ui_page_root(g_page);
-    UiWidget input = ui_widget_find_by_id(root, "chat_input");
-    if (input)
-        ui_window_focus_widget(g_win, input);
 }
 
 /* Running-state LED heartbeat: ping-pong the dot opacity through the
@@ -1793,6 +1775,37 @@ static void on_btn_apply_network_mount(UiPage p, UiWidget w, void* ud) {
     ui_widget_on_click(w, on_apply_network, NULL);
 }
 
+/* 端口输入框: Enter = 应用 (与 Apply 按钮同一条 on_apply_network 路径)。
+ * 输入框在 v-if 设置页里, 每次进页重挂, submit 钩子随挂载重装。 */
+static void on_port_input_mount(UiPage p, UiWidget w, void* ud) {
+    (void)p; (void)ud;
+    ui_widget_on_submit(w, on_apply_network, NULL);
+}
+
+/* 窗口级 Esc (TextInput 对 Esc 无编辑行为, 会冒泡到这里): 设置页 = 放弃
+ * 当前编辑, 两个端口输入还原为已保存配置。 */
+static void on_window_key(UiWindow win, int vk, void* ud) {
+    (void)win; (void)ud;
+    if (vk != VK_ESCAPE || !g_page) return;
+    char* raw = ui_page_get_json(g_page, "page");
+    if (!raw) return;
+    int on_settings = strstr(raw, "settings") != NULL;
+    ui_page_free(raw);
+    if (!on_settings) return;
+    restore_port_input("healthPort", g_cfg.health_check_port);
+    restore_port_input("webuiPort", g_cfg.webui_port);
+}
+
+/* chat_input 挂载即聚焦: 初始挂载与每次 v-if 重挂(进入 chat 页)都在挂载点
+ * 精确触发, 替代旧的 TIMER_FOCUS_CHAT 50ms 一次性定时器(挂载时机是确定的,
+ * 无需猜帧)。submit 装配一并收拢在此 —— mount 钩子每 id 只有一个槽位,
+ * 分开注册会互相覆盖。 */
+static void on_chat_input_mount(UiPage p, UiWidget w, void* ud) {
+    chat_ui_mount_input(p, w, ud);
+    if (g_win)
+        ui_window_focus_widget(g_win, w);
+}
+
 static void on_manage_credential_mount(UiPage p, UiWidget w, void* ud) { (void)p; (void)ud; ui_widget_on_click(w, on_manage_credential, NULL); }
 static void on_clear_credential_mount(UiPage p, UiWidget w, void* ud) { (void)p; (void)ud; ui_widget_on_click(w, on_clear_credential, NULL); }
 
@@ -2380,10 +2393,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_change_path", on_btn_change_path_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_webui", on_btn_webui_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_apply_network", on_btn_apply_network_mount, NULL);
+    ui_page_on_widget_mount(g_page, "health_port_input", on_port_input_mount, NULL);
+    ui_page_on_widget_mount(g_page, "webui_port_input", on_port_input_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_manage_credential", on_manage_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_clear_credential", on_clear_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_send", chat_ui_mount_send, NULL);
-    ui_page_on_widget_mount(g_page, "chat_input", chat_ui_mount_input, NULL);
     ui_page_on_widget_mount(g_page, "chat_scroll", chat_ui_mount_scroll, NULL);
     ui_page_on_widget_unmount(g_page, "chat_scroll", chat_ui_unmount_scroll, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_setting_choice_mount, on_theme_light);
@@ -2431,6 +2445,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
      * surfaceability to any second launch currently waiting on us. */
     if (g_ui_surface_event)
         SetEvent(g_ui_surface_event);
+    /* Registered AFTER the window exists: the mount hook's catch-up covers a
+     * current chat page, and every later v-if mount (entering chat, however
+     * the user got there) focuses the input exactly at mount time. */
+    ui_page_on_widget_mount(g_page, "chat_input", on_chat_input_mount, NULL);
+    /* Window-level Esc handling (settings page: revert port edits). */
+    ui_window_on_key(g_win, on_window_key, NULL);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
@@ -2502,10 +2522,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     if (g_chat_ui_timer) {
         KillTimer(hwnd, TIMER_CHAT_UI);
         g_chat_ui_timer = 0;
-    }
-    if (g_focus_chat_pending) {
-        KillTimer(hwnd, TIMER_FOCUS_CHAT);
-        g_focus_chat_pending = 0;
     }
     /* KillTimer on an idle id is a harmless no-op (pulse is one-shot-ish). */
     KillTimer(hwnd, TIMER_AMBIENT);

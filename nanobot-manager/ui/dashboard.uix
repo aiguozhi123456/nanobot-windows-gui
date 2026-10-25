@@ -1,4 +1,4 @@
-<window title="nanobot manager" width="430" height="500" centered="true" frameless="true" resizable="false" translucent="true"/>
+<window title="nanobot manager" width="430" height="500" centered="true" frameless="true" resizable="false" translucent="true" tabNavigation="true"/>
 
 <script>
 export default {
@@ -880,14 +880,14 @@ export default {
 
     <div class="body">
       <div class="sidebar">
-        <div class="nav" :class="page=='chat' ? 'on' : ''" @click="nav('chat')">
+        <div class="nav" :class="page=='chat' ? 'on' : ''" focusable="true" @click="nav('chat')">
           <svg width="20" height="20" viewBox="0 0 24 24">
             <path fill="currentColor" d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H5.17L4 17.17V4h16v12zM7 9h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2z"/>
           </svg>
           <div class="nav-tick" :visible="page=='chat'"></div>
         </div>
 
-        <div class="nav" :class="page=='dashboard' ? 'on' : ''" @click="nav('dashboard')">
+        <div class="nav" :class="page=='dashboard' ? 'on' : ''" focusable="true" @click="nav('dashboard')">
           <svg width="20" height="20" viewBox="0 0 24 24">
             <path fill="currentColor" d="M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm-7 14l-5-5 1.41-1.41L12 14.17l7.59-7.59L21 8l-9 9z"/>
           </svg>
@@ -896,7 +896,7 @@ export default {
 
         <div class="nav-spacer"/>
 
-        <div class="nav" :class="page=='settings' ? 'on' : ''" @click="nav('settings')">
+        <div class="nav" :class="page=='settings' ? 'on' : ''" focusable="true" @click="nav('settings')">
           <svg width="20" height="20" viewBox="0 0 24 24">
             <path fill="currentColor" d="M19.43 12.98c.04-.32.07-.65.07-.98s-.02-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.38-.31-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65A.488.488 0 0014 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.58-1.69.98l-2.49-1a.49.49 0 00-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.08.65-.08.98s.03.66.08.98l-2.11 1.65c-.19.15-.25.42-.12.64l2 3.46c.12.22.38.31.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49-.42l.38-2.65c.61-.25 1.17-.58 1.69-.98l2.49 1c.23.08.49 0 .61-.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5A3.5 3.5 0 1112 8a3.5 3.5 0 010 7.5z"/>
           </svg>
@@ -937,7 +937,7 @@ export default {
               v-model="draft"
               :placeholder="$t('chat_placeholder')"
             />
-            <div id="btn_send" class="btn-send" :enabled="canSend"
+            <div id="btn_send" class="btn-send" focusable="true" :enabled="canSend"
                  :opacity="hover=='btn_send' && canSend && page=='chat' ? 0.92 : 1"
                  @mouseenter="hin('btn_send')" @mouseleave="hout('btn_send')">
               <label class="btn-send-label">{{ $t('chat_send') }}</label>
@@ -949,7 +949,7 @@ export default {
           <div v-if="!installed" class="install-hint">
             <label class="install-hint-title">{{ $t('install_not_found') }}</label>
             <label class="install-hint-text">{{ installing ? $t('install_running') : $t('install_hint') }}</label>
-            <div id="btn_install_nanobot" class="install-btn" :enabled="!installing"
+            <div id="btn_install_nanobot" class="install-btn" focusable="true" :enabled="!installing"
                  :opacity="hover=='btn_install_nanobot' && !installing && page=='dashboard' ? 0.92 : 1"
                  @mouseenter="hin('btn_install_nanobot')" @mouseleave="hout('btn_install_nanobot')">
               <label class="install-btn-label">{{ $t('install_action') }}</label>
@@ -984,19 +984,19 @@ export default {
           </div>
 
           <div class="actions">
-            <div id="btn_start" class="btn btn-start" :enabled="canStart">
+            <div id="btn_start" class="btn btn-start" focusable="true" :enabled="canStart">
               <svg width="12" height="12" viewBox="0 0 24 24">
                 <path fill="currentColor" d="M8 5v14l11-7z"/>
               </svg>
               <label class="btn-label">{{ $t('btn_start') }}</label>
             </div>
-            <div id="btn_stop" class="btn btn-stop" :enabled="canStop">
+            <div id="btn_stop" class="btn btn-stop" focusable="true" :enabled="canStop">
               <svg width="12" height="12" viewBox="0 0 24 24">
                 <path fill="currentColor" d="M6 6h12v12H6z"/>
               </svg>
               <label class="btn-label">{{ $t('btn_stop') }}</label>
             </div>
-            <div id="btn_refresh" class="btn btn-refresh" :enabled="canRefresh">
+            <div id="btn_refresh" class="btn btn-refresh" focusable="true" :enabled="canRefresh">
               <svg width="12" height="12" viewBox="0 0 24 24">
                 <path fill="currentColor" d="M17.65 6.35A7.95 7.95 0 0012 4a8 8 0 107.75 10h-2.1A6 6 0 1112 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4z"/>
               </svg>
@@ -1035,7 +1035,7 @@ export default {
 
           <div class="path-row">
             <label class="setting-label">{{ $t('setting_path') }}</label>
-            <div class="path-display" id="btn_change_path">
+            <div class="path-display" id="btn_change_path" focusable="true">
               <label class="path-text" id="path_text">{{ nanobotPath }}</label>
               <label class="path-change">{{ $t('setting_path_change') }}</label>
             </div>
@@ -1065,12 +1065,12 @@ export default {
               <label class="credential-status-val" id="credential_status_text">{{ credentialStatus }}</label>
             </div>
             <div class="credential-actions">
-              <div id="btn_clear_credential" class="credential-btn" :enabled="hasCredential"
+              <div id="btn_clear_credential" class="credential-btn" focusable="true" :enabled="hasCredential"
                    :opacity="hover=='btn_clear_credential' && hasCredential && page=='settings' ? 0.92 : 1"
                    @mouseenter="hin('btn_clear_credential')" @mouseleave="hout('btn_clear_credential')">
                 <label class="credential-btn-label">{{ $t('setting_credential_clear') }}</label>
               </div>
-              <div id="btn_manage_credential" class="credential-btn"
+              <div id="btn_manage_credential" class="credential-btn" focusable="true"
                    :opacity="hover=='btn_manage_credential' && page=='settings' ? 0.92 : 1"
                    @mouseenter="hin('btn_manage_credential')" @mouseleave="hout('btn_manage_credential')">
                 <label class="credential-btn-label">{{ $t('setting_credential_manage') }}</label>
@@ -1079,7 +1079,7 @@ export default {
           </div>
 
           <div class="apply-row">
-            <div id="btn_apply_network" class="apply-btn"
+            <div id="btn_apply_network" class="apply-btn" focusable="true"
                  :opacity="hover=='btn_apply_network' && page=='settings' ? 0.92 : 1"
                  @mouseenter="hin('btn_apply_network')" @mouseleave="hout('btn_apply_network')">
               <label class="apply-btn-label">{{ $t('setting_apply') }}</label>
@@ -1093,7 +1093,7 @@ export default {
               <label class="setting-label">{{ $t('setting_theme') }}</label>
             </div>
             <div class="theme-row">
-              <div id="theme_light" :class="theme == 'light' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+              <div id="theme_light" focusable="true" :class="theme == 'light' ? 'theme-btn theme-btn-active' : 'theme-btn'">
                 <svg width="14" height="14" viewBox="0 0 24 24">
                   <circle cx="12" cy="12" r="4" fill="none" stroke="currentColor" stroke-width="2"/>
                   <line x1="12" y1="2" x2="12" y2="5" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -1106,12 +1106,12 @@ export default {
                   <line x1="16.95" y1="7.05" x2="19.07" y2="4.93" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
                 </svg>
               </div>
-              <div id="theme_dark" :class="theme == 'dark' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+              <div id="theme_dark" focusable="true" :class="theme == 'dark' ? 'theme-btn theme-btn-active' : 'theme-btn'">
                 <svg width="14" height="14" viewBox="0 0 24 24">
                   <path fill="currentColor" d="M12 3a9 9 0 109 9c0-.46-.04-.92-.1-1.36a5.389 5.389 0 01-4.4 2.26 5.403 5.403 0 01-3.14-9.8c-.44-.06-.9-.1-1.36-.1z"/>
                 </svg>
               </div>
-              <div id="theme_system" :class="theme == 'system' ? 'theme-btn theme-btn-active' : 'theme-btn'">
+              <div id="theme_system" focusable="true" :class="theme == 'system' ? 'theme-btn theme-btn-active' : 'theme-btn'">
                 <svg width="14" height="14" viewBox="0 0 24 24">
                   <rect x="3" y="4" width="18" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2"/>
                   <line x1="8" y1="21" x2="16" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
@@ -1126,10 +1126,10 @@ export default {
               <label class="setting-label">{{ $t('setting_language') }}</label>
             </div>
             <div class="lang-row">
-              <div id="lang_zh" :class="lang == 'zh' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="lang_zh" focusable="true" :class="lang == 'zh' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>中文</label>
               </div>
-              <div id="lang_en" :class="lang == 'en' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="lang_en" focusable="true" :class="lang == 'en' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>EN</label>
               </div>
             </div>
@@ -1140,16 +1140,16 @@ export default {
               <label class="setting-label">{{ $t('setting_log_level') }}</label>
             </div>
             <div class="lang-row">
-              <div id="log_debug" :class="logLevel == 'debug' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="log_debug" focusable="true" :class="logLevel == 'debug' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>DEBUG</label>
               </div>
-              <div id="log_info" :class="logLevel == 'info' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="log_info" focusable="true" :class="logLevel == 'info' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>INFO</label>
               </div>
-              <div id="log_warn" :class="logLevel == 'warn' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="log_warn" focusable="true" :class="logLevel == 'warn' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>WARN</label>
               </div>
-              <div id="log_error" :class="logLevel == 'error' ? 'lang-btn lang-btn-active' : 'lang-btn'">
+              <div id="log_error" focusable="true" :class="logLevel == 'error' ? 'lang-btn lang-btn-active' : 'lang-btn'">
                 <label>ERROR</label>
               </div>
             </div>
@@ -1157,7 +1157,7 @@ export default {
 
           <div class="settings-footer">
             <label class="footer-ver" id="footer_version">v1.6.2</label>
-            <div id="btn_webui" class="footer-link">
+            <div id="btn_webui" class="footer-link" focusable="true">
               <label class="footer-link-text">{{ $t('open_webui') }}</label>
               <svg width="10" height="10" viewBox="0 0 24 24">
                 <path fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" d="M5 12h14M12 5l7 7-7 7"/>
