@@ -1,5 +1,5 @@
 #include "nm_test.h"
-#include "process.h"
+#include "nm_process.h"
 #include <stdio.h>
 #include <stdlib.h>   /* _countof */
 #include <string.h>

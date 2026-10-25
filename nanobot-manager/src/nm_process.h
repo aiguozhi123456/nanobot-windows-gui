@@ -1,5 +1,5 @@
-#ifndef PROCESS_H
-#define PROCESS_H
+#ifndef NM_PROCESS_H
+#define NM_PROCESS_H
 
 #include <windows.h>
 #include "config.h"   /* app_config (used by the resolver) */

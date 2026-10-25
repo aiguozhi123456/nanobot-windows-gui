@@ -1,7 +1,7 @@
 #include "config.h"
-#include "process.h"
+#include "nm_process.h"
 #include "autostart.h"
-#include "chat.h"
+#include "chat.hpp"
 #include "chat_ui.h"
 #include "credential.h"
 #include "i18n.h"
@@ -689,15 +689,15 @@ static void refresh_effective_webui(void) {
 
 /* Effective bootstrap secret: Credential Manager (explicit) first, then the
  * secret auto-read from nanobot's config, else none. Single funnel for every
- * chat_set_endpoint call so the precedence stays in one place. */
+ * ChatClient::setEndpoint call so the precedence stays in one place. */
 static void set_chat_endpoint_effective(int reconnect) {
     char secret[128] = {0};
     credential_load(secret, sizeof(secret), NULL);
     if (!secret[0] && g_effective_webui_secret[0])
         memcpy(secret, g_effective_webui_secret, sizeof(secret));
-    chat_set_endpoint(g_effective_webui_port, secret);
+    chat_client().setEndpoint(g_effective_webui_port, secret);
     SecureZeroMemory(secret, sizeof(secret));
-    if (reconnect) chat_reconnect_async();
+    if (reconnect) chat_client().reconnectAsync();
 }
 
 /* --- Status i18n (single-source keys) ---------------------------------------
@@ -797,9 +797,9 @@ static void apply_health_result(int running, int actual_port) {
         }
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
-        if (chat_needs_connect() && chat_ui_can_auto_connect()) {
+        if (chat_client().needsConnect() && chat_ui_can_auto_connect()) {
             set_chat_endpoint_effective(0);
-            chat_connect();
+            chat_client().connect();
         }
         return;
     }
@@ -836,7 +836,7 @@ static void apply_health_result(int running, int actual_port) {
     nm_state_set_pid(0);
     g_effective_health_port = gateway_port_fallback();
     refresh_effective_health_port();
-    chat_disconnect_async();
+    chat_client().disconnectAsync();
     chat_ui_on_gateway_stopped();
 }
 
@@ -1315,7 +1315,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
         s_health_fail_streak = 0;
-        chat_disconnect_async();
+        chat_client().disconnectAsync();
         chat_ui_on_gateway_stopped();
         return 0;
     }
@@ -1364,7 +1364,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         stop_uptime_timer();
         g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
-        chat_disconnect_async();
+        chat_client().disconnectAsync();
         chat_ui_on_gateway_stopped();
         return 0;
     }
@@ -2467,7 +2467,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         hotkey_register(hwnd);
 
     set_chat_endpoint_effective(0);
-    chat_init(hwnd, WM_CHAT_EVENT);
+    chat_client().init(hwnd, WM_CHAT_EVENT);
 
     /* Initial detect (or start, for silent-tray) off the UI thread. UI shows
      * "Detecting..." until the first WM_ASYNC_RESOLVE_DONE arrives. */
@@ -2492,7 +2492,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     /* Drop UI first so any late chat events free LPARAMs without touching g_page. */
-    chat_shutdown();
+    chat_client().shutdown();
 
     /* P5a: unwatch + close our OpenProcess handle on shutdown. The stop_on_exit
      * decision is "leave running", so we do NOT call nanobot_stop() -- closing

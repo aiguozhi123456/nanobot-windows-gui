@@ -1,6 +1,8 @@
-#include "chat.h"
-#include "chat_history.h"
+#include "chat.hpp"
+
 #include "chat_protocol.h"
+#include "chat_history.h"
+#include "logger.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,58 +24,10 @@
 #define CHAT_CLOSE_STATUS WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS
 #define CHAT_CLOSE_TIMEOUT_MS 2000U
 
-static CRITICAL_SECTION g_cs;
-static int g_cs_inited = 0;
-
-static HWND g_hwnd = NULL;
-static UINT g_msg_id = 0;
-
-static int g_webui_port = 8765;
-static char g_bootstrap_secret[128] = {0};
-
-static HINTERNET g_session = NULL;
-static HINTERNET g_connect = NULL;
-static HINTERNET g_websocket = NULL;
-
 #define CHAT_RECV_INITIAL_CAPACITY (16U * 1024U)
 #define CHAT_RECV_MAX_WIRE_BYTES (2U * 1024U * 1024U)
 
-static HANDLE g_thread = NULL;         /* recv_thread */
-static HANDLE g_connect_thread = NULL; /* connect_thread */
-static volatile LONG g_stop = 0;
-static volatile LONG g_ready = 0;      /* socket up */
-static volatile LONG g_attached = 0;
-static volatile LONG g_connecting = 0;
-static volatile LONGLONG g_generation = 1;
-
-enum {
-    CHAT_LIFECYCLE_NONE,
-    CHAT_LIFECYCLE_DISCONNECT,
-    CHAT_LIFECYCLE_RECONNECT,
-    CHAT_LIFECYCLE_SHUTDOWN
-};
-
-static SRWLOCK g_disconnect_lock = SRWLOCK_INIT;
-static HANDLE g_lifecycle_event = NULL;
-static HANDLE g_lifecycle_thread = NULL;
-static LONG g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-static int g_lifecycle_busy = 0;
-static int g_shutting_down = 0;
-
-static char g_chat_id[128] = {0};
-static char g_attach_id[128] = {0};
-
-static int chat_connect_locked(UINT64 generation);
-static void chat_disconnect_internal(int invalidate_events);
-
-/* Call while g_cs is held before creating transport workers. */
-static int chat_lifecycle_operational_unlocked(void) {
-    return chat_protocol_lifecycle_operational(g_lifecycle_event != NULL,
-        g_lifecycle_thread != NULL, g_shutting_down);
-}
-
-typedef struct { UINT64 generation; } connect_context;
-typedef struct { HINTERNET websocket; UINT64 generation; } recv_context;
+#define CHAT_LOG_MODULE "chat"
 
 /* Always-NUL-terminated bounded copy from untrusted/gateway strings. */
 static void chat_copy_str(char* dst, size_t dst_sz, const char* src) {
@@ -104,86 +58,6 @@ static char* chat_strdup(const char* s) {
     return p;
 }
 
-void chat_event_free(chat_event* event) {
-    if (!event) return;
-    free(event->detail);
-    free(event);
-}
-
-UINT64 chat_current_generation(void) {
-    return (UINT64)InterlockedCompareExchange64(&g_generation, 0, 0);
-}
-
-static UINT64 invalidate_generation(void) {
-    for (;;) {
-        LONGLONG current = InterlockedCompareExchange64(&g_generation, 0, 0);
-        LONGLONG next = (LONGLONG)chat_protocol_next_generation((UINT64)current);
-        if (InterlockedCompareExchange64(&g_generation, next, current) == current)
-            return (UINT64)next;
-    }
-}
-
-static void post_event(WPARAM kind, UINT64 generation, char* detail_or_null) {
-    HWND hwnd;
-    UINT msg;
-    chat_event* event = (chat_event*)malloc(sizeof(*event));
-    if (!event) { free(detail_or_null); return; }
-    event->generation = generation;
-    event->detail = detail_or_null;
-    EnterCriticalSection(&g_cs);
-    hwnd = g_hwnd;
-    msg = g_msg_id;
-    LeaveCriticalSection(&g_cs);
-    if (!hwnd || !msg) {
-        chat_event_free(event);
-        return;
-    }
-    if (!PostMessageW(hwnd, msg, kind, (LPARAM)event))
-        chat_event_free(event);
-}
-
-/* WinHttpWebSocketClose cancels a pending receive. It must run while g_cs
-   serializes it with sends, but it must not release the socket handle. */
-static void cancel_websocket_unlocked(HINTERNET websocket) {
-    if (websocket)
-        WinHttpWebSocketClose(websocket, CHAT_CLOSE_STATUS, NULL, 0);
-}
-
-/* A receive worker owns its exact websocket handle until it has returned.
-   Call only after that worker has been joined or observed signaled. */
-static void destroy_connection_handles_unlocked(void) {
-    if (g_websocket) {
-        WinHttpCloseHandle(g_websocket);
-        g_websocket = NULL;
-    }
-    if (g_connect) {
-        WinHttpCloseHandle(g_connect);
-        g_connect = NULL;
-    }
-    if (g_session) {
-        WinHttpCloseHandle(g_session);
-        g_session = NULL;
-    }
-    g_ready = 0;
-    g_attached = 0;
-    g_chat_id[0] = '\0';
-    g_attach_id[0] = '\0';
-}
-
-static void reap_finished_threads_unlocked(void) {
-    if (g_thread && WaitForSingleObject(g_thread, 0) == WAIT_OBJECT_0) {
-        CloseHandle(g_thread);
-        g_thread = NULL;
-        /* recv_thread cleared g_ready only if this was its generation. */
-        if (!InterlockedCompareExchange(&g_ready, 0, 0))
-            destroy_connection_handles_unlocked();
-    }
-    if (g_connect_thread && WaitForSingleObject(g_connect_thread, 0) == WAIT_OBJECT_0) {
-        CloseHandle(g_connect_thread);
-        g_connect_thread = NULL;
-    }
-}
-
 /* Percent-encode for query values (token). */
 static void url_encode(const char* in, char* out, size_t out_sz) {
     static const char hex[] = "0123456789ABCDEF";
@@ -203,11 +77,127 @@ static void url_encode(const char* in, char* out, size_t out_sz) {
     out[o] = '\0';
 }
 
-static int http_get_bootstrap(int port, const char* secret,
-                              char* token_out, size_t token_sz,
-                              char* ws_path_out, size_t ws_path_sz) {
+const char* chat_conn_state_name(ChatConnState state) {
+    switch (state) {
+    case ChatConnState::Idle: return "idle";
+    case ChatConnState::Connecting: return "connecting";
+    case ChatConnState::Connected: return "connected";
+    case ChatConnState::Attached: return "attached";
+    default: return "?";
+    }
+}
+
+ChatClient& chat_client() {
+    static ChatClient instance;
+    return instance;
+}
+
+/* --- state machine ------------------------------------------------------- */
+
+bool ChatClient::transitionState(ChatConnState expected, ChatConnState desired) {
+    ChatConnState current = expected;
+    if (state_.compare_exchange_strong(current, desired)) {
+        nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "state: %s -> %s",
+               chat_conn_state_name(expected), chat_conn_state_name(desired));
+        return true;
+    }
+    nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "state: %s -> %s lost race (now %s)",
+           chat_conn_state_name(expected), chat_conn_state_name(desired),
+           chat_conn_state_name(current));
+    return false;
+}
+
+void ChatClient::forceStateIdle() {
+    ChatConnState previous = state_.exchange(ChatConnState::Idle);
+    if (previous != ChatConnState::Idle)
+        nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "state: %s -> idle (forced)",
+               chat_conn_state_name(previous));
+}
+
+/* --- event plumbing ------------------------------------------------------ */
+
+uint64_t ChatClient::invalidateGeneration() {
+    for (;;) {
+        uint64_t current = generation_.load();
+        uint64_t next = chat_protocol_next_generation(current);
+        if (generation_.compare_exchange_strong(current, next))
+            return next;
+    }
+}
+
+void ChatClient::postEvent(WPARAM kind, uint64_t generation, char* detail_or_null) {
+    HWND hwnd;
+    UINT msg;
+    chat_event* event = (chat_event*)malloc(sizeof(*event));
+    if (!event) { free(detail_or_null); return; }
+    event->generation = generation;
+    event->detail = detail_or_null;
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        hwnd = hwnd_;
+        msg = msg_id_;
+    }
+    if (!hwnd || !msg) {
+        chat_event_free(event);
+        return;
+    }
+    if (!PostMessageW(hwnd, msg, kind, (LPARAM)event))
+        chat_event_free(event);
+}
+
+/* --- handle / thread bookkeeping (cs_ held) ------------------------------ */
+
+/* WinHttpWebSocketClose cancels a pending receive. It must run while cs_
+   serializes it with sends, but it must not release the socket handle. */
+void ChatClient::cancelWebsocketLocked(HINTERNET websocket) {
+    if (websocket)
+        WinHttpWebSocketClose(websocket, CHAT_CLOSE_STATUS, NULL, 0);
+}
+
+/* A receive worker owns its exact websocket handle until it has returned.
+   Call only after that worker has been joined or observed finished. */
+void ChatClient::destroyConnectionHandlesLocked() {
+    if (websocket_) {
+        WinHttpCloseHandle(websocket_);
+        websocket_ = NULL;
+    }
+    if (connect_) {
+        WinHttpCloseHandle(connect_);
+        connect_ = NULL;
+    }
+    if (session_) {
+        WinHttpCloseHandle(session_);
+        session_ = NULL;
+    }
+    chat_id_[0] = '\0';
+    attach_id_[0] = '\0';
+}
+
+void ChatClient::reapFinishedThreadsLocked() {
+    if (recv_thread_.joinable() && recv_finished_.load()) {
+        recv_thread_.join();
+        /* The recv worker already cleared the state if it still owned the
+         * socket; Idle here means the connection is fully down and the
+         * handles can be released. */
+        if (state_.load() == ChatConnState::Idle)
+            destroyConnectionHandlesLocked();
+    }
+    if (connect_thread_.joinable() && connect_finished_.load())
+        connect_thread_.join();
+}
+
+bool ChatClient::lifecycleOperationalLocked() const {
+    return chat_protocol_lifecycle_operational(lifecycle_running_ ? 1 : 0,
+        lifecycle_running_ ? 1 : 0, shutting_down_ ? 1 : 0) != 0;
+}
+
+/* --- bootstrap + WS upgrade ---------------------------------------------- */
+
+int ChatClient::httpGetBootstrap(int port, const char* secret,
+                                 char* token_out, size_t token_size,
+                                 char* ws_path_out, size_t ws_path_size) {
     token_out[0] = '\0';
-    chat_copy_str(ws_path_out, ws_path_sz, "/");
+    chat_copy_str(ws_path_out, ws_path_size, "/");
 
     HINTERNET session = WinHttpOpen(L"nanobot-manager/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -218,6 +208,7 @@ static int http_get_bootstrap(int port, const char* secret,
 
     HINTERNET conn = WinHttpConnect(session, L"127.0.0.1", (INTERNET_PORT)port, 0);
     if (!conn) {
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "bootstrap: WinHttpConnect failed (%lu)", GetLastError());
         WinHttpCloseHandle(session);
         return -1;
     }
@@ -232,6 +223,7 @@ static int http_get_bootstrap(int port, const char* secret,
 
     if (secret && secret[0]) {
         if (!secret_is_safe(secret)) {
+            nm_log(NM_LOG_WARN, CHAT_LOG_MODULE, "bootstrap: secret rejected (control chars)");
             WinHttpCloseHandle(req);
             WinHttpCloseHandle(conn);
             WinHttpCloseHandle(session);
@@ -246,6 +238,7 @@ static int http_get_bootstrap(int port, const char* secret,
     if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(req, NULL)) {
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "bootstrap: request failed (%lu)", GetLastError());
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
@@ -258,6 +251,7 @@ static int http_get_bootstrap(int port, const char* secret,
         WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
         WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
     if (status != 200) {
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "bootstrap: HTTP %lu", status);
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
@@ -289,19 +283,19 @@ static int http_get_bootstrap(int port, const char* secret,
     if (!tok || !cJSON_IsString(tok) || !tok->valuestring[0])
         tok = cJSON_GetObjectItem(root, "api_token");
     if (tok && cJSON_IsString(tok) && tok->valuestring[0])
-        chat_copy_str(token_out, token_sz, tok->valuestring);
+        chat_copy_str(token_out, token_size, tok->valuestring);
 
     cJSON* wsp = cJSON_GetObjectItem(root, "ws_path");
     if (wsp && cJSON_IsString(wsp) && wsp->valuestring[0])
-        chat_copy_str(ws_path_out, ws_path_sz, wsp->valuestring);
+        chat_copy_str(ws_path_out, ws_path_size, wsp->valuestring);
 
     cJSON_Delete(root);
     return 0;
 }
 
-static int ws_connect(int port, const char* path, const char* token,
-                      HINTERNET* session_out, HINTERNET* connect_out,
-                      HINTERNET* websocket_out) {
+int ChatClient::wsConnect(int port, const char* path, const char* token,
+                          HINTERNET* session_out, HINTERNET* connect_out,
+                          HINTERNET* websocket_out) {
     char path_a[1024];
     char token_enc[1024];
     if (token && token[0]) {
@@ -344,6 +338,7 @@ static int ws_connect(int port, const char* path, const char* token,
     }
 
     if (!WinHttpSetOption(req, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0)) {
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "ws: upgrade option failed (%lu)", GetLastError());
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
@@ -353,6 +348,7 @@ static int ws_connect(int port, const char* path, const char* token,
     if (!WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
             WINHTTP_NO_REQUEST_DATA, 0, 0, 0) ||
         !WinHttpReceiveResponse(req, NULL)) {
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "ws: handshake failed (%lu)", GetLastError());
         WinHttpCloseHandle(req);
         WinHttpCloseHandle(conn);
         WinHttpCloseHandle(session);
@@ -384,7 +380,9 @@ static int ws_connect(int port, const char* path, const char* token,
     return 0;
 }
 
-static void handle_json_frame(UINT64 generation, const char* json, size_t len) {
+/* --- frame dispatch (recv worker) ---------------------------------------- */
+
+void ChatClient::handleJsonFrame(uint64_t generation, const char* json, size_t len) {
     char* buf = (char*)malloc(len + 1);
     if (!buf) return;
     memcpy(buf, json, len);
@@ -405,30 +403,35 @@ static void handle_json_frame(UINT64 generation, const char* json, size_t len) {
     }
 
     const char* event = ev->valuestring;
+    nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "frame: event=%s", event);
 
     if (strcmp(event, "ready") == 0) {
         cJSON* cid = cJSON_GetObjectItem(root, "chat_id");
         if (cid && cJSON_IsString(cid) && cid->valuestring)
-            post_event(CHAT_EVT_READY, generation, chat_strdup(cid->valuestring));
+            postEvent(CHAT_EVT_READY, generation, chat_strdup(cid->valuestring));
     } else if (strcmp(event, "attached") == 0) {
         cJSON* cid = cJSON_GetObjectItem(root, "chat_id");
         int match = 0;
-        char resolved_id[sizeof(g_attach_id)];
+        char resolved_id[sizeof(attach_id_)];
         const char* attached_id = cid && cJSON_IsString(cid) ? cid->valuestring : NULL;
-        EnterCriticalSection(&g_cs);
-        if (chat_protocol_resolve_attached(g_attach_id, attached_id, cid != NULL,
-                resolved_id, sizeof(resolved_id))) {
-            chat_copy_str(g_chat_id, sizeof(g_chat_id), resolved_id);
-            InterlockedExchange(&g_attached, 1);
-            match = 1;
+        {
+            std::lock_guard<std::mutex> lock(cs_);
+            if (chat_protocol_resolve_attached(attach_id_, attached_id, cid != NULL,
+                    resolved_id, sizeof(resolved_id))) {
+                chat_copy_str(chat_id_, sizeof(chat_id_), resolved_id);
+                /* Connected -> Attached; a lost CAS (duplicate frame, or Idle
+                 * after a racing teardown) must not suppress the event --
+                 * the generation guard owns staleness. */
+                transitionState(ChatConnState::Connected, ChatConnState::Attached);
+                match = 1;
+            }
         }
-        LeaveCriticalSection(&g_cs);
-        if (match) post_event(CHAT_EVT_ATTACHED, generation, chat_strdup(resolved_id));
+        if (match) postEvent(CHAT_EVT_ATTACHED, generation, chat_strdup(resolved_id));
     } else if (strcmp(event, "delta") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
         if (!text) text = cJSON_GetObjectItem(root, "content");
         if (text && cJSON_IsString(text) && text->valuestring)
-            post_event(CHAT_EVT_DELTA, generation, chat_strdup(text->valuestring));
+            postEvent(CHAT_EVT_DELTA, generation, chat_strdup(text->valuestring));
     } else if (strcmp(event, "message") == 0) {
         cJSON* kind = cJSON_GetObjectItem(root, "kind");
         const char* kind_name = (kind && cJSON_IsString(kind)) ? kind->valuestring : NULL;
@@ -439,17 +442,17 @@ static void handle_json_frame(UINT64 generation, const char* json, size_t len) {
             cJSON* text = cJSON_GetObjectItem(root, "text");
             if (!text) text = cJSON_GetObjectItem(root, "content");
             if (text && cJSON_IsString(text) && text->valuestring)
-                post_event(CHAT_EVT_MESSAGE, generation, chat_strdup(text->valuestring));
+                postEvent(CHAT_EVT_MESSAGE, generation, chat_strdup(text->valuestring));
         }
     } else if (strcmp(event, "stream_end") == 0 || strcmp(event, "done") == 0) {
         cJSON* text = cJSON_GetObjectItem(root, "text");
         if (!text) text = cJSON_GetObjectItem(root, "content");
-        post_event(CHAT_EVT_STREAM_END, generation,
+        postEvent(CHAT_EVT_STREAM_END, generation,
             text && cJSON_IsString(text) && text->valuestring ? chat_strdup(text->valuestring) : NULL);
         if (strcmp(event, "done") == 0)
-            post_event(CHAT_EVT_TURN_END, generation, NULL);
+            postEvent(CHAT_EVT_TURN_END, generation, NULL);
     } else if (strcmp(event, "turn_end") == 0) {
-        post_event(CHAT_EVT_TURN_END, generation, NULL);
+        postEvent(CHAT_EVT_TURN_END, generation, NULL);
     } else if (strcmp(event, "error") == 0) {
         cJSON* detail = cJSON_GetObjectItem(root, "detail");
         if (!detail) detail = cJSON_GetObjectItem(root, "message");
@@ -457,107 +460,113 @@ static void handle_json_frame(UINT64 generation, const char* json, size_t len) {
         if (!detail) detail = cJSON_GetObjectItem(root, "text");
         const char* msg = (detail && cJSON_IsString(detail) && detail->valuestring)
             ? detail->valuestring : "error";
-        post_event(CHAT_EVT_ERROR, generation, chat_strdup(msg));
+        postEvent(CHAT_EVT_ERROR, generation, chat_strdup(msg));
     }
 
     cJSON_Delete(root);
 }
 
-static DWORD WINAPI recv_thread(LPVOID param) {
-    recv_context* context = (recv_context*)param;
-    HINTERNET ws = context->websocket;
-    UINT64 generation = context->generation;
-    free(context);
+/* --- workers -------------------------------------------------------------- */
+
+void ChatClient::recvThreadMain(RecvContext context) {
+    HINTERNET ws = context.websocket;
+    uint64_t generation = context.generation;
     char* frame = NULL;
     size_t acc = 0;
     size_t frame_capacity = 0;
     const char* receive_error = NULL;
     int peer_closed = 0;
 
-    while (!InterlockedCompareExchange(&g_stop, 0, 0)) {
-        if (!ws) break;
+    try {
+        while (!stop_.load()) {
+            if (!ws) break;
 
-        if (acc == frame_capacity) {
-            size_t new_capacity;
-            char* grown;
+            if (acc == frame_capacity) {
+                size_t new_capacity;
+                char* grown;
 
-            if (frame_capacity >= CHAT_RECV_MAX_WIRE_BYTES) {
-                receive_error = "Incoming WebSocket message exceeds 2 MiB";
+                if (frame_capacity >= CHAT_RECV_MAX_WIRE_BYTES) {
+                    receive_error = "Incoming WebSocket message exceeds 2 MiB";
+                    break;
+                }
+                new_capacity = frame_capacity ? frame_capacity * 2 : CHAT_RECV_INITIAL_CAPACITY;
+                if (new_capacity > CHAT_RECV_MAX_WIRE_BYTES || new_capacity < frame_capacity)
+                    new_capacity = CHAT_RECV_MAX_WIRE_BYTES;
+                grown = (char*)realloc(frame, new_capacity + 1);
+                if (!grown) {
+                    receive_error = "Out of memory receiving WebSocket message";
+                    break;
+                }
+                frame = grown;
+                frame_capacity = new_capacity;
+            }
+
+            DWORD space = (DWORD)(frame_capacity - acc);
+
+            DWORD read = 0;
+            WINHTTP_WEB_SOCKET_BUFFER_TYPE btype = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
+            DWORD err = WinHttpWebSocketReceive(ws, frame + acc, space, &read, &btype);
+
+            if (err != ERROR_SUCCESS) {
+                nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "recv: receive err=%lu", err);
                 break;
             }
-            new_capacity = frame_capacity ? frame_capacity * 2 : CHAT_RECV_INITIAL_CAPACITY;
-            if (new_capacity > CHAT_RECV_MAX_WIRE_BYTES || new_capacity < frame_capacity)
-                new_capacity = CHAT_RECV_MAX_WIRE_BYTES;
-            grown = (char*)realloc(frame, new_capacity + 1);
-            if (!grown) {
-                receive_error = "Out of memory receiving WebSocket message";
+
+            if (btype == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
+                peer_closed = 1;
                 break;
             }
-            frame = grown;
-            frame_capacity = new_capacity;
-        }
-
-        DWORD space = (DWORD)(frame_capacity - acc);
-
-        DWORD read = 0;
-        WINHTTP_WEB_SOCKET_BUFFER_TYPE btype = WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE;
-        DWORD err = WinHttpWebSocketReceive(ws, frame + acc, space, &read, &btype);
-
-        if (err != ERROR_SUCCESS) {
-            break;
-        }
-
-        if (btype == WINHTTP_WEB_SOCKET_CLOSE_BUFFER_TYPE) {
-            peer_closed = 1;
-            break;
-        }
-
-        if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
-            btype == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
-            btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
-            btype == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) {
-            if (read > CHAT_RECV_MAX_WIRE_BYTES - acc) {
-                receive_error = "Incoming WebSocket message exceeds 2 MiB";
-                break;
-            }
-            acc += read;
-            frame[acc] = '\0';
 
             if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
-                btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
-                handle_json_frame(generation, frame, acc);
-                acc = 0;
+                btype == WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE ||
+                btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE ||
+                btype == WINHTTP_WEB_SOCKET_BINARY_FRAGMENT_BUFFER_TYPE) {
+                if (read > CHAT_RECV_MAX_WIRE_BYTES - acc) {
+                    receive_error = "Incoming WebSocket message exceeds 2 MiB";
+                    break;
+                }
+                acc += read;
+                frame[acc] = '\0';
+
+                if (btype == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE ||
+                    btype == WINHTTP_WEB_SOCKET_BINARY_MESSAGE_BUFFER_TYPE) {
+                    handleJsonFrame(generation, frame, acc);
+                    acc = 0;
+                }
             }
         }
+    } catch (...) {
+        nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "recv worker: unexpected exception");
+        receive_error = "Receive worker failed";
     }
 
     free(frame);
     if (receive_error)
-        post_event(CHAT_EVT_ERROR, generation, chat_strdup(receive_error));
+        postEvent(CHAT_EVT_ERROR, generation, chat_strdup(receive_error));
+    if (peer_closed)
+        nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "recv: peer closed connection");
 
-    EnterCriticalSection(&g_cs);
-    /* A peer close must be acknowledged. Keep the handle alive for the
-       lifecycle owner, which destroys it only after this thread is signaled. */
-    if (g_websocket == ws) {
-        if (peer_closed)
-            cancel_websocket_unlocked(ws);
-        InterlockedExchange(&g_ready, 0);
-        InterlockedExchange(&g_attached, 0);
-        g_chat_id[0] = '\0';
-        g_attach_id[0] = '\0';
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        /* A peer close must be acknowledged. Keep the handle alive for the
+           lifecycle owner, which destroys it only after this worker joined. */
+        if (websocket_ == ws) {
+            if (peer_closed)
+                cancelWebsocketLocked(ws);
+            forceStateIdle();
+            chat_id_[0] = '\0';
+            attach_id_[0] = '\0';
+        }
     }
-    LeaveCriticalSection(&g_cs);
 
-    /* Do NOT clear g_connecting here — that flag is owned by
-       chat_connect / connect_thread for the duration of a connect attempt. */
-    post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
-    return 0;
+    /* Do NOT touch the Connecting state here -- that belongs to the connect
+       worker for the duration of a connect attempt. */
+    postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+    recv_finished_.store(true);   /* last statement: enables try-join reaping */
 }
 
-static DWORD WINAPI connect_thread(LPVOID param) {
-    connect_context* context = (connect_context*)param;
-    UINT64 generation = context->generation;
-    free(context);
+void ChatClient::connectThreadMain(ConnectContext context) {
+    uint64_t generation = context.generation;
     int port;
     char secret[128];
     char token[512];
@@ -566,258 +575,274 @@ static DWORD WINAPI connect_thread(LPVOID param) {
     HINTERNET connect = NULL;
     HINTERNET websocket = NULL;
 
-    EnterCriticalSection(&g_cs);
-    port = g_webui_port;
-    chat_copy_str(secret, sizeof(secret), g_bootstrap_secret);
-    LeaveCriticalSection(&g_cs);
-
-    token[0] = '\0';
-    chat_copy_str(ws_path, sizeof(ws_path), "/");
-
-    int boot_ok = http_get_bootstrap(port, secret, token, sizeof(token),
-        ws_path, sizeof(ws_path));
-
-    if (InterlockedCompareExchange(&g_stop, 0, 0)) {
-        SecureZeroMemory(secret, sizeof(secret));
-        SecureZeroMemory(token, sizeof(token));
-        InterlockedExchange(&g_connecting, 0);
-        return 0;
-    }
-
-    int rc = -1;
-    if (boot_ok == 0)
-        rc = ws_connect(port, ws_path, token, &session, &connect, &websocket);
-
-    /* Fallback: no token / default path (websocketRequiresToken:false) */
-    if (rc != 0 && !InterlockedCompareExchange(&g_stop, 0, 0)) {
-        chat_copy_str(token, sizeof(token), "");
-        chat_copy_str(ws_path, sizeof(ws_path), "/");
-        rc = ws_connect(port, ws_path, token, &session, &connect, &websocket);
-    }
-
-    if (rc != 0) {
-        SecureZeroMemory(secret, sizeof(secret));
-        SecureZeroMemory(token, sizeof(token));
-        InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_ERROR, generation, chat_strdup("WebSocket connect failed"));
-        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
-        return 0;
-    }
-
-    EnterCriticalSection(&g_cs);
-    if (InterlockedCompareExchange(&g_stop, 0, 0) || g_thread) {
-        if (websocket) {
-            cancel_websocket_unlocked(websocket);
-            WinHttpCloseHandle(websocket);
+    try {
+        {
+            std::lock_guard<std::mutex> lock(cs_);
+            port = webui_port_;
+            chat_copy_str(secret, sizeof(secret), bootstrap_secret_);
         }
-        if (connect)
-            WinHttpCloseHandle(connect);
-        if (session)
-            WinHttpCloseHandle(session);
-        LeaveCriticalSection(&g_cs);
+
+        token[0] = '\0';
+        chat_copy_str(ws_path, sizeof(ws_path), "/");
+
+        int boot_ok = httpGetBootstrap(port, secret, token, sizeof(token),
+            ws_path, sizeof(ws_path));
+        nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "bootstrap: %s (port=%d)",
+               boot_ok == 0 ? "ok" : "failed", port);
+
+        if (stop_.load()) {
+            SecureZeroMemory(secret, sizeof(secret));
+            SecureZeroMemory(token, sizeof(token));
+            transitionState(ChatConnState::Connecting, ChatConnState::Idle);
+            connect_finished_.store(true);
+            return;
+        }
+
+        int rc = -1;
+        if (boot_ok == 0)
+            rc = wsConnect(port, ws_path, token, &session, &connect, &websocket);
+
+        /* Fallback: no token / default path (websocketRequiresToken:false) */
+        if (rc != 0 && !stop_.load()) {
+            nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "ws: retrying without token");
+            chat_copy_str(token, sizeof(token), "");
+            chat_copy_str(ws_path, sizeof(ws_path), "/");
+            rc = wsConnect(port, ws_path, token, &session, &connect, &websocket);
+        }
+
+        if (rc != 0) {
+            SecureZeroMemory(secret, sizeof(secret));
+            SecureZeroMemory(token, sizeof(token));
+            nm_log(NM_LOG_WARN, CHAT_LOG_MODULE, "connect: websocket failed (port=%d)", port);
+            transitionState(ChatConnState::Connecting, ChatConnState::Idle);
+            postEvent(CHAT_EVT_ERROR, generation, chat_strdup("WebSocket connect failed"));
+            postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+            connect_finished_.store(true);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cs_);
+            if (stop_.load() || recv_thread_.joinable()) {
+                if (websocket) {
+                    cancelWebsocketLocked(websocket);
+                    WinHttpCloseHandle(websocket);
+                }
+                if (connect)
+                    WinHttpCloseHandle(connect);
+                if (session)
+                    WinHttpCloseHandle(session);
+                transitionState(ChatConnState::Connecting, ChatConnState::Idle);
+                SecureZeroMemory(secret, sizeof(secret));
+                SecureZeroMemory(token, sizeof(token));
+                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+                connect_finished_.store(true);
+                return;
+            }
+
+            destroyConnectionHandlesLocked();
+            session_ = session;
+            connect_ = connect;
+            websocket_ = websocket;
+            /* Publish readiness before the worker can observe an immediate
+             * peer close; a lost CAS here means a teardown already won. */
+            if (!transitionState(ChatConnState::Connecting, ChatConnState::Connected)) {
+                destroyConnectionHandlesLocked();
+                SecureZeroMemory(secret, sizeof(secret));
+                SecureZeroMemory(token, sizeof(token));
+                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+                connect_finished_.store(true);
+                return;
+            }
+
+            recv_finished_ = false;
+            try {
+                recv_thread_ = std::thread(&ChatClient::recvThreadMain, this,
+                                           RecvContext{websocket, generation});
+            } catch (...) {
+                destroyConnectionHandlesLocked();
+                SecureZeroMemory(secret, sizeof(secret));
+                SecureZeroMemory(token, sizeof(token));
+                forceStateIdle();
+                postEvent(CHAT_EVT_ERROR, generation, chat_strdup("Failed to start receive thread"));
+                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+                connect_finished_.store(true);
+                return;
+            }
+            /* Socket is up; a READY frame must still offer a session for
+             * attachment. */
+        }
+
         SecureZeroMemory(secret, sizeof(secret));
         SecureZeroMemory(token, sizeof(token));
-        InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
-        return 0;
+        nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "connect: websocket up (generation=%llu)",
+               (unsigned long long)generation);
+        postEvent(CHAT_EVT_CONNECTED, generation, NULL);
+    } catch (...) {
+        nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "connect worker: unexpected exception");
+        forceStateIdle();
+        postEvent(CHAT_EVT_ERROR, generation, chat_strdup("Connect worker failed"));
+        postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
     }
-
-    destroy_connection_handles_unlocked();
-    g_session = session;
-    g_connect = connect;
-    g_websocket = websocket;
-    /* Publish readiness before the worker can observe an immediate peer close. */
-    InterlockedExchange(&g_ready, 1);
-
-    recv_context* recv = (recv_context*)malloc(sizeof(*recv));
-    if (recv) { recv->websocket = websocket; recv->generation = generation; }
-    HANDLE th = recv ? CreateThread(NULL, 0, recv_thread, recv, 0, NULL) : NULL;
-    if (!th) {
-        free(recv);
-        destroy_connection_handles_unlocked();
-        LeaveCriticalSection(&g_cs);
-        SecureZeroMemory(secret, sizeof(secret));
-        SecureZeroMemory(token, sizeof(token));
-        InterlockedExchange(&g_connecting, 0);
-        post_event(CHAT_EVT_ERROR, generation, chat_strdup("Failed to start receive thread"));
-        post_event(CHAT_EVT_DISCONNECTED, generation, NULL);
-        return 0;
-    }
-
-    g_thread = th;
-    /* Socket is up; a READY frame must still offer a session for attachment. */
-    LeaveCriticalSection(&g_cs);
-
-    InterlockedExchange(&g_connecting, 0);
-    SecureZeroMemory(secret, sizeof(secret));
-    SecureZeroMemory(token, sizeof(token));
-    post_event(CHAT_EVT_CONNECTED, generation, NULL);
-    return 0;
+    connect_finished_.store(true);   /* last statement: enables try-join reaping */
 }
 
-static void chat_disconnect_internal(int invalidate_events) {
-    HANDLE th_recv = NULL;
-    HANDLE th_conn = NULL;
+void ChatClient::lifecycleThreadMain() {
+    for (;;) {
+        {
+            std::unique_lock<std::mutex> lock(cs_);
+            lifecycleCv_.wait(lock, [this] { return lifecycle_request_ != LIFECYCLE_NONE; });
+        }
+        for (;;) {
+            LifecycleRequest request;
+            {
+                std::lock_guard<std::mutex> lock(cs_);
+                request = lifecycle_request_;
+                if (request == LIFECYCLE_NONE) {
+                    lifecycle_busy_ = false;
+                    break;
+                }
+                lifecycle_busy_ = true;
+            }
+            nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "lifecycle: request=%d", (int)request);
+            {
+                std::lock_guard<std::mutex> disconnect_lock(disconnectMutex_);
+                disconnectInternal(0);
+            }
+            {
+                std::unique_lock<std::mutex> lock(cs_);
+                if (lifecycle_request_ != request)
+                    continue;
+                if (request == LIFECYCLE_SHUTDOWN) {
+                    lifecycle_request_ = LIFECYCLE_NONE;
+                    lifecycle_busy_ = false;
+                    SecureZeroMemory(bootstrap_secret_, sizeof(bootstrap_secret_));
+                    lock.unlock();
+                    postEvent(CHAT_EVT_DISCONNECT_DONE, currentGeneration(), NULL);
+                    return;
+                }
+                if (request == LIFECYCLE_DISCONNECT) {
+                    lifecycle_request_ = LIFECYCLE_NONE;
+                    lifecycle_busy_ = false;
+                    SecureZeroMemory(bootstrap_secret_, sizeof(bootstrap_secret_));
+                    lock.unlock();
+                    postEvent(CHAT_EVT_DISCONNECT_DONE, currentGeneration(), NULL);
+                    break;
+                }
+            }
+            bool start_reconnect = false;
+            {
+                std::unique_lock<std::mutex> lock(cs_);
+                if (lifecycle_request_ == LIFECYCLE_RECONNECT && !shutting_down_) {
+                    lifecycle_request_ = LIFECYCLE_NONE;
+                    lock.unlock();
+
+                    uint64_t replacement_generation = invalidateGeneration();
+                    /* Queue completion before any replacement worker can
+                     * report CONNECTED or READY. */
+                    postEvent(CHAT_EVT_DISCONNECT_DONE, replacement_generation, NULL);
+                    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE,
+                           "lifecycle: reconnecting (generation=%llu)",
+                           (unsigned long long)replacement_generation);
+                    {
+                        std::lock_guard<std::mutex> disconnect_lock(disconnectMutex_);
+                        std::lock_guard<std::mutex> lock2(cs_);
+                        start_reconnect = !shutting_down_ &&
+                            lifecycle_request_ == LIFECYCLE_NONE;
+                        if (start_reconnect)
+                            connectLocked(replacement_generation);
+                        if (start_reconnect)
+                            lifecycle_busy_ = false;
+                    }
+                    if (start_reconnect)
+                        break;
+                    continue;
+                }
+            }
+        }
+    }
+}
+
+/* --- teardown plumbing ---------------------------------------------------- */
+
+void ChatClient::disconnectInternal(int invalidate_events) {
+    std::thread th_recv;
+    std::thread th_conn;
 
     if (invalidate_events)
-        invalidate_generation();
-    InterlockedExchange(&g_stop, 1);
+        invalidateGeneration();
+    stop_ = true;
 
-    EnterCriticalSection(&g_cs);
-    /* Clear readiness before cancelling Receive; g_cs also serializes Send. */
-    InterlockedExchange(&g_ready, 0);
-    cancel_websocket_unlocked(g_websocket);
-    th_recv = g_thread;
-    g_thread = NULL;
-    th_conn = g_connect_thread;
-    g_connect_thread = NULL;
-    LeaveCriticalSection(&g_cs);
-
-    if (th_recv) {
-        WaitForSingleObject(th_recv, INFINITE);
-        CloseHandle(th_recv);
-    }
-    if (th_conn) {
-        WaitForSingleObject(th_conn, INFINITE);
-        CloseHandle(th_conn);
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        /* Clear readiness before cancelling Receive; cs_ also serializes Send. */
+        forceStateIdle();
+        cancelWebsocketLocked(websocket_);
+        th_recv = std::move(recv_thread_);
+        th_conn = std::move(connect_thread_);
     }
 
-    EnterCriticalSection(&g_cs);
-    /* recv_thread has returned, so no WinHTTP receive can use these handles. */
-    destroy_connection_handles_unlocked();
-    LeaveCriticalSection(&g_cs);
+    if (th_recv.joinable())
+        th_recv.join();
+    if (th_conn.joinable())
+        th_conn.join();
 
-    InterlockedExchange(&g_connecting, 0);
-    InterlockedExchange(&g_ready, 0);
-}
-
-static DWORD WINAPI lifecycle_thread(LPVOID param) {
-    (void)param;
-
-    for (;;) {
-        int request;
-
-        WaitForSingleObject(g_lifecycle_event, INFINITE);
-        for (;;) {
-            EnterCriticalSection(&g_cs);
-            request = (int)g_lifecycle_request;
-            if (request == CHAT_LIFECYCLE_NONE) {
-                g_lifecycle_busy = 0;
-                LeaveCriticalSection(&g_cs);
-                break;
-            }
-            g_lifecycle_busy = 1;
-            LeaveCriticalSection(&g_cs);
-
-            AcquireSRWLockExclusive(&g_disconnect_lock);
-            chat_disconnect_internal(0);
-            ReleaseSRWLockExclusive(&g_disconnect_lock);
-
-            EnterCriticalSection(&g_cs);
-            if (g_lifecycle_request != request) {
-                LeaveCriticalSection(&g_cs);
-                continue;
-            }
-            if (request == CHAT_LIFECYCLE_SHUTDOWN) {
-                g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-                g_lifecycle_busy = 0;
-                SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-                LeaveCriticalSection(&g_cs);
-                post_event(CHAT_EVT_DISCONNECT_DONE, chat_current_generation(), NULL);
-                return 0;
-            }
-            if (request == CHAT_LIFECYCLE_DISCONNECT) {
-                g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-                g_lifecycle_busy = 0;
-                SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-                LeaveCriticalSection(&g_cs);
-                post_event(CHAT_EVT_DISCONNECT_DONE, chat_current_generation(), NULL);
-                break;
-            }
-            LeaveCriticalSection(&g_cs);
-
-            EnterCriticalSection(&g_cs);
-            if (g_lifecycle_request == CHAT_LIFECYCLE_RECONNECT && !g_shutting_down) {
-                int start_reconnect;
-                g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-                LeaveCriticalSection(&g_cs);
-
-                UINT64 replacement_generation = invalidate_generation();
-                /* Queue completion before any replacement worker can report
-                   CONNECTED or READY. */
-                post_event(CHAT_EVT_DISCONNECT_DONE, replacement_generation, NULL);
-
-                AcquireSRWLockExclusive(&g_disconnect_lock);
-                EnterCriticalSection(&g_cs);
-                start_reconnect = !g_shutting_down &&
-                    g_lifecycle_request == CHAT_LIFECYCLE_NONE;
-                if (start_reconnect)
-                    chat_connect_locked(replacement_generation);
-                if (start_reconnect)
-                    g_lifecycle_busy = 0;
-                LeaveCriticalSection(&g_cs);
-                ReleaseSRWLockExclusive(&g_disconnect_lock);
-                if (start_reconnect)
-                    break;
-                continue;
-            }
-            LeaveCriticalSection(&g_cs);
-        }
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        /* The recv worker has returned, so no WinHTTP receive can use these
+         * handles. */
+        destroyConnectionHandlesLocked();
     }
 }
 
-static void chat_request_lifecycle(int request) {
-    HANDLE event = NULL;
-
-    if (!g_cs_inited) return;
-    EnterCriticalSection(&g_cs);
-    if (!g_lifecycle_thread || !g_lifecycle_event || g_shutting_down) {
-        LeaveCriticalSection(&g_cs);
-        return;
+void ChatClient::requestLifecycle(LifecycleRequest request) {
+    if (!inited_) return;
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        if (!lifecycle_running_ || shutting_down_)
+            return;
+        lifecycle_request_ = request;
     }
-    g_lifecycle_request = request;
-    event = g_lifecycle_event;
-    LeaveCriticalSection(&g_cs);
-    SetEvent(event);
+    lifecycleCv_.notify_one();
 }
 
-void chat_init(HWND hwnd, UINT msg_id) {
-    if (!g_cs_inited) {
-        InitializeCriticalSection(&g_cs);
-        g_cs_inited = 1;
-    }
-    EnterCriticalSection(&g_cs);
-    g_hwnd = hwnd;
-    g_msg_id = msg_id;
-    g_shutting_down = 0;
-    g_lifecycle_request = CHAT_LIFECYCLE_NONE;
-    g_lifecycle_busy = 0;
-    LeaveCriticalSection(&g_cs);
+/* --- public API ----------------------------------------------------------- */
 
-    g_lifecycle_event = CreateEventW(NULL, FALSE, FALSE, NULL);
-    if (!g_lifecycle_event)
-        return;
-    g_lifecycle_thread = CreateThread(NULL, 0, lifecycle_thread, NULL, 0, NULL);
-    if (!g_lifecycle_thread) {
-        CloseHandle(g_lifecycle_event);
-        g_lifecycle_event = NULL;
+void ChatClient::init(HWND hwnd, UINT msg_id) {
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        hwnd_ = hwnd;
+        msg_id_ = msg_id;
+        shutting_down_ = false;
+        lifecycle_request_ = LIFECYCLE_NONE;
+        lifecycle_busy_ = false;
+        inited_ = true;
     }
+
+    try {
+        std::thread thread(&ChatClient::lifecycleThreadMain, this);
+        std::lock_guard<std::mutex> lock(cs_);
+        lifecycle_thread_ = std::move(thread);
+        lifecycle_running_ = true;
+    } catch (...) {
+        nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "init: failed to start lifecycle thread");
+        std::lock_guard<std::mutex> lock(cs_);
+        lifecycle_running_ = false;
+    }
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "init complete (msg=%u)", msg_id);
 }
 
-void chat_set_endpoint(int webui_port, const char* bootstrap_secret) {
-    if (!g_cs_inited) {
-        InitializeCriticalSection(&g_cs);
-        g_cs_inited = 1;
+void ChatClient::setEndpoint(int webui_port, const char* bootstrap_secret) {
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
+        webui_port_ = webui_port;
+        SecureZeroMemory(bootstrap_secret_, sizeof(bootstrap_secret_));
+        chat_copy_str(bootstrap_secret_, sizeof(bootstrap_secret_),
+                      bootstrap_secret ? bootstrap_secret : "");
     }
-    EnterCriticalSection(&g_cs);
-    webui_port = (webui_port > 0 && webui_port <= 65535) ? webui_port : 8765;
-    g_webui_port = webui_port;
-    SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-    if (bootstrap_secret)
-        chat_copy_str(g_bootstrap_secret, sizeof(g_bootstrap_secret), bootstrap_secret);
-    else
-        g_bootstrap_secret[0] = '\0';
-    LeaveCriticalSection(&g_cs);
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "endpoint: port=%d secret=%s",
+           webui_port, (bootstrap_secret && bootstrap_secret[0]) ? "set" : "none");
 }
 
 /* Start a connect. generation == 0 bumps the generation lazily AFTER the
@@ -825,210 +850,212 @@ void chat_set_endpoint(int webui_port, const char* bootstrap_secret) {
  * queued for a live connection and contradict the "idempotent if already
  * connected/connecting" contract. A non-zero generation is used verbatim
  * (the lifecycle reconnect path has already bumped and announced it). */
-static int chat_connect_locked(UINT64 generation) {
-    connect_context* context;
-    if (!chat_lifecycle_operational_unlocked())
+int ChatClient::connectLocked(uint64_t generation) {
+    if (!lifecycleOperationalLocked())
         return -1;
-    if (InterlockedCompareExchange(&g_ready, 0, 0))
+    if (state_.load() != ChatConnState::Idle)
         return 0;
-    if (InterlockedCompareExchange(&g_connecting, 1, 0) != 0)
+    if (!transitionState(ChatConnState::Idle, ChatConnState::Connecting))
         return 0;
 
-    InterlockedExchange(&g_stop, 0);
+    stop_ = false;
+    connect_finished_ = false;
     if (!generation)
-        generation = invalidate_generation();
-    context = (connect_context*)malloc(sizeof(*context));
-    if (!context) { InterlockedExchange(&g_connecting, 0); return -1; }
-    context->generation = generation;
+        generation = invalidateGeneration();
 
-    HANDLE th = CreateThread(NULL, 0, connect_thread, context, 0, NULL);
-    if (!th) {
-        free(context);
-        InterlockedExchange(&g_connecting, 0);
+    reapFinishedThreadsLocked();
+    if (connect_thread_.joinable() || recv_thread_.joinable()) {
+        /* Unreachable through the public guards; fail rather than clobber a
+         * live worker (assigning onto a joinable std::thread terminates). */
+        nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "connect: worker still present, aborting");
+        forceStateIdle();
         return -1;
     }
-    reap_finished_threads_unlocked();
-    g_connect_thread = th;
+
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "connect: starting (generation=%llu)",
+           (unsigned long long)generation);
+    try {
+        connect_thread_ = std::thread(&ChatClient::connectThreadMain, this,
+                                      ConnectContext{generation});
+    } catch (...) {
+        nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "connect: failed to spawn worker");
+        forceStateIdle();
+        return -1;
+    }
     return 0;
 }
 
-int chat_connect(void) {
-    int result;
-
-    if (!g_cs_inited) return -1;
-    AcquireSRWLockExclusive(&g_disconnect_lock);
-    EnterCriticalSection(&g_cs);
-    reap_finished_threads_unlocked();
-    if (!chat_lifecycle_operational_unlocked() || g_lifecycle_busy) {
-        LeaveCriticalSection(&g_cs);
-        ReleaseSRWLockExclusive(&g_disconnect_lock);
+int ChatClient::connect() {
+    if (!inited_) return -1;
+    std::lock_guard<std::mutex> disconnect_lock(disconnectMutex_);
+    std::lock_guard<std::mutex> lock(cs_);
+    reapFinishedThreadsLocked();
+    if (!lifecycleOperationalLocked() || lifecycle_busy_) {
         return -1;
     }
-    if (g_thread || g_connect_thread) {
-        LeaveCriticalSection(&g_cs);
-        ReleaseSRWLockExclusive(&g_disconnect_lock);
+    if (recv_thread_.joinable() || connect_thread_.joinable()) {
         return 0;
     }
-    result = chat_connect_locked(0);   /* 0: bump only if a connect really starts */
-    LeaveCriticalSection(&g_cs);
-    ReleaseSRWLockExclusive(&g_disconnect_lock);
-    return result;
+    return connectLocked(0);   /* 0: bump only if a connect really starts */
 }
 
-void chat_disconnect(void) {
-    if (!g_cs_inited) return;
-    AcquireSRWLockExclusive(&g_disconnect_lock);
-    chat_disconnect_internal(1);
-    EnterCriticalSection(&g_cs);
-    SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-    LeaveCriticalSection(&g_cs);
-    ReleaseSRWLockExclusive(&g_disconnect_lock);
+void ChatClient::disconnect() {
+    if (!inited_) return;
+    std::lock_guard<std::mutex> disconnect_lock(disconnectMutex_);
+    disconnectInternal(1);
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        SecureZeroMemory(bootstrap_secret_, sizeof(bootstrap_secret_));
+    }
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "disconnect: complete");
 }
 
-void chat_disconnect_async(void) {
-    if (g_cs_inited) invalidate_generation();
-    chat_request_lifecycle(CHAT_LIFECYCLE_DISCONNECT);
+void ChatClient::disconnectAsync() {
+    invalidateGeneration();
+    requestLifecycle(LIFECYCLE_DISCONNECT);
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "disconnect_async: requested");
 }
 
-void chat_reconnect_async(void) {
-    if (g_cs_inited) invalidate_generation();
-    chat_request_lifecycle(CHAT_LIFECYCLE_RECONNECT);
+void ChatClient::reconnectAsync() {
+    invalidateGeneration();
+    requestLifecycle(LIFECYCLE_RECONNECT);
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "reconnect_async: requested");
 }
 
-int chat_is_connected(void) {
-    return InterlockedCompareExchange(&g_ready, 0, 0) ? 1 : 0;
+bool ChatClient::isConnected() const {
+    ChatConnState state = state_.load();
+    return state == ChatConnState::Connected || state == ChatConnState::Attached;
 }
 
 /* Socket up is enough to send; typed chat_id preferred when available.
    UI should still prefer CHAT_EVT_READY for canSend when chat_id matters. */
-int chat_is_ready(void) {
-    return InterlockedCompareExchange(&g_ready, 0, 0) &&
-        InterlockedCompareExchange(&g_attached, 0, 0) ? 1 : 0;
+bool ChatClient::isReady() const {
+    return state_.load() == ChatConnState::Attached;
 }
 
-int chat_needs_connect(void) {
-    int operational;
-    if (!g_cs_inited) return 0;
-    EnterCriticalSection(&g_cs);
-    operational = chat_lifecycle_operational_unlocked();
-    LeaveCriticalSection(&g_cs);
-    return operational && !InterlockedCompareExchange(&g_ready, 0, 0) &&
-        !InterlockedCompareExchange(&g_connecting, 0, 0);
+bool ChatClient::needsConnect() const {
+    if (!inited_) return false;
+    std::lock_guard<std::mutex> lock(cs_);
+    return lifecycleOperationalLocked() && state_.load() == ChatConnState::Idle;
 }
 
-int chat_attach(const char* chat_id) {
+int ChatClient::attach(const char* chat_id) {
     cJSON* root;
     char* payload;
     HINTERNET ws;
     DWORD err;
     if (!chat_history_is_valid_chat_id(chat_id)) return -1;
-    if (!g_cs_inited) return -1;
-    EnterCriticalSection(&g_cs);
-    if (!InterlockedCompareExchange(&g_ready, 0, 0) || !g_websocket ||
-        InterlockedCompareExchange(&g_stop, 0, 0)) { LeaveCriticalSection(&g_cs); return -1; }
-    InterlockedExchange(&g_attached, 0);
-    chat_copy_str(g_attach_id, sizeof(g_attach_id), chat_id);
-    ws = g_websocket;
-    root = cJSON_CreateObject();
-    if (!root || !cJSON_AddStringToObject(root, "type", "attach") ||
-        !cJSON_AddStringToObject(root, "chat_id", chat_id)) {
-        cJSON_Delete(root); LeaveCriticalSection(&g_cs); return -1;
+    if (!inited_) return -1;
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        if (!isConnected() || !websocket_ || stop_.load()) return -1;
+        /* Re-attach demotes Attached -> Connected; a first attach is already
+         * Connected and must not log a bogus "lost race". */
+        if (state_.load() == ChatConnState::Attached)
+            transitionState(ChatConnState::Attached, ChatConnState::Connected);
+        chat_copy_str(attach_id_, sizeof(attach_id_), chat_id);
+        ws = websocket_;
+        root = cJSON_CreateObject();
+        if (!root || !cJSON_AddStringToObject(root, "type", "attach") ||
+            !cJSON_AddStringToObject(root, "chat_id", chat_id)) {
+            cJSON_Delete(root);
+            return -1;
+        }
+        payload = cJSON_PrintUnformatted(root);
+        cJSON_Delete(root);
+        if (!payload) return -1;
+        err = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
+            payload, (DWORD)strlen(payload));
+        free(payload);
     }
-    payload = cJSON_PrintUnformatted(root); cJSON_Delete(root);
-    if (!payload) { LeaveCriticalSection(&g_cs); return -1; }
-    err = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
-        payload, (DWORD)strlen(payload));
-    free(payload);
-    LeaveCriticalSection(&g_cs);
+    nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "attach: chat_id=%.32s -> %s",
+           chat_id, err == ERROR_SUCCESS ? "sent" : "failed");
     return err == ERROR_SUCCESS ? 0 : -1;
 }
 
-int chat_send(const char* utf8_text) {
+int ChatClient::send(const char* utf8_text) {
     if (!utf8_text || !utf8_text[0]) return -1;
-    if (!g_cs_inited) return -1;
+    if (!inited_) return -1;
 
     char chat_id[128];
     HINTERNET ws;
     DWORD err;
 
-    EnterCriticalSection(&g_cs);
-    /* Disconnect clears ready before it cancels ws under this same lock. */
-    if (!InterlockedCompareExchange(&g_ready, 0, 0) ||
-        InterlockedCompareExchange(&g_stop, 0, 0)) {
-        LeaveCriticalSection(&g_cs);
+    std::lock_guard<std::mutex> lock(cs_);
+    /* Disconnect clears the state before it cancels the socket under this
+     * same lock. */
+    if (!isConnected() || stop_.load())
         return -1;
-    }
-    chat_copy_str(chat_id, sizeof(chat_id), g_chat_id);
-    ws = g_websocket;
-    if (!ws) {
-        LeaveCriticalSection(&g_cs);
+    chat_copy_str(chat_id, sizeof(chat_id), chat_id_);
+    ws = websocket_;
+    if (!ws)
         return -1;
-    }
 
     cJSON* root = cJSON_CreateObject();
-    if (!root) {
-        LeaveCriticalSection(&g_cs);
+    if (!root)
         return -1;
-    }
 
-    if (!InterlockedCompareExchange(&g_attached, 0, 0) || !chat_history_is_valid_chat_id(chat_id) ||
+    if (state_.load() != ChatConnState::Attached ||
+        !chat_history_is_valid_chat_id(chat_id) ||
         !cJSON_AddStringToObject(root, "type", "message") ||
         !cJSON_AddStringToObject(root, "chat_id", chat_id) ||
         !cJSON_AddStringToObject(root, "content", utf8_text)) {
         cJSON_Delete(root);
-        LeaveCriticalSection(&g_cs);
         return -1;
     }
 
     char* payload = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
-    if (!payload) {
-        LeaveCriticalSection(&g_cs);
+    if (!payload)
         return -1;
-    }
 
-    /* Hold CS across send so disconnect cannot close the handle mid-call. */
+    /* Hold cs_ across send so disconnect cannot close the handle mid-call. */
     err = WinHttpWebSocketSend(ws,
         WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
         (PVOID)payload, (DWORD)strlen(payload));
-    LeaveCriticalSection(&g_cs);
     free(payload);
 
+    nm_log(NM_LOG_DEBUG, CHAT_LOG_MODULE, "send: %zu bytes -> %s",
+           strlen(utf8_text), err == ERROR_SUCCESS ? "ok" : "failed");
     return (err == ERROR_SUCCESS) ? 0 : -1;
 }
 
-void chat_shutdown(void) {
-    HANDLE lifecycle_thread_handle;
-    HANDLE lifecycle_event;
+void ChatClient::shutdown() {
+    if (!inited_) return;
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        hwnd_ = NULL;
+        msg_id_ = 0;
+        shutting_down_ = true;
+        lifecycle_request_ = LIFECYCLE_SHUTDOWN;
+    }
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "shutdown: requesting lifecycle stop");
 
-    if (!g_cs_inited) return;
-    EnterCriticalSection(&g_cs);
-    g_hwnd = NULL;
-    g_msg_id = 0;
-    g_shutting_down = 1;
-    g_lifecycle_request = CHAT_LIFECYCLE_SHUTDOWN;
-    lifecycle_thread_handle = g_lifecycle_thread;
-    lifecycle_event = g_lifecycle_event;
-    LeaveCriticalSection(&g_cs);
-
-    if (lifecycle_thread_handle && lifecycle_event) {
-        SetEvent(lifecycle_event);
-        WaitForSingleObject(lifecycle_thread_handle, INFINITE);
-        CloseHandle(lifecycle_thread_handle);
-        CloseHandle(lifecycle_event);
+    if (lifecycle_running_) {
+        lifecycleCv_.notify_one();
+        if (lifecycle_thread_.joinable())
+            lifecycle_thread_.join();
     } else {
-        AcquireSRWLockExclusive(&g_disconnect_lock);
-        chat_disconnect_internal(1);
-        ReleaseSRWLockExclusive(&g_disconnect_lock);
-        if (lifecycle_event)
-            CloseHandle(lifecycle_event);
+        std::lock_guard<std::mutex> disconnect_lock(disconnectMutex_);
+        disconnectInternal(1);
     }
 
-    EnterCriticalSection(&g_cs);
-    g_lifecycle_thread = NULL;
-    g_lifecycle_event = NULL;
-    SecureZeroMemory(g_bootstrap_secret, sizeof(g_bootstrap_secret));
-    LeaveCriticalSection(&g_cs);
-    DeleteCriticalSection(&g_cs);
-    g_cs_inited = 0;
+    {
+        std::lock_guard<std::mutex> lock(cs_);
+        lifecycle_running_ = false;
+        SecureZeroMemory(bootstrap_secret_, sizeof(bootstrap_secret_));
+    }
+    inited_ = false;
+    nm_log(NM_LOG_INFO, CHAT_LOG_MODULE, "shutdown: complete");
+}
+
+ChatClient::~ChatClient() {
+    /* shutdown() (WM_DESTROY) owns teardown; join defensively so a missed
+     * call can never terminate the process via a joinable std::thread. */
+    if (lifecycle_thread_.joinable())
+        lifecycle_thread_.join();
+    if (recv_thread_.joinable())
+        recv_thread_.join();
+    if (connect_thread_.joinable())
+        connect_thread_.join();
 }

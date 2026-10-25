@@ -2,7 +2,7 @@
 #define CHAT_UI_H
 
 #include "ui_core.h"
-#include "chat.h"
+#include "chat.hpp"
 #include <windows.h>
 
 #ifdef __cplusplus

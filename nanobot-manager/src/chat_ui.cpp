@@ -1,5 +1,5 @@
 #include "chat_ui.h"
-#include "chat.h"
+#include "chat.hpp"
 #include "chat_history.h"
 #include "chat_protocol.h"
 #include "cJSON.h"
@@ -370,14 +370,14 @@ static void set_can_send(int enabled) {
 }
 
 static int can_send_now(void) {
-    return g_turn_state == CHAT_TURN_IDLE && chat_is_ready() &&
+    return g_turn_state == CHAT_TURN_IDLE && chat_client().isReady() &&
         (!g_health_fn || g_health_fn());
 }
 
 static int can_retry_now(void) {
     return chat_protocol_retry_allowed(g_auto_connect_blocked,
         g_turn_state == CHAT_TURN_IDLE, !g_health_fn || g_health_fn(),
-        chat_is_connected(), !chat_needs_connect(), g_attach_pending);
+        chat_client().isConnected(), !chat_client().needsConnect(), g_attach_pending);
 }
 
 static void attach_after_ready(const char* offered_id) {
@@ -392,7 +392,7 @@ static void attach_after_ready(const char* offered_id) {
         terminal_failure("无法准备新的聊天记录", "Could not prepare new chat history", NULL);
         return;
     }
-    if (chat_attach(wanted) != 0) {
+    if (chat_client().attach(wanted) != 0) {
         terminal_failure("无法附加聊天会话", "Could not attach chat session", NULL);
         return;
     }
@@ -420,7 +420,7 @@ static void terminal_failure(const char* zh, const char* en, const char* detail)
     if (detail && detail[0]) chat_ui_status(detail);
     else chat_ui_status_i18n(zh, en);
     set_can_send(0);
-    chat_disconnect_async();
+    chat_client().disconnectAsync();
 }
 
 static void discard_new_history_backup(void) {
@@ -564,7 +564,7 @@ int chat_ui_can_auto_connect(void) { return !g_auto_connect_blocked; }
 void chat_ui_on_event(WPARAM kind, chat_event* event) {
     char* detail;
     if (!event) return;
-    if (event->generation != chat_current_generation()) {
+    if (event->generation != chat_client().currentGeneration()) {
         chat_event_free(event);
         return;
     }
@@ -572,7 +572,7 @@ void chat_ui_on_event(WPARAM kind, chat_event* event) {
     switch ((int)kind) {
     case CHAT_EVT_CONNECTED:
         /* CONNECTED can be queued behind ATTACHED; never regress a ready UI. */
-        if (!chat_is_ready()) {
+        if (!chat_client().isReady()) {
             /* Cover the CONNECTED -> READY window too: if the gateway completes
              * the upgrade but never offers a session, the attach deadline would
              * otherwise never be armed. attach_after_ready re-arms it on READY. */
@@ -726,7 +726,7 @@ void chat_ui_on_send(int health_running) {
         g_auto_connect_blocked = 0;
         set_can_send(0);
         chat_ui_status_i18n("正在连接…", "Connecting…");
-        chat_connect();
+        chat_client().connect();
         return;
     }
     raw = ui_page_get_json(g_page, "draft");
@@ -751,10 +751,10 @@ void chat_ui_on_send(int health_running) {
         cJSON_Delete(json);
         return;
     }
-    if (!chat_is_ready()) {
+    if (!chat_client().isReady()) {
         chat_ui_status_i18n("连接中…连接后请再次发送", "Connecting… send again when connected");
         g_auto_connect_blocked = 0;
-        chat_connect();
+        chat_client().connect();
         cJSON_Delete(json);
         return;
     }
@@ -781,7 +781,7 @@ void chat_ui_on_send(int health_running) {
         cJSON_Delete(json);
         return;
     }
-    if (chat_send(is_new ? "/new" : text) != 0) {
+    if (chat_client().send(is_new ? "/new" : text) != 0) {
         cJSON_Delete(backup);
         cJSON_Delete(empty_history);
         persist_binding(prior_resume_safe);
