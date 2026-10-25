@@ -33,7 +33,8 @@ export default {
       messages: [],
       draft: "",
       canSend: true,
-      chatStatus: "",
+      chatStatusKey: "chat_status_start_nanobot",
+      chatStatusDetail: "",
       hover: "",
       ambientGlow: 1,
       ringSize: 16,
@@ -908,7 +909,7 @@ export default {
 
         <div v-if="page=='chat'" class="chat-page">
           <div class="chat-status-bar">
-            <label class="chat-status-text">{{ chatStatus }}</label>
+            <label class="chat-status-text">{{ chatStatusDetail || $t(chatStatusKey) }}</label>
           </div>
 
           <ScrollView id="chat_scroll" class="chat-scroll">

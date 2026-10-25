@@ -148,8 +148,7 @@ int ChatUi::commitCanonical(const char* canonical_or_null) {
 /* --- history --------------------------------------------------------------- */
 
 void ChatUi::saveFailureStatus() {
-    statusI18n("聊天记录保存失败，将在之后重试",
-               "Could not save chat history; it will be retried");
+    statusKey("chat_status_save_retry");
 }
 
 /* chat_history predicates (can_resume) expect document.messages to be an
@@ -232,8 +231,7 @@ bool ChatUi::prepareFreshSession() {
         wchar_t archive_path[MAX_PATH + 64];
         if (chat_history_copy_to_archive(history_path_, archive_path,
                 _countof(archive_path), &error) != 0) {
-            statusI18n("无法备份旧聊天记录，未连接",
-                       "Could not archive old chat history; not connecting");
+            statusKey("chat_status_archive_failed");
             return false;
         }
     }
@@ -288,12 +286,11 @@ bool ChatUi::recoverHistoryBeforeSend() {
         saved_revision_ = 0;
         setDirty();
         history_read_error_ = false;
-        statusI18n("无效历史已备份", "Invalid chat history was backed up");
+        statusKey("chat_status_history_backed_up");
         return true;
     }
     chat_history_document_free(&loaded);
-    statusI18n("聊天记录暂时不可用，未发送消息",
-               "Chat history is temporarily unavailable; message was not sent");
+    statusKey("chat_status_history_unavailable");
     return false;
 }
 
@@ -317,12 +314,12 @@ void ChatUi::setCanSend(int enabled) {
     if (page_) ui_page_set_bool(page_, "canSend", enabled ? 1 : 0);
 }
 
-void ChatUi::statusUtf8(const char* utf8) {
-    nm_page_set_utf8(page_, "chatStatus", utf8);
+void ChatUi::statusKey(const char* key) {
+    nm_page_set_utf8(page_, "chatStatusKey", key ? key : "");
 }
 
-void ChatUi::statusI18n(const char* zh, const char* en) {
-    statusUtf8(is_zh_ && is_zh_() ? zh : en);
+void ChatUi::statusDetail(const char* utf8) {
+    nm_page_set_utf8(page_, "chatStatusDetail", utf8 ? utf8 : "");
 }
 
 void ChatUi::attachScroll(UiWidget widget) {
@@ -340,26 +337,26 @@ void ChatUi::detachScroll(UiWidget widget) {
 void ChatUi::attachAfterReady(const char* offered_id) {
     const char* wanted = offered_id;
     if (!chat_history_is_valid_chat_id(offered_id)) {
-        terminalFailure("服务器会话无效", "Server offered an invalid chat session", NULL);
+        terminalFailure("chat_status_invalid_session", NULL);
         return;
     }
     if (canResume())
         wanted = history_.chat_id;
     else if (!prepareFreshSession()) {
-        terminalFailure("无法准备新的聊天记录", "Could not prepare new chat history", NULL);
+        terminalFailure("chat_status_prepare_failed", NULL);
         return;
     }
     if (chat_client().attach(wanted) != 0) {
-        terminalFailure("无法附加聊天会话", "Could not attach chat session", NULL);
+        terminalFailure("chat_status_attach_failed", NULL);
         return;
     }
     attach_pending_ = true;
     attach_deadline_ = GetTickCount64() + CHAT_ATTACH_TIMEOUT_MS;
     setCanSend(0);
-    statusI18n("正在恢复会话…", "Restoring session…");
+    statusKey("chat_status_restoring");
 }
 
-void ChatUi::terminalFailure(const char* zh, const char* en, const char* detail) {
+void ChatUi::terminalFailure(const char* key, const char* detail) {
     int had_fresh = fresh_pending_ ? 1 : 0;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate the partial reply before teardown */
@@ -375,8 +372,8 @@ void ChatUi::terminalFailure(const char* zh, const char* en, const char* detail)
     if (chat_protocol_should_persist_unsafe(had_fresh, history_.resume_safe))
         persistBinding(0);
     auto_connect_blocked_ = true;
-    if (detail && detail[0]) statusUtf8(detail);
-    else statusI18n(zh, en);
+    if (detail && detail[0]) statusDetail(detail);
+    else statusKey(key);
     setCanSend(0);
     chat_client().disconnectAsync();
 }
@@ -391,7 +388,7 @@ void ChatUi::onConnected() {
          * otherwise never be armed. attachAfterReady re-arms it on READY. */
         attach_pending_ = true;
         attach_deadline_ = GetTickCount64() + CHAT_ATTACH_TIMEOUT_MS;
-        statusI18n("已连接…", "Connected…");
+        statusKey("chat_status_connected_ellipsis");
         setCanSend(0);
     }
 }
@@ -419,7 +416,7 @@ void ChatUi::onAttached(const char* attached_id) {
             chat_history_save(history_path_, &fresh, NULL) != 0) {
             fresh.messages = NULL;
             cJSON_Delete(array);
-            terminalFailure("聊天记录保存失败", "Could not save chat history", NULL);
+            terminalFailure("chat_status_save_failed", NULL);
             return;
         }
         history_.messages = NULL;
@@ -440,10 +437,10 @@ void ChatUi::onAttached(const char* attached_id) {
     strcpy_s(history_.chat_id, sizeof(history_.chat_id), attached_id);
     history_.resume_safe = turn_state_ == ChatTurnState::Idle ? 1 : 0;
     if (!fresh_committed && !persistBinding(history_.resume_safe)) {
-        terminalFailure("聊天记录保存失败", "Could not save chat history", NULL);
+        terminalFailure("chat_status_save_failed", NULL);
         return;
     }
-    statusI18n("已连接", "Connected");
+    statusKey("chat_status_connected");
     setCanSend(canSendNow() ? 1 : 0);
 }
 
@@ -460,7 +457,7 @@ void ChatUi::onDisconnected() {
     turn_state_ = ChatTurnState::Idle;
     saveIfDirty();
     if (!auto_connect_blocked_)
-        statusI18n("未连接", "Disconnected");
+        statusKey("chat_status_disconnected");
     setCanSend(canRetryNow() ? 1 : 0);
 }
 
@@ -471,8 +468,7 @@ void ChatUi::onDelta(const char* chunk) {
     turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
     if (!chunk) return;
     if (!draft_.append(chunk, CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES))
-        statusI18n("回复过长，已保留可保存的内容",
-                   "Reply is too long; the saved portion was kept");
+        statusKey("chat_status_reply_too_long");
     else
         setDirty();
 }
@@ -489,8 +485,7 @@ void ChatUi::onMessage(const char* detail) {
         }
     } else if (turn_state_ == ChatTurnState::NormalWaitActivity) {
         if (detail && !commitCanonical(detail))
-            statusI18n("回复过长，已保留可保存的内容",
-                       "Reply is too long; the saved portion was kept");
+            statusKey("chat_status_reply_too_long");
         turn_state_ = ChatTurnState::Idle;
         turn_deadline_ = 0;
         persistBinding(1);
@@ -498,8 +493,7 @@ void ChatUi::onMessage(const char* detail) {
     } else if (turn_state_ == ChatTurnState::NormalActive) {
         turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
         if (detail && !commitCanonical(detail))
-            statusI18n("回复过长，已保留可保存的内容",
-                       "Reply is too long; the saved portion was kept");
+            statusKey("chat_status_reply_too_long");
         saveIfDirty();
     }
     flushMessagesUi();
@@ -513,8 +507,7 @@ void ChatUi::onStreamEnd(const char* detail) {
      * watchdog armed for that gap. */
     turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
     if (detail && !commitCanonical(detail))
-        statusI18n("回复过长，已保留可保存的内容",
-                   "Reply is too long; the saved portion was kept");
+        statusKey("chat_status_reply_too_long");
     /* Without canonical text the draft stays active and is fixated at
      * TURN_END / disconnect. */
     saveIfDirty();
@@ -533,7 +526,7 @@ void ChatUi::onTurnEnd() {
 }
 
 void ChatUi::onError(const char* detail) {
-    terminalFailure("连接失败", "Connection failed", detail);
+    terminalFailure("chat_status_connection_failed", detail);
 }
 
 /* --- event dispatch ----------------------------------------------------------- */
@@ -568,7 +561,7 @@ void ChatUi::onSend(int health_running) {
     if (canRetryNow()) {
         auto_connect_blocked_ = false;
         setCanSend(0);
-        statusI18n("正在连接…", "Connecting…");
+        statusKey("chat_status_connecting");
         chat_client().connect();
         return;
     }
@@ -579,7 +572,7 @@ void ChatUi::onSend(int health_running) {
     const char* text = json && cJSON_IsString(json) ? json->valuestring : NULL;
     if (!text) { cJSON_Delete(json); return; }
     if (strlen(text) > CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES) {
-        statusI18n("消息过长，无法发送", "Message is too long to send");
+        statusKey("chat_status_msg_too_long");
         cJSON_Delete(json);
         return;
     }
@@ -589,12 +582,12 @@ void ChatUi::onSend(int health_running) {
         return;
     }
     if (!health_running) {
-        statusI18n("请先启动 nanobot", "Start nanobot first");
+        statusKey("chat_status_start_first");
         cJSON_Delete(json);
         return;
     }
     if (!chat_client().isReady()) {
-        statusI18n("连接中…连接后请再次发送", "Connecting… send again when connected");
+        statusKey("chat_status_connecting_retry");
         auto_connect_blocked_ = false;
         chat_client().connect();
         cJSON_Delete(json);
@@ -607,14 +600,13 @@ void ChatUi::onSend(int health_running) {
     int prior_resume_safe = history_.resume_safe;
     if (!persistBinding(0)) {
         history_.resume_safe = prior_resume_safe;
-        statusI18n("聊天记录保存失败，未发送消息",
-                   "Could not save chat history; message was not sent");
+        statusKey("chat_status_save_failed_nosend");
         cJSON_Delete(json);
         return;
     }
     if (chat_client().send(is_new ? "/new" : text) != 0) {
         persistBinding(prior_resume_safe);
-        statusI18n("发送失败", "Send failed");
+        statusKey("chat_status_send_failed");
         cJSON_Delete(json);
         return;
     }
@@ -638,9 +630,8 @@ void ChatUi::onSend(int health_running) {
 
 /* --- lifecycle ------------------------------------------------------------------ */
 
-void ChatUi::bind(UiPage page, int (*is_zh)(void)) {
+void ChatUi::bind(UiPage page) {
     page_ = page;
-    is_zh_ = is_zh;
 }
 
 void ChatUi::setGateway(int (*health_fn)(void), int webui_port) {
@@ -669,16 +660,14 @@ void ChatUi::configureHistory(const wchar_t* config_path) {
             revision_ = 0;
             saved_revision_ = 0;
             setDirty();
-            statusI18n("无效历史已备份", "Invalid chat history was backed up");
+            statusKey("chat_status_history_backed_up");
         } else {
             history_read_error_ = true;
-            statusI18n("无效聊天记录无法备份，原文件未被覆盖",
-                       "Invalid chat history could not be backed up; existing file was not replaced");
+            statusKey("chat_status_history_quarantine_failed");
         }
     } else if (result == CHAT_HISTORY_LOAD_IO_ERROR) {
         history_read_error_ = true;
-        statusI18n("聊天记录读取失败，现有记录未被覆盖",
-                   "Could not read chat history; existing file was not replaced");
+        statusKey("chat_status_history_read_failed");
     }
     chat_history_document_free(&loaded);
 }
@@ -698,7 +687,7 @@ void ChatUi::resetIdle() {
         ui_page_set_text(page_, "draft", L"");
         setCanSend(0);
     }
-    statusI18n("启动 nanobot 后即可聊天", "Start nanobot to chat");
+    statusKey("chat_status_start_nanobot");
 }
 
 void ChatUi::shutdown() {
@@ -715,7 +704,6 @@ void ChatUi::shutdown() {
     page_ = 0;
     chat_scroll_ = 0;
     messages_ui_dirty_ = false;
-    is_zh_ = NULL;
     health_fn_ = NULL;
     history_path_[0] = L'\0';
     history_read_error_ = false;
@@ -734,15 +722,15 @@ void ChatUi::onGatewayStopped() {
     restoreNewHistoryBackup();
     turn_state_ = ChatTurnState::Idle;
     saveIfDirty();
-    statusI18n("启动 nanobot 后即可聊天", "Start nanobot to chat");
+    statusKey("chat_status_start_nanobot");
     setCanSend(0);
 }
 
 void ChatUi::tick(ULONGLONG now) {
     if (attach_pending_ && now >= attach_deadline_)
-        terminalFailure("恢复会话超时", "Session restore timed out", NULL);
+        terminalFailure("chat_status_attach_timeout", NULL);
     else if (turn_state_ != ChatTurnState::Idle && turn_deadline_ && now >= turn_deadline_)
-        terminalFailure("等待回复超时", "Timed out waiting for a reply", NULL);
+        terminalFailure("chat_status_turn_timeout", NULL);
 }
 
 void ChatUi::publishTick() {

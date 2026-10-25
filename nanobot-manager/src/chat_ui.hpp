@@ -45,7 +45,10 @@ struct ChatMsg {
  * flush entry points. */
 class ChatUi {
 public:
-    void bind(UiPage page, int (*is_zh)(void));
+    /* Status text is key-based: statusKey() pushes an i18n key into the
+     * chatStatusKey page field ($t resolves it, so locale switches refresh
+     * the label); raw server error text goes to chatStatusDetail instead. */
+    void bind(UiPage page);
 
     /* health_fn returns 1 if the gateway is running; drives the send button. */
     void setGateway(int (*health_fn)(void), int webui_port);
@@ -102,10 +105,10 @@ private:
 
     /* --- derived state ---------------------------------------------------- */
     void setCanSend(int enabled);
-    void statusUtf8(const char* utf8);
-    void statusI18n(const char* zh, const char* en);
+    void statusKey(const char* key);
+    void statusDetail(const char* utf8);
     void attachAfterReady(const char* offered_id);
-    void terminalFailure(const char* zh, const char* en, const char* detail);
+    void terminalFailure(const char* key, const char* detail);
 
     /* --- per-event handlers (CHAT_EVT_*) ---------------------------------- */
     void onConnected();
@@ -119,7 +122,6 @@ private:
     void onError(const char* detail);
 
     UiPage page_ = 0;
-    int (*is_zh_)(void) = nullptr;
     int (*health_fn_)(void) = nullptr;
     int webui_port_ = 8765;
 

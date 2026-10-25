@@ -2348,7 +2348,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     /* Chat initial state */
-    chat_ui().bind(g_page, is_zh);
+    chat_ui().bind(g_page);
     chat_ui().setGateway(health_running_thunk, g_effective_webui_port);
     chat_ui().resetIdle();
     chat_ui().configureHistory(config_get_active_path());

@@ -127,6 +127,38 @@ static const status_i18n_entry g_status_i18n[] = {
     /* Non-status key: the nanobotPath "Auto-detect" label is pushed from C++
      * (main.cpp), not rendered via $t() — the table keeps it single-source. */
     { "auto_detect",                 "自动检测",                       "Auto-detect" },
+    /* Chat page status keys: ChatUi pushes the KEY (chatStatusKey) and the
+     * template renders $t(chatStatusKey), so locale switches re-resolve
+     * automatically. Raw server error text rides a separate non-i18n field
+     * (chatStatusDetail) that the template prefers when non-empty. */
+    { "chat_status_save_retry",      "聊天记录保存失败，将在之后重试",   "Could not save chat history; it will be retried" },
+    { "chat_status_archive_failed",  "无法备份旧聊天记录，未连接",       "Could not archive old chat history; not connecting" },
+    { "chat_status_history_backed_up", "无效历史已备份",                "Invalid chat history was backed up" },
+    { "chat_status_history_quarantine_failed", "无效聊天记录无法备份，原文件未被覆盖",
+                                     "Invalid chat history could not be backed up; existing file was not replaced" },
+    { "chat_status_history_read_failed", "聊天记录读取失败，现有记录未被覆盖",
+                                     "Could not read chat history; existing file was not replaced" },
+    { "chat_status_history_unavailable", "聊天记录暂时不可用，未发送消息",
+                                     "Chat history is temporarily unavailable; message was not sent" },
+    { "chat_status_start_nanobot",   "启动 nanobot 后即可聊天",         "Start nanobot to chat" },
+    { "chat_status_invalid_session", "服务器会话无效",                  "Server offered an invalid chat session" },
+    { "chat_status_prepare_failed",  "无法准备新的聊天记录",             "Could not prepare new chat history" },
+    { "chat_status_attach_failed",   "无法附加聊天会话",                "Could not attach chat session" },
+    { "chat_status_restoring",       "正在恢复会话…",                   "Restoring session…" },
+    { "chat_status_connected_ellipsis", "已连接…",                      "Connected…" },
+    { "chat_status_connected",       "已连接",                          "Connected" },
+    { "chat_status_disconnected",    "未连接",                          "Disconnected" },
+    { "chat_status_reply_too_long",  "回复过长，已保留可保存的内容",      "Reply is too long; the saved portion was kept" },
+    { "chat_status_save_failed",     "聊天记录保存失败",                 "Could not save chat history" },
+    { "chat_status_connection_failed", "连接失败",                      "Connection failed" },
+    { "chat_status_connecting",      "正在连接…",                       "Connecting…" },
+    { "chat_status_msg_too_long",    "消息过长，无法发送",               "Message is too long to send" },
+    { "chat_status_start_first",     "请先启动 nanobot",                "Start nanobot first" },
+    { "chat_status_connecting_retry", "连接中…连接后请再次发送",       "Connecting… send again when connected" },
+    { "chat_status_save_failed_nosend", "聊天记录保存失败，未发送消息",    "Could not save chat history; message was not sent" },
+    { "chat_status_send_failed",     "发送失败",                        "Send failed" },
+    { "chat_status_attach_timeout",  "恢复会话超时",                    "Session restore timed out" },
+    { "chat_status_turn_timeout",    "等待回复超时",                    "Timed out waiting for a reply" },
 };
 
 const char* i18n_status(const char* key, int zh) {
