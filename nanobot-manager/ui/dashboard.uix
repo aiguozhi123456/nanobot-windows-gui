@@ -80,13 +80,15 @@ export default {
      translucent-white titlebar / inputs drawn over it), so the whole glass looks
      dim — no DWM flag fixes that (they were verified correct). Lift the base
      toward the theme surface with an achromatic white veil; hue fields below
-     keep their tint on top. 0.6 is the user-tuned final: 0.8 lifted the base
-     fully but read as milky and killed the see-through, so brightness yields to
-     transparency. An achromatic veil may exceed the ≤0.32 hue-field cap — that
-     cap keeps COLORS from turning the glass opaque pastel, white haze doesn't
-     fight the backdrop hue. */
+     keep their tint on top. Calibration history: 0.8 lifted the base fully but
+     read as milky ("太白、失透"), 0.6 was the 2026-10-25 user-tuned final; later
+     that day the DWM fog stopped sampling the backdrop env-wide, making the
+     glass read opaque white over light backdrops, so the veil was re-lowered to
+     0.45 to hunt transparency (pending user calibration). An achromatic veil may
+     exceed the ≤0.32 hue-field cap — that cap keeps COLORS from turning the
+     glass opaque pastel, white haze doesn't fight the backdrop hue. */
   .theme-light {
-    background: rgba(255, 255, 255, 0.6);
+    background: rgba(255, 255, 255, 0.45);
   }
 
   /* Hue-accent fields OVER the acrylic backdrop (kept faint: on a translucent

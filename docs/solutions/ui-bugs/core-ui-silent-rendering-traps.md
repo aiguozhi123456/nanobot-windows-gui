@@ -57,7 +57,7 @@ tags: [core-ui, dashboard-uix, uix-binding, opacity-subtree, border-radius, css-
 - **`position:absolute; left:0; right:0` 期望左右拉伸**：绝对定位宽度只取 `fixedW` 或 `SizeHint()`（widget.cpp:411-421），`posRight` 仅在 `posLeft` 缺席时当定位锚点，不参与宽度求解。满宽必须显式 `width`（窗口固定尺寸时可直接算出）。
 - **净零边距算术只加不减**：`.backdrop-b` 写了 `margin-top:220 + height:300 + margin-bottom:-500`，净流高 = +20 DIP——把标题栏整体顶下来，窗口顶部出现一条背景色带。净零 div 的 margin 必须满足 `margin-top + height + margin-bottom = 0`（此例 -520 才对）。
 - **DPI 不感知的截图（假警报来源）**：PowerShell PrintWindow（`PW_RENDERFULLCONTENT=2`）在一个 150% 缩放的机器上，采集进程 DPI 不感知，窗口真实物理尺寸 645x750，DC 却硬裁到 430px——"卡片被裁切、第三个 metric 截断"完全是采集侧假象。修正：在 GetWindowRect/PrintWindow 之前先 P/Invoke `SetProcessDPIAware()`。
-- **PrintWindow 采集 DComp 窗口拿到空/旧内容**：透窗版（WS_EX_NOREDIRECTIONBITMAP + DirectComposition）不走重定向表面，PrintWindow 抓不到合成内容——改用 `CopyFromScreen` 按窗口屏幕区域拷屏（代价：重叠窗口/光标会入镜，采图前先移开并前置）。
+- **PrintWindow 采集 DComp 窗口拿到空/旧内容**：透窗版（WS_EX_NOREDIRECTIONBITMAP + DirectComposition）不走重定向表面，PrintWindow 抓不到合成内容——改用 `CopyFromScreen` 按窗口屏幕区域拷屏（代价：重叠窗口/光标会入镜）。**采图前零接触**（2026-10-25 修订）：移动/前置/还原窗口本身就是一次 backdrop 踢，会把死采样踢活、伪造"采集正常"——只做纯查询（GetWindowRect）+ 纯读屏（CopyFromScreen），判别采样死活用壁纸对照，见 architecture-patterns/translucent-window-dwm-acrylic.md 三轮。
 - **视觉模型读小图标不可靠**：对小尺寸图标的判读反复互相矛盾；曾把渲染内容"读"成不存在的"fox logo"（幻觉）。像素扫描才稳定。
 - **鼠标位置污染截图**：首批截图时鼠标恰好停在某个导航项上，截到的是 hover 态。采图前需 `SetCursorPos` 把光标移开。
 
@@ -237,7 +237,7 @@ core-ui UI 编写清单（每条都对应一个已付过学费的静默陷阱）
 - [ ] **多层逗号背景不支持**——一层渐变一个元素，不要写 `background: g1, g2`。
 - [ ] **`backdrop-filter`/`box-shadow` 不要直接写在 ScrollView 上**（覆写的 DrawTree 跳过基类绘制）——玻璃/投影放包住它的普通 div。
 - [ ] **绝对定位满宽写显式 `width`**——`left`+`right` 组合不拉伸宽度；固定尺寸窗口可直接算出列宽（如 430 - 48 侧栏 = 382px）。
-- [ ] **采集 DComp/NOREDIRECTIONBITMAP 窗口用 CopyFromScreen 拷屏**——PrintWindow 抓不到组合表面内容；先移光标、再前置窗口。
+- [ ] **采集 DComp/NOREDIRECTIONBITMAP 窗口用 CopyFromScreen 拷屏，且零接触**——PrintWindow 抓不到组合表面内容；移开光标可以，但移动/前置/还原窗口都是 backdrop 踢，会把死采样踢活、伪造通过（判采样死活用壁纸对照，见 architecture-patterns/translucent-window-dwm-acrylic.md 三轮）。
 
 ## Related Issues
 

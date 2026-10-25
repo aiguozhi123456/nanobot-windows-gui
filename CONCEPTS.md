@@ -203,3 +203,25 @@ The user's chosen Windows light/dark personalization for applications, which the
 Windows exposes this state only as a registry value, not through a theme API, so the manager reads it at startup before the first paint and again when the user picks the "system" option. The concrete theme must be resolved before the window is created, or the wrong theme flashes for one frame; a hard-coded theme attribute on the UI template silently overrides whatever the manager decides and must not be present.
 
 
+
+## Translucent Window
+
+### Backdrop Sampling
+Whether the DWM system-backdrop material behind the translucent window actually samples the desktop behind it, as opposed to merely being composited as a flat tint.
+
+Sampling has a dead state — the material renders as a flat fog that ignores the desktop — and it only wires up when a backdrop attribute value change lands on the already-visible window; a same-value re-application is a no-op to DWM. A hidden-to-show cycle can leave it dead again, so the wiring is re-triggered after every reveal.
+
+### Backdrop Kick
+A deliberate value-changing re-application of the immersive-dark attribute after the window becomes visible, forcing DWM to re-evaluate Backdrop Sampling.
+
+It is scheduled after the first reveal and on every hidden-to-show cycle. It is invisible while sampling is dead (neither tint state renders a material) and costs at most one frame of tint shift when alive; same-value repaints and frame-change nudges do not substitute for it.
+
+### Zero-Touch Capture
+The screenshot discipline for verifying translucency: only pure window queries and screen reads may precede a capture.
+
+Any window operation beforehand — foregrounding, moving, minimize/restore — is itself a Backdrop Kick that can revive dead sampling and fake a pass, which is how early "cannot reproduce" conclusions got polluted.
+
+### Wallpaper Discrimination
+Judging whether Backdrop Sampling is alive by capturing against a desktop-wallpaper-backed region: alive fog shifts toward the wallpaper's color, dead fog stays a constant tint.
+
+Neutral or white backgrounds mask the difference almost entirely, so the wallpaper A/B is the decisive probe; window-move A/Bs remain valid only for color calibration after liveness is established.

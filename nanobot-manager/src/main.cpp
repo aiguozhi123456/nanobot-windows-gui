@@ -79,6 +79,7 @@ static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manage
 #define TIMER_PULSE 1007
 #define TIMER_FIELD_DRIFT 1008
 #define TIMER_BG_TRIM 1009
+#define TIMER_BACKDROP_KICK 1010
 /* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
  * and each flush costs an O(rendered-history) serialize + JSON parse. */
 #define CHAT_UI_FRAME_MS 66
@@ -175,6 +176,35 @@ static void backdrop_reapply_for_theme(int dark) {
         apply_accent_acrylic(g_hwnd, dark);
 }
 
+/* DWM wires up the system-backdrop desktop-sampling only when an attribute
+ * VALUE change lands on the already-composed window; a set that only ever
+ * existed pre-show (or a same-value re-set) leaves a dead, non-sampling
+ * material — and on cold first launches (AV scan, cold D2D device) the
+ * post-show set alone can still race the first composition into a fully
+ * black frame. Two-layer fix: apply pre-show (fog from frame 0, never
+ * black), then flip immersive-dark out and back once the window has been
+ * up for a moment (two shots at 250/800ms to cover both warm and cold
+ * composition timing). In the dead state the flips are invisible; on an
+ * already-alive material they cost at most one frame of wrong tint. */
+static VOID CALLBACK on_timer_backdrop_kick(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
+    (void)msg; (void)tick;
+    if (!g_hwnd || !g_cfg.window_transparent || !g_backdrop_kind) return;
+    static int fired = 0;
+    int dark = ui_theme_get_mode() == UI_THEME_DARK;
+    if (g_backdrop_kind == 1) {
+        set_immersive_dark(g_hwnd, !dark);
+        set_immersive_dark(g_hwnd, dark);
+    } else if (g_backdrop_kind == 2) {
+        apply_accent_acrylic(g_hwnd, dark);
+    }
+    if (++fired < 2)
+        SetTimer(hwnd, id, 550, on_timer_backdrop_kick);   /* second shot for cold starts */
+}
+
+static void backdrop_kick_schedule(HWND hwnd) {
+    SetTimer(hwnd, TIMER_BACKDROP_KICK, 250, on_timer_backdrop_kick);
+}
+
 static void tray_remove(void);
 static int has_arg(LPCWSTR cmd, const wchar_t* arg);
 static int can_edit_gateway_port(void);
@@ -217,6 +247,8 @@ static void surface_main_window(void) {
         AttachThreadInput(GetCurrentThreadId(), fg_tid, FALSE);
 
     ui_window_show(g_win);
+    /* The backdrop re-apply happens in on_window_shown() below (covers this
+     * surface and any other hide→show transition). */
     on_window_shown();
 }
 
@@ -562,6 +594,10 @@ static void on_window_shown(void) {
     SetTimer(g_hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     SetTimer(g_hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
     g_decor_paused = 0;
+    /* Hide→show cycle: re-kick the backdrop (the desktop-sampling wiring is
+     * per-composition, see WinMain) — covers tray/hotkey surfaces and
+     * restores that bypass surface_main_window (taskbar click). */
+    backdrop_kick_schedule(g_hwnd);
 }
 
 /* Steady-state re-trim: acts only while hidden/minimized, no-op when the
@@ -2262,10 +2298,11 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "log_warn", on_setting_choice_mount, on_log_warn);
     ui_page_on_widget_mount(g_page, "log_error", on_setting_choice_mount, on_log_error);
 
-    if (g_autostart_silent)
-        g_win = ui_page_prepare_window(g_page, NULL);
-    else
-        g_win = ui_page_open_window(g_page, NULL);
+    /* Both startup modes create the window hidden (prepare): the backdrop set
+     * must land on the shown-but-not-yet-presented window (see the reveal
+     * below), and the subclass/timers need to be in place before anything is
+     * visible. The silent-tray mode simply stays hidden until surfaced. */
+    g_win = ui_page_prepare_window(g_page, NULL);
     if (!g_win) {
         chat_ui_shutdown();
         ui_page_destroy(g_page);
@@ -2276,8 +2313,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     HWND hwnd = (HWND)ui_window_hwnd(g_win);
     g_hwnd = hwnd;
     /* The window is created translucent by the UIX <window translucent> tag;
-     * paint DWM acrylic behind it (or degrade to an opaque clear when neither
-     * backdrop API is available / window_transparent is turned off). */
+     * paint DWM acrylic behind it while it is still hidden — the material is
+     * up from the very first frame (cold first launches must never show a
+     * black window). The desktop-sampling wiring happens post-reveal via the
+     * kick below. */
     if (g_cfg.window_transparent &&
         apply_window_backdrop(hwnd, ui_theme_get_mode() == UI_THEME_DARK)) {
         nm_log(NM_LOG_INFO, "app", "translucent window: acrylic backdrop kind=%d", g_backdrop_kind);
@@ -2294,8 +2333,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
     SetTimer(hwnd, TIMER_BG_TRIM, BG_TRIM_INTERVAL_MS, on_timer_bg_trim);
-    if (!IsWindowVisible(hwnd))
-        on_window_hidden();   /* autostart-silent mounts the page unshown */
+    if (g_autostart_silent)
+        on_window_hidden();   /* tray mode mounts the page unshown */
+    else {
+        ui_window_show(g_win);   /* first reveal; fog from frame 0 */
+        backdrop_kick_schedule(hwnd);   /* wire up desktop sampling once composed */
+    }
     if (g_tray_enabled_effective)
         tray_add(hwnd);
     if (g_cfg.hotkey_enabled)
