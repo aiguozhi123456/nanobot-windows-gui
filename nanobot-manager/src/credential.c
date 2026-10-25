@@ -35,7 +35,7 @@ int credential_store_for_target(const char* target, const char* secret, DWORD* e
     DWORD old_blob_size = 0;
     int had_old = 0;
     size_t length = secret ? strlen(secret) : 0;
-    if (!secret || length < 1 || length > 127) {
+    if (!secret || length < 1 || length > CREDENTIAL_SECRET_MAX) {
         if (error) *error = ERROR_INVALID_PARAMETER;
         return -1;
     }
@@ -52,6 +52,7 @@ int credential_store_for_target(const char* target, const char* secret, DWORD* e
             if (!old_blob) {
                 SecureZeroMemory(old_credential->CredentialBlob, old_blob_size);
                 CredFree(old_credential);
+                old_credential = NULL;
                 SecureZeroMemory(wide_target, (wcslen(wide_target) + 1) * sizeof(wchar_t));
                 free(wide_target);
                 if (error) *error = ERROR_NOT_ENOUGH_MEMORY;
@@ -143,17 +144,22 @@ int credential_load_for_target(const char* target, char* out, size_t cap, DWORD*
         local_error = GetLastError();
         SecureZeroMemory(wide_target, (wcslen(wide_target) + 1) * sizeof(wchar_t));
         free(wide_target);
-        if (error) *error = local_error;
+        /* "Absent" is not an error: return 0 with ERROR_SUCCESS, matching
+         * credential_delete_for_target's not-found convention. */
+        if (error) *error = (local_error == ERROR_NOT_FOUND) ? ERROR_SUCCESS : local_error;
         return local_error == ERROR_NOT_FOUND ? 0 : -1;
     }
     int result = -1;
     if (credential->CredentialBlob && credential->CredentialBlobSize >= 1 &&
-        credential->CredentialBlobSize <= 127 && credential->CredentialBlobSize < cap) {
+        credential->CredentialBlobSize <= CREDENTIAL_SECRET_MAX && credential->CredentialBlobSize < cap) {
         memcpy(out, credential->CredentialBlob, credential->CredentialBlobSize);
         out[credential->CredentialBlobSize] = '\0';
         result = 1;
     } else {
-        local_error = ERROR_INSUFFICIENT_BUFFER;
+        /* Only a too-small caller buffer is a capacity problem; a NULL/empty
+         * or out-of-range blob is bad data a bigger buffer cannot fix. */
+        local_error = (credential->CredentialBlob && credential->CredentialBlobSize >= cap)
+            ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_DATA;
     }
     if (credential->CredentialBlob && credential->CredentialBlobSize)
         SecureZeroMemory(credential->CredentialBlob, credential->CredentialBlobSize);

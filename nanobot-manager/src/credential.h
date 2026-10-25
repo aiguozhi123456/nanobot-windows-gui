@@ -10,6 +10,11 @@ extern "C" {
 
 #define CREDENTIAL_TARGET "nanobot-manager/bootstrap-secret/v1"
 
+/* Longest secret credential_store accepts, in bytes (no NUL). Loads accept
+ * the same bound so the write/read limits cannot drift apart; callers pass
+ * an output buffer of CREDENTIAL_SECRET_MAX + 1 bytes. */
+#define CREDENTIAL_SECRET_MAX 127
+
 /* Store/delete return 0 on success and -1 on failure. Load returns 1 when a
  * value was found, 0 when absent, and -1 on an API/validation error. */
 int credential_store(const char* secret, DWORD* error);
