@@ -6,6 +6,10 @@
 
 #include "cJSON.h"
 
+/* Serializes path selection, load/save and the legacy-auth scrubbers. SRWLOCK
+ * is not recursive: public entry points wrap _locked cores and must not call
+ * each other while holding it. */
+static SRWLOCK g_lock = SRWLOCK_INIT;
 static wchar_t g_active_path[MAX_PATH];
 static int g_path_selected = 0;
 static DWORD g_last_error = ERROR_SUCCESS;
@@ -92,7 +96,9 @@ static int path_is_legacy_adjacent(const wchar_t* path) {
     if (!slash) return 0;
     *slash = L'\0';
     wchar_t legacy[MAX_PATH];
-    swprintf_s(legacy, _countof(legacy), L"%s\\config.json", exe);
+    /* _TRUNCATE form: a truncated candidate simply fails the compare below
+     * instead of invoking the CRT invalid-parameter handler. */
+    _snwprintf_s(legacy, _countof(legacy), _TRUNCATE, L"%s\\config.json", exe);
     return _wcsicmp(path, legacy) == 0;
 }
 
@@ -103,10 +109,12 @@ static void get_legacy_adjacent_path(wchar_t path[MAX_PATH]) {
     wchar_t* slash = wcsrchr(exe, L'\\');
     if (!slash) return;
     *slash = L'\0';
-    swprintf_s(path, MAX_PATH, L"%s\\config.json", exe);
+    if (_snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%s\\config.json", exe) < 0)
+        path[0] = L'\0';   /* does not fit: no adjacent path */
 }
 
-static void select_config_path(void) {
+/* Caller holds g_lock. */
+static void select_config_path_locked(void) {
     wchar_t exe_dir[MAX_PATH], portable_flag[MAX_PATH], legacy[MAX_PATH];
     if (g_path_selected) return;
     g_path_selected = 1;
@@ -118,12 +126,22 @@ static void select_config_path(void) {
     wchar_t* slash = wcsrchr(exe_dir, L'\\');
     if (!slash) { g_last_error = ERROR_BAD_PATHNAME; return; }
     *slash = L'\0';
-    swprintf_s(portable_flag, _countof(portable_flag), L"%s\\portable.flag", exe_dir);
-    swprintf_s(legacy, _countof(legacy), L"%s\\config.json", exe_dir);
+    /* Checked _TRUNCATE form throughout: a too-long base path degrades to an
+     * error instead of the CRT invalid-parameter handler killing the app. */
+    if (_snwprintf_s(portable_flag, _countof(portable_flag), _TRUNCATE,
+                     L"%s\\portable.flag", exe_dir) < 0 ||
+        _snwprintf_s(legacy, _countof(legacy), _TRUNCATE,
+                     L"%s\\config.json", exe_dir) < 0) {
+        g_last_error = ERROR_BUFFER_OVERFLOW;
+        return;
+    }
 
     if (file_exists(portable_flag) ||
         (!exe_is_in_program_files(exe_dir) && !registry_install_matches(exe_dir))) {
-        wcscpy_s(g_active_path, _countof(g_active_path), legacy);
+        if (wcscpy_s(g_active_path, _countof(g_active_path), legacy) != 0) {
+            g_active_path[0] = L'\0';
+            g_last_error = ERROR_BUFFER_OVERFLOW;
+        }
         return;
     }
 
@@ -136,17 +154,34 @@ static void select_config_path(void) {
         return;
     }
     wchar_t directory[MAX_PATH];
-    swprintf_s(directory, _countof(directory), L"%s\\nanobot-manager", local_app_data);
+    if (_snwprintf_s(directory, _countof(directory), _TRUNCATE,
+                     L"%s\\nanobot-manager", local_app_data) < 0) {
+        CoTaskMemFree(local_app_data);
+        g_last_error = ERROR_BUFFER_OVERFLOW;
+        return;
+    }
     CoTaskMemFree(local_app_data);
     if (!CreateDirectoryW(directory, NULL)) {
         DWORD err = GetLastError();
         if (err != ERROR_ALREADY_EXISTS) { g_last_error = err; return; }
     }
-    swprintf_s(g_active_path, _countof(g_active_path), L"%s\\config.json", directory);
+    if (_snwprintf_s(g_active_path, _countof(g_active_path), _TRUNCATE,
+                     L"%s\\config.json", directory) < 0) {
+        g_active_path[0] = L'\0';
+        g_last_error = ERROR_BUFFER_OVERFLOW;
+    }
 }
 
 DWORD config_get_last_error(void) { return g_last_error; }
-const wchar_t* config_get_active_path(void) { select_config_path(); return g_active_path; }
+
+const wchar_t* config_get_active_path(void) {
+    /* g_active_path never changes once selected, so the pointer stays valid
+     * after the lock is released. */
+    AcquireSRWLockExclusive(&g_lock);
+    select_config_path_locked();
+    ReleaseSRWLockExclusive(&g_lock);
+    return g_active_path;
+}
 
 void config_apply_defaults(app_config* cfg) {
     memset(cfg, 0, sizeof(*cfg));
@@ -176,7 +211,12 @@ int config_parse_port(const char* text, int* out_port) {
 int config_parse_json(app_config* cfg, const char* json) {
     if (!cfg || !json) return -1;
     cJSON* root = cJSON_Parse(json);
-    if (!root) return -1;
+    /* Only objects are configs: an array/string/number would silently load
+     * defaults and mask a corrupted file (and suppress legacy migration). */
+    if (!root || !cJSON_IsObject(root)) {
+        cJSON_Delete(root);
+        return -1;
+    }
     cJSON* item = cJSON_GetObjectItem(root, "nanobot_path");
     if (item && cJSON_IsString(item) && item->valuestring[0]) {
         free(cfg->nanobot_path); cfg->nanobot_path = _strdup(item->valuestring);
@@ -237,6 +277,7 @@ int config_parse_json(app_config* cfg, const char* json) {
 }
 
 int config_remove_legacy_auth_json(const char* json, char** out_json) {
+    cJSON* child;
     if (!json || !out_json) return -1;
     *out_json = NULL;
     cJSON* root = cJSON_Parse(json);
@@ -244,11 +285,19 @@ int config_remove_legacy_auth_json(const char* json, char** out_json) {
         cJSON_Delete(root);
         return -1;
     }
-    cJSON* secret = cJSON_DetachItemFromObject(root, "webui_auth");
-    if (secret) {
-        if (cJSON_IsString(secret) && secret->valuestring)
-            SecureZeroMemory(secret->valuestring, strlen(secret->valuestring));
-        cJSON_Delete(secret);
+    /* A hand-edited file can repeat the key, and detach-by-name only touches
+     * the first match — scrub EVERY webui_auth child or a duplicate secret
+     * survives the rewrite. */
+    child = root->child;
+    while (child) {
+        cJSON* next = child->next;
+        if (child->string && strcmp(child->string, "webui_auth") == 0) {
+            if (cJSON_IsString(child) && child->valuestring)
+                SecureZeroMemory(child->valuestring, strlen(child->valuestring));
+            cJSON_DetachItemViaPointer(root, child);
+            cJSON_Delete(child);
+        }
+        child = next;
     }
     *out_json = cJSON_Print(root);
     cJSON_Delete(root);
@@ -383,11 +432,15 @@ static void cleanup_orphaned_temps(void) {
     FindClose(find);
 }
 
-int config_load(app_config* cfg) {
+/* Caller holds g_lock. */
+static int config_save_locked(const app_config* cfg);
+
+/* Caller holds g_lock. */
+static int config_load_locked(app_config* cfg) {
     if (!cfg) return -1;
     config_apply_defaults(cfg);
     g_last_error = ERROR_SUCCESS;
-    select_config_path();
+    select_config_path_locked();
     if (!g_active_path[0]) return -1;
     cleanup_orphaned_temps();
     config_file_status active = read_config_file(cfg, g_active_path);
@@ -419,7 +472,7 @@ int config_load(app_config* cfg) {
                 /* The old install location can be read-only (notably Program
                  * Files), so retain it as a recovery source rather than trying
                  * to rename it. A failed user-config write must stop startup. */
-                return cfg->legacy_migration_pending ? 0 : config_save(cfg);
+                return cfg->legacy_migration_pending ? 0 : config_save_locked(cfg);
             }
             if (legacy_status == CONFIG_FILE_IO_ERROR)
                 return -1;
@@ -428,7 +481,16 @@ int config_load(app_config* cfg) {
     return 0;
 }
 
-int config_scrub_legacy_auth(const wchar_t* path) {
+int config_load(app_config* cfg) {
+    int result;
+    AcquireSRWLockExclusive(&g_lock);
+    result = config_load_locked(cfg);
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
+}
+
+/* Caller holds g_lock. */
+static int config_scrub_legacy_auth_locked(const wchar_t* path) {
     if (!path || !path[0]) { g_last_error = ERROR_INVALID_PARAMETER; return -1; }
     FILE* file = _wfopen(path, L"rb");
     if (!file) { g_last_error = GetLastError(); return -1; }
@@ -454,6 +516,10 @@ int config_scrub_legacy_auth(const wchar_t* path) {
             (long)InterlockedIncrement(&g_temp_counter));
         handle = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_TEMPORARY, NULL);
         if (handle != INVALID_HANDLE_VALUE) break;
+        g_last_error = GetLastError();
+        /* Retry only on a name collision; anything else (access denied, full
+         * disk) is fatal for this save. */
+        if (g_last_error != ERROR_FILE_EXISTS && g_last_error != ERROR_ALREADY_EXISTS) break;
     }
     BOOL written = handle != INVALID_HANDLE_VALUE;
     size_t remaining = strlen(output);
@@ -474,44 +540,62 @@ int config_scrub_legacy_auth(const wchar_t* path) {
     return 0;
 }
 
+int config_scrub_legacy_auth(const wchar_t* path) {
+    int result;
+    AcquireSRWLockExclusive(&g_lock);
+    result = config_scrub_legacy_auth_locked(path);
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
+}
+
 int config_scrub_adjacent_legacy_auth(void) {
     wchar_t adjacent[MAX_PATH];
+    int result;
     get_legacy_adjacent_path(adjacent);
     if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; return -1; }
-    return config_scrub_legacy_auth(adjacent);
+    AcquireSRWLockExclusive(&g_lock);
+    result = config_scrub_legacy_auth_locked(adjacent);
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
 }
 
 int config_adjacent_legacy_auth_present(int* out_present) {
     wchar_t adjacent[MAX_PATH];
     app_config scanned;
     config_file_status status;
+    int result = 0;
     if (!out_present) { g_last_error = ERROR_INVALID_PARAMETER; return -1; }
     *out_present = 0;
     get_legacy_adjacent_path(adjacent);
     if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; return -1; }
+    AcquireSRWLockExclusive(&g_lock);
     config_apply_defaults(&scanned);
     status = read_config_file(&scanned, adjacent);
     if (status == CONFIG_FILE_ABSENT) {
         config_free(&scanned);
         g_last_error = ERROR_SUCCESS;
+        ReleaseSRWLockExclusive(&g_lock);
         return 0;
     }
-    if (status == CONFIG_FILE_IO_ERROR) { config_free(&scanned); return -1; }
+    if (status == CONFIG_FILE_IO_ERROR) { config_free(&scanned); ReleaseSRWLockExclusive(&g_lock); return -1; }
     if (status == CONFIG_FILE_INVALID) {
         config_free(&scanned);
         g_last_error = ERROR_INVALID_DATA;
+        ReleaseSRWLockExclusive(&g_lock);
         return -1;
     }
     if (status == CONFIG_FILE_VALID)
         *out_present = scanned.legacy_migration_pending ? 1 : 0;
     config_free(&scanned);
-    return 0;
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
 }
 
-int config_save(const app_config* cfg) {
+/* Caller holds g_lock. */
+static int config_save_locked(const app_config* cfg) {
     if (!cfg) { g_last_error = ERROR_INVALID_PARAMETER; return -1; }
     if (cfg->legacy_migration_pending) { g_last_error = ERROR_BUSY; return -1; }
-    select_config_path();
+    select_config_path_locked();
     if (!g_active_path[0]) return -1;
     char* json = config_serialize_json(cfg);
     if (!json) { g_last_error = ERROR_NOT_ENOUGH_MEMORY; return -1; }
@@ -564,6 +648,14 @@ int config_save(const app_config* cfg) {
     }
     g_last_error = ERROR_SUCCESS;
     return 0;
+}
+
+int config_save(const app_config* cfg) {
+    int result;
+    AcquireSRWLockExclusive(&g_lock);
+    result = config_save_locked(cfg);
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
 }
 
 void config_free(app_config* cfg) {

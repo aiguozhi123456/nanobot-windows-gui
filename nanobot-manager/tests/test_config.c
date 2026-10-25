@@ -14,6 +14,7 @@ static int configs_equal(const app_config* left, const app_config* right) {
         left->hotkey_enabled == right->hotkey_enabled &&
         left->health_check_port == right->health_check_port &&
         left->theme_mode == right->theme_mode &&
+        left->window_transparent == right->window_transparent &&
         strcmp(left->language, right->language) == 0 &&
         strcmp(left->log_level, right->log_level) == 0 &&
         left->webui_port == right->webui_port;
@@ -22,7 +23,7 @@ static int configs_equal(const app_config* left, const app_config* right) {
 static const char* FULL_JSON =
     "{\"nanobot_path\":\"C:\\\\tools\\\\nanobot.exe\","
     "\"autostart_nanobot\":true,\"stay_in_tray\":true,\"hotkey_enabled\":false,"
-    "\"health_check_port\":19000,\"theme_mode\":2,"
+    "\"health_check_port\":19000,\"theme_mode\":2,\"window_transparent\":false,"
     "\"language\":\"en\",\"webui_port\":9000,\"log_level\":\"warn\","
     "\"webui_auth\":\"nbwt_abcdef\"}";
 
@@ -36,6 +37,7 @@ static void test_defaults(void) {
     TEST_CHECK(cfg.health_check_port == 0);   /* 0 = auto: follow the running gateway */
     TEST_CHECK(cfg.webui_port == 0);   /* 0 = auto-detect from nanobot config */
     TEST_CHECK(cfg.theme_mode == 0);
+    TEST_CHECK(cfg.window_transparent == 1);   /* acrylic window on by default */
     TEST_CHECK(strcmp(cfg.language, "zh") == 0);
     TEST_CHECK(strcmp(cfg.log_level, "info") == 0);
     config_free(&cfg);
@@ -49,6 +51,7 @@ static void test_parse_full(void) {
     TEST_CHECK(cfg.autostart_nanobot == 1 && cfg.stay_in_tray == 1 && cfg.hotkey_enabled == 0);
     TEST_CHECK(cfg.health_check_port == 19000 && cfg.webui_port == 9000);
     TEST_CHECK(cfg.theme_mode == 2 && strcmp(cfg.language, "en") == 0);
+    TEST_CHECK(cfg.window_transparent == 0);   /* opaque escape hatch parses */
     TEST_CHECK(strcmp(cfg.log_level, "warn") == 0);
     config_free(&cfg);
 }
@@ -200,6 +203,16 @@ static void test_legacy_scrub_json(void) {
     TEST_CHECK(cleaned && strstr(cleaned, "webui_auth") == NULL);
     TEST_CHECK(strstr(cleaned, "unknown") && strstr(cleaned, "nested"));
     free(cleaned);
+    /* Duplicate keys: detach-by-name only removes the first match, so the
+     * scrubber must sweep every webui_auth child. */
+    cleaned = NULL;
+    TEST_CHECK(config_remove_legacy_auth_json(
+        "{\"webui_auth\":\"a\",\"keep\":1,\"webui_auth\":\"b\"}", &cleaned) == 0);
+    TEST_CHECK(cleaned && strstr(cleaned, "webui_auth") == NULL &&
+               strstr(cleaned, "keep") != NULL);
+    free(cleaned);
+    /* Non-object documents are rejected outright. */
+    TEST_CHECK(config_remove_legacy_auth_json("[1,2]", &cleaned) == -1);
 }
 
 static void test_active_legacy_source_has_priority(void) {
