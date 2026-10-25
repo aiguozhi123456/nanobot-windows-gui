@@ -1,13 +1,16 @@
 /* Unified logging pipeline: single nanobot-manager.log beside the exe with
  * level + module prefixes, thread-safe writes, size-based rotation to .bak.
- * Replaces the former per-module autostart_log/process_log helpers. On any
- * file failure the logger degrades to a no-op: logging must never take the
- * app down. */
+ * Replaces the former per-module autostart_log/process_log helpers. The log
+ * is opened in binary mode so g_bytes matches the on-disk size (LF endings,
+ * no CRLF translation). On any file failure the logger degrades to a no-op
+ * and retries the open on the next call: logging must never take the app
+ * down. */
 #include "logger.h"
 
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>   /* _stricmp, strlen */
 #include <wchar.h>
 
 #define LOGGER_FILE_NAME   L"nanobot-manager.log"
@@ -23,7 +26,7 @@ static nm_log_level   g_level = NM_LOG_INFO;
 static unsigned long  g_max_bytes = LOGGER_DEFAULT_MAX_BYTES;
 static unsigned long  g_bytes = 0;
 static wchar_t        g_path[MAX_PATH] = {0};
-static int            g_initialized = 0;
+static int            g_initialized = 0;   /* logger_init set a path; gates lazy reopen */
 
 static const char* level_tag(nm_log_level level) {
     switch (level) {
@@ -80,20 +83,29 @@ static unsigned long query_file_size(const wchar_t* path) {
         return 0;
     sz.LowPart  = fad.nFileSizeLow;
     sz.HighPart = fad.nFileSizeHigh;
+    /* unsigned long is 32-bit on Windows (LLP64): clamp instead of wrapping. */
+    if (sz.QuadPart > 0xFFFFFFFFUL)
+        return 0xFFFFFFFFUL;
     return (unsigned long)sz.QuadPart;
 }
 
-/* Caller holds g_lock. Closes, renames the log to .bak, reopens fresh.
- * Returns the new FILE* or NULL (no-op degradation). */
+/* Caller holds g_lock. Closes, renames the log to .bak, reopens fresh. When
+ * the rename fails (the .bak is held open by a viewer without
+ * FILE_SHARE_DELETE, path too long for the .bak name), the log is reopened
+ * in APPEND mode so no prior entry is lost. Returns the new FILE* or NULL. */
 static FILE* rotate_locked(void) {
     wchar_t bak[MAX_PATH];
+    int rotated = 0;
     close_locked();
     if (g_path[0]) {
-        if (swprintf_s(bak, _countof(bak), L"%s%s", g_path, LOGGER_BAK_SUFFIX) > 0)
-            MoveFileExW(g_path, bak, MOVEFILE_REPLACE_EXISTING);
-        g_file = _wfopen(g_path, L"w");
+        if (wcslen(g_path) + wcslen(LOGGER_BAK_SUFFIX) < _countof(bak) &&
+            swprintf_s(bak, _countof(bak), L"%s%s", g_path, LOGGER_BAK_SUFFIX) > 0) {
+            rotated = (MoveFileExW(g_path, bak, MOVEFILE_REPLACE_EXISTING) != 0);
+        }
+        /* Truncate only when the old content was actually moved aside. */
+        g_file = _wfopen(g_path, rotated ? L"wb" : L"ab");
     }
-    g_bytes = 0;
+    g_bytes = query_file_size(g_path);
     return g_file;
 }
 
@@ -101,8 +113,11 @@ int logger_init(const wchar_t* dir, nm_log_level level) {
     wchar_t path[MAX_PATH];
 
     if (dir && *dir) {
-        if (swprintf_s(path, _countof(path), L"%s\\%s", dir, LOGGER_FILE_NAME) <= 0)
+        /* Pre-check instead of trusting swprintf_s to fail: on overflow it
+         * invokes the CRT invalid-parameter handler and kills the process. */
+        if (wcslen(dir) + 1 + wcslen(LOGGER_FILE_NAME) >= _countof(path))
             return -1;
+        swprintf_s(path, _countof(path), L"%s\\%s", dir, LOGGER_FILE_NAME);
     } else {
         wchar_t exe[MAX_PATH];
         wchar_t* slash;
@@ -111,8 +126,9 @@ int logger_init(const wchar_t* dir, nm_log_level level) {
         slash = wcsrchr(exe, L'\\');
         if (!slash) return -1;
         *slash = L'\0';
-        if (swprintf_s(path, _countof(path), L"%s\\%s", exe, LOGGER_FILE_NAME) <= 0)
+        if (wcslen(exe) + 1 + wcslen(LOGGER_FILE_NAME) >= _countof(path))
             return -1;
+        swprintf_s(path, _countof(path), L"%s\\%s", exe, LOGGER_FILE_NAME);
     }
 
     AcquireSRWLockExclusive(&g_lock);
@@ -120,8 +136,8 @@ int logger_init(const wchar_t* dir, nm_log_level level) {
     wcscpy_s(g_path, _countof(g_path), path);
     g_level = level;
     g_bytes = query_file_size(path);
-    g_file = _wfopen(path, L"a");
-    g_initialized = (g_file != NULL);
+    g_file = _wfopen(path, L"ab");
+    g_initialized = 1;   /* path is set: nm_log may lazily retry the open */
     ReleaseSRWLockExclusive(&g_lock);
     return g_file ? 0 : -1;
 }
@@ -131,6 +147,7 @@ void logger_shutdown(void) {
     close_locked();
     g_path[0] = L'\0';
     g_bytes = 0;
+    g_max_bytes = LOGGER_DEFAULT_MAX_BYTES;   /* a re-init must not inherit a test override */
     g_initialized = 0;
     ReleaseSRWLockExclusive(&g_lock);
 }
@@ -141,35 +158,49 @@ void nm_log(nm_log_level level, const char* module, const char* fmt, ...) {
     char line[LOGGER_LINE_BODY + 96];
     va_list ap;
 
+    if (!fmt) return;   /* vsnprintf(NULL, ...) is UB; guard like module below */
+
     AcquireSRWLockShared(&g_lock);
-    if (!g_file || level < g_level) {
-        ReleaseSRWLockShared(&g_lock);
-        return;
-    }
+    int active = (g_file || (g_initialized && g_path[0])) && level >= g_level;
     ReleaseSRWLockShared(&g_lock);
+    if (!active) return;
 
     GetLocalTime(&st);
     va_start(ap, fmt);
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
     body[sizeof(body) - 1] = '\0';
+    /* Enforce the single-line contract even for caller-supplied %s text
+     * (e.g. the gateway state-file identity read in process.c). */
+    for (char* p = body; *p; p++) {
+        if (*p == '\n' || *p == '\r') *p = ' ';
+    }
 
-    snprintf(line, sizeof(line), "[%04d-%02d-%02d %02d:%02d:%02d] [%s] [%s] %s\n",
+    int n = snprintf(line, sizeof(line),
+             "[%04d-%02d-%02d %02d:%02d:%02d] [%s] [%s] %s\n",
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
              level_tag(level), module ? module : "-", body);
-    line[sizeof(line) - 1] = '\0';
+    if (n < 0) return;
+    if ((size_t)n >= sizeof(line)) {
+        /* Truncated: mark the cut so the loss is visible, still one line. */
+        memcpy(&line[sizeof(line) - 5], "...\n", 5);   /* 4 chars + NUL */
+    }
 
     AcquireSRWLockExclusive(&g_lock);
-    if (g_file && level >= g_level) {
-        if (g_bytes > g_max_bytes)
+    if ((g_file || (g_initialized && g_path[0])) && level >= g_level) {
+        /* Self-heal after a lost handle (failed rotation reopen, failed
+         * write): retry the open instead of no-op-ing forever. */
+        if (!g_file && g_path[0])
+            g_file = _wfopen(g_path, L"ab");
+        if (g_file && g_bytes > g_max_bytes)
             rotate_locked();
         if (g_file) {
             size_t len = strlen(line);
-            fputs(line, g_file);
-            fflush(g_file);
-            g_bytes += (unsigned long)len;
+            if (fputs(line, g_file) >= 0 && fflush(g_file) == 0)
+                g_bytes += (unsigned long)len;
+            else
+                close_locked();   /* next nm_log retries the open */
         }
     }
     ReleaseSRWLockExclusive(&g_lock);
-    (void)g_initialized;
 }

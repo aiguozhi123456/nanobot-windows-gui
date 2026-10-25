@@ -31,10 +31,19 @@ const char*  logger_level_to_string(nm_log_level level);
 /* Rotation threshold override, mainly for tests. Default 512 KiB. */
 void logger_set_max_bytes(unsigned long bytes);
 
-/* Line format: [YYYY-MM-DD HH:MM:SS] [LEVEL] [module] message\n (UTF-8).
- * Thread-safe; messages below the active level are dropped. fmt is printf
- * style with UTF-8 text; message must be a single line (no embedded \n). */
+/* Line format: [YYYY-MM-DD HH:MM:SS] [LEVEL] [module] message\n (UTF-8, LF
+ * line endings). Thread-safe; messages below the active level are dropped.
+ * fmt is printf style with UTF-8 text; embedded \n/\r in the formatted
+ * message are replaced with spaces so every entry is exactly one line. */
+#ifdef _MSC_VER
+void nm_log(nm_log_level level, const char* module,
+            _Printf_format_string_ const char* fmt, ...);
+#elif defined(__GNUC__)
+void nm_log(nm_log_level level, const char* module, const char* fmt, ...)
+    __attribute__((format(printf, 3, 4)));
+#else
 void nm_log(nm_log_level level, const char* module, const char* fmt, ...);
+#endif
 
 #ifdef __cplusplus
 }

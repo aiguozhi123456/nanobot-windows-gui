@@ -13,16 +13,25 @@ static wchar_t g_dir[MAX_PATH];
 static void make_temp_dir(void) {
     wchar_t base[MAX_PATH];
     wchar_t candidate[MAX_PATH];
+    g_dir[0] = L'\0';   /* clear any previous (already deleted) directory */
     for (int attempt = 0; attempt < 100; attempt++) {
         if (!GetTempPathW(_countof(base), base)) return;
         swprintf_s(candidate, _countof(candidate), L"%snm-log-test-%d-%d",
                    base, (int)GetCurrentProcessId(), attempt);
         if (CreateDirectoryW(candidate, NULL) || GetLastError() == ERROR_ALREADY_EXISTS) {
+            /* A leftover log from a crashed previous run would break the
+             * exact-count assertions below — start clean. */
+            wchar_t stale_log[MAX_PATH], stale_bak[MAX_PATH];
+            swprintf_s(stale_log, _countof(stale_log),
+                       L"%s\\nanobot-manager.log", candidate);
+            swprintf_s(stale_bak, _countof(stale_bak),
+                       L"%s\\nanobot-manager.log.bak", candidate);
+            DeleteFileW(stale_log);
+            DeleteFileW(stale_bak);
             wcscpy_s(g_dir, _countof(g_dir), candidate);
             return;
         }
     }
-    g_dir[0] = L'\0';
 }
 
 static void remove_temp_dir(void) {
@@ -81,6 +90,7 @@ static void test_line_format_and_filtering(void) {
     char text[8192];
     make_temp_dir();
     TEST_CHECK(g_dir[0] != L'\0');
+    if (!g_dir[0]) return;   /* do not fall back to logging beside the exe */
     TEST_CHECK(logger_init(g_dir, NM_LOG_INFO) == 0);
 
     nm_log(NM_LOG_DEBUG, "proc", "hidden debug %d", 1);
@@ -100,6 +110,7 @@ static void test_line_format_and_filtering(void) {
     TEST_CHECK(strstr(text, "[DEBUG] [proc] visible debug") != NULL);
     TEST_CHECK(count_lines(text) == 3);
 
+    logger_set_level(NM_LOG_INFO);   /* restore global state for later tests */
     logger_shutdown();
     remove_temp_dir();
 }
@@ -109,6 +120,7 @@ static void test_rotation_preserves_lines(void) {
     const int total = 10;
     make_temp_dir();
     TEST_CHECK(g_dir[0] != L'\0');
+    if (!g_dir[0]) return;
     TEST_CHECK(logger_init(g_dir, NM_LOG_INFO) == 0);
     logger_set_max_bytes(500);                 /* ~6 lines of ~90 bytes */
 
@@ -146,6 +158,7 @@ static void test_concurrent_writers(void) {
     thread_arg args[4];
     make_temp_dir();
     TEST_CHECK(g_dir[0] != L'\0');
+    if (!g_dir[0]) return;
     TEST_CHECK(logger_init(g_dir, NM_LOG_INFO) == 0);
 
     for (int i = 0; i < 4; i++) {
