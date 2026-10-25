@@ -171,11 +171,19 @@ int ChatUi::persistBinding(int resume_safe) {
         saveFailureStatus();
         return 0;
     }
+    /* The document keeps its placeholder array between saves; swap the
+     * materialized copy in for the save call only, restoring the placeholder
+     * afterwards. Overwriting without restoring would both leak the
+     * placeholder and hand setHistoryArrayPlaceholder a dangling pointer. */
     cJSON* array = messagesToJson(messages_);
-    history_.messages = array;
-    int rc = array ? chat_history_save(history_path_, &history_, &error) : -1;
-    cJSON_Delete(array);
-    setHistoryArrayPlaceholder();
+    int rc = -1;
+    if (array) {
+        cJSON* placeholder = history_.messages;
+        history_.messages = array;
+        rc = chat_history_save(history_path_, &history_, &error);
+        history_.messages = placeholder;
+        cJSON_Delete(array);
+    }
     if (rc != 0) {
         saveFailureStatus();
         return 0;
@@ -189,11 +197,16 @@ void ChatUi::saveIfDirty() {
     if (!history_path_[0] || history_read_error_ ||
         turn_state_ == ChatTurnState::NewWaitAck || saved_revision_ == revision_) return;
     cJSON* array = messagesToJson(messages_);
-    history_.messages = array;
-    int rc = (history_.version == 2 && array)
-        ? chat_history_save(history_path_, &history_, &error) : -1;
-    cJSON_Delete(array);
-    setHistoryArrayPlaceholder();
+    int rc = -1;
+    if (array && history_.version == 2) {
+        cJSON* placeholder = history_.messages;   /* see persistBinding */
+        history_.messages = array;
+        rc = chat_history_save(history_path_, &history_, &error);
+        history_.messages = placeholder;
+        cJSON_Delete(array);
+    } else {
+        cJSON_Delete(array);
+    }
     if (rc == 0)
         saved_revision_ = revision_;
     else
