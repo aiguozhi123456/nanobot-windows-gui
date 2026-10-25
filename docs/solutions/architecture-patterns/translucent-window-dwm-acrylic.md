@@ -9,7 +9,7 @@ severity: info
 symptoms:
   - "窗口需要透出模糊桌面（真液态玻璃），但 core-ui 主窗口默认走不透明 flip swapchain，CSS 玻璃只能糊窗内色场"
 resolution_type: code_fix
-tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha, noredirectionbitmap, backdrop, liquid-glass]
+tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha, noredirectionbitmap, backdrop, liquid-glass, theme-conditional-css]
 ---
 
 # 透窗模式：core-ui DComp 逐像素 alpha + DWM 亚克力
@@ -47,6 +47,25 @@ tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha
 - **系统亚克力材质的深浅跟随 immersive-dark 旗标，不跟随应用主题**。只设 `DWMWA_SYSTEMBACKDROP_TYPE` 时材质按系统默认（多为浅色）渲染——深色主题的应用后面是一层亮白雾，深色壁纸透出来被洗成粉彩，用户看到的就是"暗色模式坏了"。`DwmSetWindowAttribute` 返回 S_OK 只说明 API 接受了，不代表视觉正确。
 
 **色场 alpha 纪律**：透窗后"玻璃要糊的对象"是真实桌面，窗内色场（`radial-gradient` 色块）只能当色相点缀——0.3~0.45 是实测可用的区间（0.85/0.75/0.70 的首版盖满窗口后亚克力透出的画面被搅成不透明粉彩糊，用户观感"压根没透"而管线其实在工作；跌破 ~0.3 则设计感消失）。同理，玻璃卡上的输入框/字段容器不要用实色 `--input-bg`/`--bg-2`（玻璃上贴色块），TextInput 直接不写 background/border 走框架的 WinUI 状态机（烟熏填充+底线下划），div 类容器用白烟熏 alpha（0.07 底 + 0.16 描边）。
+
+### 色场需要亮色变体（2026-10-25 亮色发暗）
+
+用户反馈"亮色模式玻璃板偏暗"，但 kind=1 / immersive-dark=FALSE 全部正确。根因在色场本身：**同一组中间调色块（0.25~0.32 alpha 的青/紫/绿）叠在暗色亚克力上是提亮的色相点缀，叠在亮色亚克力白底上就是灰蒙蒙的污渍**（如青色块核心叠白后 ≈ #C0D6DE，局部亮度降 ~25%）——暗色越看越对、亮色越看越闷，正是这种不对称的来源。修法是同色相向白提亮 + alpha 降到 ~0.15（见 dashboard.uix `.theme-light .backdrop-*`）。
+
+主题条件样式在 uix 里的正确接法：core-ui 匹配选择器时把静态 `class` 与 `:class` 动态类**合并**进同一个类列表，且支持祖先链（compiler.cpp 的 MatchNode 构建），所以根容器 `:class="isDark ? 'theme-dark' : 'theme-light'"` + `.theme-light .backdrop-a { … }` 后代选择器即可覆盖。两个坑：
+
+- uix data 里的 `theme` 字段是**用户偏好**（"system"），跟随系统时它分辨不出有效深浅——必须由 C++ 推送**有效**暗色布尔（`apply_theme` 里 `ui_page_set_bool(g_page, "isDark", dark)`；apply_theme 是启动初始化与三个主题按钮的唯一漏斗，切换即时生效）。
+- data 默认值给 `isDark: true`（旧观感），页面加载到 C++ 推送之间的窗口期不会闪一帧亮色。
+
+### 底色发暗的真正层级：亚克力雾本身（2026-10-25 二轮）
+
+色场变体上线后用户仍报"暗"，并给出关键对照：**标题条与设置页输入框（框架主题色的半透明白）比底色亮一大截**——标题条是不透明 `#ffffff`（titleBarBg = windowBg），它们和底色之间的落差说明问题在 DWM 亮色亚克力的雾底本身，不在任何窗内图层。immersive-dark 旗标全对也救不了：材质雾的浓度应用层不可调，壁纸偏暗时白雾被压成灰。
+
+修法是**亮色下给根容器垫一层消色差白罩**（`.theme-light { background: rgba(255,255,255,0.8) }`），把底色抬向主题表面色。要点：
+
+- 罩层必须绑在 `.theme-light`（根容器）上而非各卡片——一次抬整窗底色，卡片/侧栏的白烟熏叠在上面仍然保持相对层次。
+- 消色差白不受"色场 ≤ ~0.32"纪律约束——那条纪律防的是**彩色**场把玻璃搅成不透明粉彩，白雾不与背板争色相。浓度定档 **0.6**：0.8 能把底色完全抬白但用户判"太白、失透"否决——亮度让位于透感，接受底色保留轻微灰调。教训：白罩浓度是透感/亮度的直接交换，不要单方向追求"贴近表面色"，起测从 0.6 档上下微调。
+- 教训：**校准必须像素实测**（A/B 抓屏对比标题条/输入框/底色均值），本轮因环境的屏捕路径全部失效（沙箱 shell 的 GDI CopyFromScreen 全黑；CUA 窗口截图对 NOREDIRECTIONBITMAP 窗口的可见性误判拒绝）只能按惯例取值 + 用户目检标定——下次在正常环境先补测量。
 
 ## Why This Works
 

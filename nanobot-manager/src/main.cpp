@@ -1756,6 +1756,11 @@ static void apply_theme(int mode) {
     }
     backdrop_reapply_for_theme(dark);
 
+    /* Effective dark flag for theme-conditional uix styling (.theme-light/.theme-dark
+     * on the root, e.g. the light acrylic field variants) — distinct from the
+     * user's chosen `theme` label, which stays "system" when following the OS. */
+    ui_page_set_bool(g_page, "isDark", dark);
+
     const char* labels[] = { "system", "dark", "light" };
     page_set("theme", labels[mode]);
     config_save(&g_cfg);

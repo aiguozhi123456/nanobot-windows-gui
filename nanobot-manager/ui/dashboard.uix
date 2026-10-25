@@ -25,6 +25,7 @@ export default {
       credentialStatus: "",
       hasCredential: false,
       theme: "system",
+      isDark: true,
       installed: true,
       installing: false,
       lang: "zh",
@@ -75,6 +76,19 @@ export default {
     gap: 0;
   }
 
+  /* Light theme: the Win11 light-acrylic fog itself reads grey (darker than the
+     translucent-white titlebar / inputs drawn over it), so the whole glass looks
+     dim — no DWM flag fixes that (they were verified correct). Lift the base
+     toward the theme surface with an achromatic white veil; hue fields below
+     keep their tint on top. 0.6 is the user-tuned final: 0.8 lifted the base
+     fully but read as milky and killed the see-through, so brightness yields to
+     transparency. An achromatic veil may exceed the ≤0.32 hue-field cap — that
+     cap keeps COLORS from turning the glass opaque pastel, white haze doesn't
+     fight the backdrop hue. */
+  .theme-light {
+    background: rgba(255, 255, 255, 0.6);
+  }
+
   /* Hue-accent fields OVER the acrylic backdrop (kept faint: on a translucent
      window the blurred desktop is the real backdrop, and dense fields read as
      an opaque pastel wash — the "not transparent at all" effect). Two core-ui
@@ -107,6 +121,20 @@ export default {
     width: 260px;
     height: 240px;
     background: radial-gradient(rgba(96, 148, 90, 0.25), rgba(96, 148, 90, 0) 70%);
+  }
+
+  /* Light theme: over the bright acrylic the mid-tone hues above read as grey
+     smudges instead of accents, so the glass looks dim. Same hues, lifted
+     toward white and at lower alpha. Single-layer gradients, no `at` prefix —
+     see the core-ui constraints note above. */
+  .theme-light .backdrop-a {
+    background: radial-gradient(rgba(120, 178, 196, 0.18), rgba(120, 178, 196, 0) 70%);
+  }
+  .theme-light .backdrop-b {
+    background: radial-gradient(rgba(152, 142, 212, 0.16), rgba(152, 142, 212, 0) 70%);
+  }
+  .theme-light .backdrop-c {
+    background: radial-gradient(rgba(148, 188, 142, 0.15), rgba(148, 188, 142, 0) 70%);
   }
 
   .titlebar-left {
@@ -838,7 +866,7 @@ export default {
 </style>
 
 <template>
-  <div class="root">
+  <div class="root" :class="isDark ? 'theme-dark' : 'theme-light'">
     <div class="backdrop-a" :left="fieldAx" :top="fieldAy" hitTransparent="true"></div>
     <div class="backdrop-b" :left="fieldBx" :top="fieldBy" hitTransparent="true"></div>
     <div class="backdrop-c" :left="fieldCx" :top="fieldCy" hitTransparent="true"></div>
