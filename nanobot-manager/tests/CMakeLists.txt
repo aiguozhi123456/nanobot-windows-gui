@@ -4,11 +4,17 @@
 add_library(nm_test INTERFACE)
 target_include_directories(nm_test INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# Define a manager unit-test executable from <name>.c plus any extra sources.
+# Define a manager unit-test executable from <name>.c (or <name>.cpp when the
+# .cpp variant exists) plus any extra sources.
 # Console subsystem (WIN32_EXECUTABLE FALSE) so CTest captures output.
 # Link extra libs / add include dirs afterwards with the normal commands.
 function(nm_add_test name)
-    add_executable(${name} ${name}.c ${ARGN})
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp)
+        set(_nm_test_src ${name}.cpp)
+    else()
+        set(_nm_test_src ${name}.c)
+    endif()
+    add_executable(${name} ${_nm_test_src} ${ARGN})
     target_link_libraries(${name} PRIVATE nm_test)
     target_compile_definitions(${name} PRIVATE
         UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS
@@ -55,7 +61,7 @@ target_include_directories(test_chat_history PRIVATE
 target_link_libraries(test_chat_history PRIVATE cjson)
 
 nm_add_test(test_chat_protocol
-    ${CMAKE_SOURCE_DIR}/src/chat_protocol.c
+    ${CMAKE_SOURCE_DIR}/src/chat_protocol.cpp
     ${CMAKE_SOURCE_DIR}/src/chat_history.c
 )
 target_include_directories(test_chat_protocol PRIVATE
@@ -63,6 +69,10 @@ target_include_directories(test_chat_protocol PRIVATE
     ${cjson_SOURCE_DIR}
 )
 target_link_libraries(test_chat_protocol PRIVATE cjson)
+
+# chat_draft: bounded streaming buffer (pure C++ logic, header-only).
+nm_add_test(test_chat_draft)
+target_include_directories(test_chat_draft PRIVATE ${CMAKE_SOURCE_DIR}/src)
 
 # logger: file pipeline (level filter, format, rotation) against a temp dir.
 nm_add_test(test_logger ${CMAKE_SOURCE_DIR}/src/logger.c)

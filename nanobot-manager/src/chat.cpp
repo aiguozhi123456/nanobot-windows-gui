@@ -3,6 +3,7 @@
 #include "chat_protocol.h"
 #include "chat_history.h"
 #include "logger.h"
+#include "util.hpp"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,25 +57,6 @@ static char* chat_strdup(const char* s) {
     char* p = (char*)malloc(n);
     if (p) memcpy(p, s, n);
     return p;
-}
-
-/* Percent-encode for query values (token). */
-static void url_encode(const char* in, char* out, size_t out_sz) {
-    static const char hex[] = "0123456789ABCDEF";
-    size_t o = 0;
-    if (!in || out_sz == 0) return;
-    for (const unsigned char* p = (const unsigned char*)in; *p && o + 4 < out_sz; p++) {
-        unsigned char c = *p;
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~') {
-            out[o++] = (char)c;
-        } else {
-            out[o++] = '%';
-            out[o++] = hex[c >> 4];
-            out[o++] = hex[c & 15];
-        }
-    }
-    out[o] = '\0';
 }
 
 const char* chat_conn_state_name(ChatConnState state) {
@@ -297,20 +279,13 @@ int ChatClient::wsConnect(int port, const char* path, const char* token,
                           HINTERNET* session_out, HINTERNET* connect_out,
                           HINTERNET* websocket_out) {
     char path_a[1024];
-    char token_enc[1024];
     if (token && token[0]) {
-        url_encode(token, token_enc, sizeof(token_enc));
-        if (strchr(path, '?'))
-            snprintf(path_a, sizeof(path_a), "%s&token=%s&client_id=nanobot-manager",
-                path, token_enc);
-        else
-            snprintf(path_a, sizeof(path_a), "%s?token=%s&client_id=nanobot-manager",
-                path, token_enc);
+        std::string token_enc = nm_percent_encode(token);
+        snprintf(path_a, sizeof(path_a), "%s%stoken=%s&client_id=nanobot-manager",
+            path, strchr(path, '?') ? "&" : "?", token_enc.c_str());
     } else {
-        if (strchr(path, '?'))
-            snprintf(path_a, sizeof(path_a), "%s&client_id=nanobot-manager", path);
-        else
-            snprintf(path_a, sizeof(path_a), "%s?client_id=nanobot-manager", path);
+        snprintf(path_a, sizeof(path_a), "%s%sclient_id=nanobot-manager",
+            path, strchr(path, '?') ? "&" : "?");
     }
 
     wchar_t path_w[1024];

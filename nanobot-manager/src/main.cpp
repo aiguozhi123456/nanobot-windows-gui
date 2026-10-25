@@ -2,7 +2,8 @@
 #include "nm_process.h"
 #include "autostart.h"
 #include "chat.hpp"
-#include "chat_ui.h"
+#include "chat_ui.hpp"
+#include "util.hpp"
 #include "credential.h"
 #include "i18n.h"
 #include "logger.h"
@@ -357,23 +358,18 @@ static int is_zh(void) {
 
 /* Cached gateway-running predicate for the chat send path. Used to live-call
  * nanobot_check_running (HTTP on the UI thread) -- now just reads the guarded
- * state set by apply_health_result. Unblocks chat_ui.c:252 with no HTTP. */
+ * state set by apply_health_result. Unblocks the chat send path with no HTTP. */
 static int health_running_thunk(void) {
     return nm_state_get() == NM_STATE_RUNNING ? 1 : 0;
 }
 
 static void page_set(const char* name, const char* utf8) {
     if (!utf8 || !utf8[0]) return;
-    /* Convert the whole NUL-terminated UTF-8 string into a capped wide buffer.
-     * cbMultiByte MUST be -1 (a byte count, not the wchar sizing count) so the
-     * NUL terminator is written by the API and multibyte sequences decode fully.
-     * The 1024-wchar destination cap prevents overflow; on ERROR_INSUFFICIENT
-     * BUFFER (>1023 wchars) the API returns 0 and we leave the field as-is --
-     * status text is always short, so that path is not hit in practice. */
-    wchar_t w[1024];
-    int written = MultiByteToWideChar(CP_UTF8, 0, utf8, -1, w, 1024);
-    if (written <= 0) return;
-    ui_page_set_text(g_page, name, w);
+    /* Empty result = over the 1024-wchar cap or conversion failure; status
+     * text is always short, so leave the field as-is on that path. */
+    std::wstring w = nm_utf8_to_wide(utf8);
+    if (w.empty()) return;
+    ui_page_set_text(g_page, name, w.c_str());
 }
 
 static void page_set_int(const char* name, int val) {
@@ -400,7 +396,7 @@ static void update_uptime(void) {
 static VOID CALLBACK on_timer_uptime(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)tick;
     update_uptime();
-    chat_ui_tick(GetTickCount64());
+    chat_ui().tick(GetTickCount64());
 }
 
 static void start_uptime_timer(int pid) {
@@ -533,7 +529,7 @@ static void set_status(const char* status, const char* text, const char* sub) {
 
 static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)hwnd; (void)msg; (void)id; (void)tick;
-    chat_ui_publish_tick();
+    chat_ui().publishTick();
 }
 
 /* Running-state LED heartbeat: ping-pong the dot opacity through the
@@ -793,11 +789,11 @@ static void apply_health_result(int running, int actual_port) {
              * chat_ui's binding port must follow the same refresh or history
              * resume stays keyed on the stale startup port. */
             refresh_effective_webui();
-            chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
+            chat_ui().setGateway(health_running_thunk, g_effective_webui_port);
         }
         page_set_int("pid", (int)v.pid);
         /* Auto-connect chat when gateway becomes healthy */
-        if (chat_client().needsConnect() && chat_ui_can_auto_connect()) {
+        if (chat_client().needsConnect() && chat_ui().canAutoConnect()) {
             set_chat_endpoint_effective(0);
             chat_client().connect();
         }
@@ -837,7 +833,7 @@ static void apply_health_result(int running, int actual_port) {
     g_effective_health_port = gateway_port_fallback();
     refresh_effective_health_port();
     chat_client().disconnectAsync();
-    chat_ui_on_gateway_stopped();
+    chat_ui().onGatewayStopped();
 }
 
 /* --- Health worker (boot-phase backoff -> steady) --------------------------
@@ -1316,7 +1312,7 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         refresh_effective_health_port();
         s_health_fail_streak = 0;
         chat_client().disconnectAsync();
-        chat_ui_on_gateway_stopped();
+        chat_ui().onGatewayStopped();
         return 0;
     }
     if (msg == WM_INSTALLER_EXITED) {
@@ -1365,11 +1361,11 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         g_effective_health_port = gateway_port_fallback();
         refresh_effective_health_port();
         chat_client().disconnectAsync();
-        chat_ui_on_gateway_stopped();
+        chat_ui().onGatewayStopped();
         return 0;
     }
     if (msg == WM_CHAT_EVENT) {
-        chat_ui_on_event(wp, (chat_event*)lp);
+        chat_ui().onEvent(wp, (chat_event*)lp);
         return 0;
     }
     if (msg == WM_TRAY_ICON) {
@@ -1525,32 +1521,6 @@ static void on_change_path(UiWidget w, void* ud) {
     }
 }
 
-/* Percent-encode every byte outside the RFC 3986 unreserved set (mirrors
- * Python urllib quote(secret, safe='') used by nanobot's own browser URL).
- * Returns 0 on success, non-zero when the secret contains CR/LF or does not
- * fit (caller falls back to the plain URL). */
-static int percent_encode_secret(const char* secret, char* out, size_t cap) {
-    static const char hex[] = "0123456789ABCDEF";
-    size_t o = 0;
-    if (!secret || !out || cap == 0) return -1;
-    for (const unsigned char* p = (const unsigned char*)secret; *p; p++) {
-        unsigned char c = *p;
-        if (c == '\r' || c == '\n') return -1;
-        if (o + 4 > cap) return -1;      /* worst case "%XY" + NUL */
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '_' || c == '.' || c == '-' ||
-            c == '~') {
-            out[o++] = (char)c;
-        } else {
-            out[o++] = '%';
-            out[o++] = hex[c >> 4];
-            out[o++] = hex[c & 0xF];
-        }
-    }
-    out[o] = '\0';
-    return 0;
-}
-
 static void on_open_webui(UiWidget w, void* ud) {
     (void)w; (void)ud;
     int webui_port = g_effective_webui_port > 0 ? g_effective_webui_port : 8765;
@@ -1558,12 +1528,12 @@ static void on_open_webui(UiWidget w, void* ud) {
      * the browser land pre-authenticated. No usable secret (or an unsafe one)
      * -> plain URL, the WebUI handles its own auth flow. */
     if (g_effective_webui_secret[0]) {
-        char enc[512];
+        std::string enc = nm_percent_encode(g_effective_webui_secret);
         char url_a[512];
-        if (percent_encode_secret(g_effective_webui_secret, enc, _countof(enc)) == 0 &&
+        if (!enc.empty() &&
             snprintf(url_a, sizeof(url_a),
                      "http://localhost:%d/#/?bootstrapSecret=%s",
-                     webui_port, enc) > 0) {
+                     webui_port, enc.c_str()) > 0) {
             wchar_t url[512];
             if (MultiByteToWideChar(CP_UTF8, 0, url_a, -1, url, _countof(url)) > 0) {
                 ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
@@ -1766,7 +1736,7 @@ static void on_apply_network(UiWidget w, void* ud) {
     restore_port_input("healthPort", g_cfg.health_check_port);
     restore_port_input("webuiPort", g_cfg.webui_port);
     refresh_effective_webui();
-    chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
+    chat_ui().setGateway(health_running_thunk, g_effective_webui_port);
     if (webui_changed) set_chat_endpoint_effective(1);
 }
 
@@ -2378,10 +2348,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     }
 
     /* Chat initial state */
-    chat_ui_bind(g_page, is_zh);
-    chat_ui_set_gateway(health_running_thunk, g_effective_webui_port);
-    chat_ui_reset_idle();
-    chat_ui_configure_history(config_get_active_path());
+    chat_ui().bind(g_page, is_zh);
+    chat_ui().setGateway(health_running_thunk, g_effective_webui_port);
+    chat_ui().resetIdle();
+    chat_ui().configureHistory(config_get_active_path());
 
     ui_page_on_widget_mount(g_page, "btn_start", on_btn_start_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_stop",  on_btn_stop_mount,  NULL);
@@ -2416,7 +2386,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
      * visible. The silent-tray mode simply stays hidden until surfaced. */
     g_win = ui_page_prepare_window(g_page, NULL);
     if (!g_win) {
-        chat_ui_shutdown();
+        chat_ui().shutdown();
         ui_page_destroy(g_page);
         config_free(&g_cfg);
         return 2;
@@ -2528,7 +2498,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     KillTimer(hwnd, TIMER_PULSE);
     KillTimer(hwnd, TIMER_FIELD_DRIFT);
     KillTimer(hwnd, TIMER_BG_TRIM);
-    chat_ui_shutdown();
+    chat_ui().shutdown();
     ui_page_destroy(g_page);
     config_free(&g_cfg);
     logger_shutdown();
