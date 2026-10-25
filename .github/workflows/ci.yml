@@ -8,10 +8,19 @@ on:
 permissions:
   contents: read
 
+# Rapid pushes to the same branch/PR shouldn't keep redundant full MSVC builds
+# running in parallel.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     name: Windows MSVC build & test
     runs-on: windows-latest
+    # A hung configure/build/ctest would otherwise burn the 6-hour platform
+    # default instead of failing fast.
+    timeout-minutes: 30
 
     steps:
       - name: Checkout (with submodules)
@@ -41,10 +50,12 @@ jobs:
         run: nanobot-manager\scripts\build.bat
 
       # BUILD_TESTING is ON by default, so the config/autostart unit tests are
-      # built into nanobot-manager\build\tests. CTest runs them in Release.
+      # built into nanobot-manager\build\tests. CTest runs them in Release;
+      # --timeout names and fails a single stuck test instead of stalling the
+      # job (winhttp polls / real Credential Manager / registry round-trips).
       - name: Test (CTest, Release)
         shell: cmd
-        run: ctest --test-dir nanobot-manager\build -C Release --output-on-failure --no-tests=error
+        run: ctest --test-dir nanobot-manager\build -C Release --output-on-failure --no-tests=error --timeout 120
 
       - name: Upload test logs on failure
         if: failure()
