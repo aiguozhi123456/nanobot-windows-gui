@@ -71,6 +71,19 @@ static int       g_effective_health_port = 18790;
 static int       g_effective_webui_port = 8765;
 static char      g_effective_webui_secret[128] = {0};
 static UINT      g_msg_activate = 0;   /* RegisterWindowMessageW("nanobot-manager-activate") */
+/* Owned single-instance mutex; closed the moment ui_run() returns so a
+ * relaunch during shutdown cleanup takes over instead of being told the
+ * dying instance "is already running". NULL when not owned (second launch
+ * or already released). */
+static HANDLE    g_single_instance_mutex = NULL;
+/* Manual-reset named event, signaled exactly while this instance's window
+ * exists and can be surfaced. Reset the instant quit is COMMITTED (the
+ * WM_CLOSE that will destroy, and WM_DESTROY) -- deliberately not at
+ * destruction time -- so a second launch never mistakes a quitting
+ * instance for a live one even when window destruction lags behind a busy
+ * UI thread. NULL when this process is not the mutex owner; second
+ * launches probe it by name. */
+static HANDLE    g_ui_surface_event = NULL;
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
@@ -1280,6 +1293,17 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         on_window_hidden();
         return 0;
     }
+    if (msg == WM_CLOSE || msg == WM_DESTROY) {
+        /* Quit committed (a WM_CLOSE that will destroy, or destruction
+         * itself): retire surfaceability NOW -- before and independent of
+         * how long actual window destruction and teardown take -- so a
+         * concurrent second launch waits for takeover instead of
+         * activating a window that is about to vanish. The tray-hide
+         * branch above returns earlier: hiding keeps the window alive and
+         * surfaceable. */
+        if (g_ui_surface_event)
+            ResetEvent(g_ui_surface_event);
+    }
     if (g_msg_activate && msg == g_msg_activate) {
         /* Second instance asked us to come forward: raise only -- keep the
          * current page and never steal keyboard focus (that is summon
@@ -2063,36 +2087,110 @@ static int run_autostart_mode(void) {
 /* Returns 1 when this process owns the single-instance mutex and may start;
  * returns 0 when another instance is already running (caller must exit).
  * The existing instance is surfaced unless `autostart` -- a logon launch
- * must never pop UI behind the user's back.  The mutex handle is
- * intentionally leaked: the OS releases it on process exit, which is
- * exactly the ownership lifetime we want.  RegisterWindowMessageW returns
+ * must never pop UI behind the user's back.  RegisterWindowMessageW returns
  * the same value for the same string in every process, so the message can
- * be posted cross-process. */
+ * be posted cross-process.
+ *
+ * Never pops an "already running" dialog. The mutex name object can
+ * outlive the previous instance's window by the whole shutdown-cleanup
+ * tail (its handle is only closed by process exit if it doesn't release
+ * early), and equally the first instance holds the mutex for a while
+ * before its window exists (config read, credential migration). In both
+ * gaps FindWindow fails, so a second launch used to misdiagnose "already
+ * running" and popup. Now it waits for one of three outcomes: the owner
+ * is surfaceable (the ui-surface named event is signaled AND FindWindow
+ * resolves the HWND -- activate it), the mutex object vanishes (previous
+ * instance exited -- take over ownership and start), or the budget runs
+ * out (silent exit; a live-but-windowless instance always has some dialog
+ * on screen). The event is the authority on "surfaceable": its owner sets
+ * it once the window exists and resets it the instant quit commits, so
+ * slow teardown can never masquerade as a live instance. */
+#define NM_SINGLE_INSTANCE_MUTEX L"Local\\nanobot-manager-single-instance"
+#define NM_UI_SURFACE_EVENT      L"Local\\nanobot-manager-ui-surface"
+#define NM_ACTIVATE_WAIT_MS      100
+#define NM_ACTIVATE_WAIT_STEPS   100   /* ~10s: cold start + shutdown tail */
+#define NM_ACTIVATE_CONFIRM_MS   300   /* grace for a queued-but-unprocessed WM_CLOSE */
+#define NM_TAKEOVER_ATTEMPTS     4
+
 static int single_instance_begin(int autostart) {
     if (!g_msg_activate)
         g_msg_activate = RegisterWindowMessageW(L"nanobot-manager-activate");
 
-    HANDLE mutex = CreateMutexW(NULL, TRUE,
-        L"Local\\nanobot-manager-single-instance");
-    if (!mutex)
-        return 1; /* fail-open: a broken kernel object beats a blocked start */
-    if (GetLastError() != ERROR_ALREADY_EXISTS)
-        return 1;
+    for (int attempt = 0; attempt < NM_TAKEOVER_ATTEMPTS; attempt++) {
+        HANDLE mutex = CreateMutexW(NULL, TRUE, NM_SINGLE_INSTANCE_MUTEX);
+        if (!mutex)
+            return 1; /* fail-open: a broken kernel object beats a blocked start */
+        if (GetLastError() != ERROR_ALREADY_EXISTS) {
+            g_single_instance_mutex = mutex;  /* owned; released after ui_run() */
+            /* Announce surfaceability later: non-signaled until our window
+             * exists, reset the moment quit commits. CreateEventW reopens
+             * an existing object left signaled by a hard-killed owner --
+             * harmless, because activation still requires FindWindow to
+             * see a window, and our own quit resets it. Failure is
+             * non-fatal: second launches fall back to FindWindow alone. */
+            g_ui_surface_event = CreateEventW(NULL, TRUE, FALSE, NM_UI_SURFACE_EVENT);
+            return 1;
+        }
+        CloseHandle(mutex);
+        if (autostart)
+            return 0;
 
-    CloseHandle(mutex);
-    if (autostart)
-        return 0;
-
-    /* Hidden (tray) windows are still found by FindWindow.  If the lookup
-     * fails the first instance is likely still creating its window -- the
-     * mutex is already taken either way, so fall back to a plain hint. */
-    HWND prev = FindWindowW(L"UiCore_Window", L"nanobot manager");
-    if (prev) {
-        PostMessageW(prev, g_msg_activate, 0, 0);
-    } else {
-        MessageBoxW(NULL,
-            L"nanobot-manager 已经在运行。\nnanobot-manager is already running.",
-            L"nanobot-manager", MB_OK | MB_ICONINFORMATION);
+        int object_vanished = 0;
+        for (int step = 0; step < NM_ACTIVATE_WAIT_STEPS; step++) {
+            /* Surfaceability gate. The ui-surface event is the authority:
+             * signaled = the owner's window exists and quit is NOT
+             * committed (it resets at the committing WM_CLOSE / WM_DESTROY,
+             * independent of how slow actual teardown runs). FindWindow only
+             * resolves the HWND. Owners from builds before the event exist
+             * have no object to open -- for them fall back to FindWindow
+             * alone. */
+            HANDLE ev = OpenEventW(SYNCHRONIZE, FALSE, NM_UI_SURFACE_EVENT);
+            HWND prev = NULL;
+            if (ev) {
+                int surfaceable = (WaitForSingleObject(ev, 0) == WAIT_OBJECT_0);
+                CloseHandle(ev);
+                prev = surfaceable
+                    ? FindWindowW(L"UiCore_Window", L"nanobot manager") : NULL;
+            } else {
+                /* legacy owner (pre-event build): window presence is all we know */
+                prev = FindWindowW(L"UiCore_Window", L"nanobot manager");
+            }
+            if (prev) {
+                PostMessageW(prev, g_msg_activate, 0, 0);
+                /* Confirm the target did not commit to quitting between the
+                 * probe and the post (or had an unprocessed WM_CLOSE queued).
+                 * With the event this is authoritative: a quitting owner
+                 * resets it inside WM_CLOSE handling, however slow its
+                 * teardown afterwards. */
+                Sleep(NM_ACTIVATE_CONFIRM_MS);
+                if (ev) {
+                    HANDLE ev2 = OpenEventW(SYNCHRONIZE, FALSE, NM_UI_SURFACE_EVENT);
+                    int still = ev2
+                        ? (WaitForSingleObject(ev2, 0) == WAIT_OBJECT_0 &&
+                           FindWindowW(L"UiCore_Window", L"nanobot manager") != NULL)
+                        : 0;   /* owner died during the grace: object gone */
+                    if (ev2) CloseHandle(ev2);
+                    if (still)
+                        return 0;
+                } else if (FindWindowW(L"UiCore_Window", L"nanobot manager")) {
+                    return 0;  /* legacy owner (pre-event build): heuristic */
+                }
+                /* it was dying -- fall through and keep waiting */
+            }
+            /* Can the named mutex still be opened by anyone? If not, the
+             * previous instance exited and released the name: retry taking
+             * ownership instead of just starting (a plain return 1 here
+             * would allow a third launch to race past us). */
+            HANDLE probe = OpenMutexW(SYNCHRONIZE, FALSE, NM_SINGLE_INSTANCE_MUTEX);
+            if (!probe) {
+                object_vanished = 1;
+                break;
+            }
+            CloseHandle(probe);
+            Sleep(NM_ACTIVATE_WAIT_MS);
+        }
+        if (!object_vanished)
+            return 0;  /* budget exhausted: stay silent, never popup */
     }
     return 0;
 }
@@ -2329,6 +2427,10 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
             nm_log(NM_LOG_WARN, "app", "no DWM acrylic backdrop available; opaque fallback");
     }
     SetWindowSubclass(hwnd, subclass_proc, 0, 0);
+    /* The window exists and the activate route (subclass) is live: announce
+     * surfaceability to any second launch currently waiting on us. */
+    if (g_ui_surface_event)
+        SetEvent(g_ui_surface_event);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
     SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
     SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
@@ -2352,6 +2454,22 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     kick_resolve_worker(hwnd, g_autostart_silent ? 1 : 0);
 
     int ret = ui_run();
+
+    /* Release the single-instance mutex NOW: the window is destroyed, so a
+     * relaunch during the cleanup below must be allowed to take over and
+     * start instead of waiting out our teardown (or worse, being told an
+     * instance "is already running" while no window can be surfaced). The
+     * brief overlap with our own cleanup tail is safe: the log opens in
+     * append mode with default (deny-none) CRT sharing, config is read-only
+     * here, and closing our gateway tracking handle never kills the gateway. */
+    if (g_single_instance_mutex) {
+        CloseHandle(g_single_instance_mutex);
+        g_single_instance_mutex = NULL;
+    }
+    if (g_ui_surface_event) {
+        CloseHandle(g_ui_surface_event);
+        g_ui_surface_event = NULL;
+    }
 
     /* Drop UI first so any late chat events free LPARAMs without touching g_page. */
     chat_shutdown();
