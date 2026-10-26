@@ -87,9 +87,9 @@ static HANDLE    g_ui_surface_event = NULL;
 
 #define TIMER_UPTIME 1003
 #define TIMER_CHAT_UI 1004
-#define TIMER_AMBIENT 1005
-#define TIMER_PULSE 1006
 #define TIMER_FIELD_DRIFT 1007
+#define DRIFT_TICK_MS 100
+#define TIMER_PULSE 1006
 #define TIMER_BG_TRIM 1008
 #define TIMER_BACKDROP_KICK 1009
 /* Chat publish cadence: streaming text only needs ~15 fps to read as smooth,
@@ -99,9 +99,6 @@ static HANDLE    g_ui_surface_event = NULL;
  * re-faulted pages are handed back to the OS on this cadence. The timer runs
  * always but only acts when the window is not on screen. */
 #define BG_TRIM_INTERVAL_MS 60000
-/* Running-state LED heartbeat period. The .status-dot opacity transition is
- * the same duration, so each toggle animates one full sine-like cycle. */
-#define LED_HEARTBEAT_MS 1400
 /* Radar pulse tick: reset -> anticipate -> expand+dissolve phases, each one
  * tick apart. The .pulse-ring CSS transition (450ms) is tuned to land inside
  * this spacing. */
@@ -460,11 +457,19 @@ static VOID CALLBACK on_timer_pulse(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick
     }
 }
 
-/* Backdrop color-field drift: the three gradient blobs slide on slow
- * Lissajous paths (17-31s periods so they de-phase) — the "liquid" in the
- * liquid-glass look. Positions go out as reactive floats; :left/:top bindings
- * move the absolutely-positioned fields. Delta-skipped: near a turn point the
- * sample barely moves and a set_float would only buy a wasted layout pass. */
+/* Backdrop color-field drift + running-state LED heartbeat, on one 10Hz tick.
+ * The three gradient blobs slide on slow Lissajous paths (17-31s periods so
+ * they de-phase) — the "liquid" in the liquid-glass look. Positions go out as
+ * reactive floats; :left/:top bindings move the absolutely-positioned fields.
+ * Delta-skipped: near a turn point the sample barely moves and a set_float
+ * would only buy a wasted paint pass. The heartbeat is a true sine of the dot
+ * opacity (0.45..1.0, 2.8s cycle) sampled here — discrete steps, NO CSS
+ * transition: a tween would run the animation host at ~60Hz and repaint the
+ * whole window for one 10px dot (the old TIMER_AMBIENT ping-pong design).
+ * Non-running states hold full opacity.
+ * 10Hz tick, not 30: the blobs drift <= ~8 DIP/s, so a step is <= 0.8 DIP on
+ * a 300px gradient — visually identical to 33ms, but each tick still pays a
+ * full-window repaint (core-ui has no partial present). */
 typedef struct {
     const char* xk; const char* yk;
     double bx, by, ax, ay, px, py, phx;
@@ -494,6 +499,17 @@ static VOID CALLBACK on_timer_field_drift(HWND hwnd, UINT msg, UINT_PTR id, DWOR
             ui_page_set_float(g_page, d->yk, y);
         }
     }
+    static int hb_running = 0;
+    if (nm_state_get() != NM_STATE_RUNNING) {
+        if (hb_running) {
+            hb_running = 0;
+            ui_page_set_float(g_page, "ambientGlow", 1.0f);
+        }
+        return;
+    }
+    hb_running = 1;
+    ui_page_set_float(g_page, "ambientGlow",
+                      (float)(0.725 + 0.275 * sin(t * 6.28318530717958647692 / 2.8)));
 }
 
 static void led_pulse_start(void) {
@@ -533,39 +549,18 @@ static VOID CALLBACK on_timer_chat_ui(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
     chat_ui().publishTick();
 }
 
-/* Running-state LED heartbeat: ping-pong the dot opacity through the
- * .status-dot opacity transition (same LED_HEARTBEAT_MS duration, sine-like
- * ease-in-out). Only while the gateway actually runs; any other state holds
- * full opacity. Hidden windows skip paint invalidation, so this is near free
- * when minimized to tray. */
-static VOID CALLBACK on_timer_ambient(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
-    (void)hwnd; (void)msg; (void)id; (void)tick;
-    static int dimmed = 0;
-    if (!g_page) return;
-    if (nm_state_get() != NM_STATE_RUNNING) {
-        if (dimmed) {
-            dimmed = 0;
-            ui_page_set_float(g_page, "ambientGlow", 1.0f);
-        }
-        return;
-    }
-    dimmed = !dimmed;
-    ui_page_set_float(g_page, "ambientGlow", dimmed ? 0.45f : 1.0f);
-}
-
 /* --- Background memory trim ------------------------------------------------
  * While hidden to tray / minimized, SetProcessWorkingSetSize(-1,-1) hands the
  * resident pages back to the OS; they return as soft faults on demand, so
- * nothing needs restoring on show. The two purely decorative timers are
- * paused while hidden: drift wakes the UI thread ~30x/s only to early-return
- * and both timers re-dirty pages behind the trim. The 66ms chat publish tick
- * and the uptime timer keep running -- background stream output must keep
- * draining. */
+ * nothing needs restoring on show. The decorative drift tick (which also
+ * drives the LED heartbeat) is paused while hidden: it would only wake the
+ * UI thread to early-return and re-dirty pages behind the trim. The 66ms chat
+ * publish tick and the uptime timer keep running -- background stream output
+ * must keep draining. */
 static int g_decor_paused = 0;
 
 static void pause_decorative_timers(void) {
     if (!g_hwnd || g_decor_paused) return;
-    KillTimer(g_hwnd, TIMER_AMBIENT);
     KillTimer(g_hwnd, TIMER_FIELD_DRIFT);
     g_decor_paused = 1;
 }
@@ -581,10 +576,9 @@ static void on_window_hidden(void) {
 
 static void on_window_shown(void) {
     if (!g_hwnd || !g_decor_paused) return;
-    /* Drift positions are sampled from absolute time and the heartbeat is a
-     * two-state static, so restarting here is visually seamless. */
-    SetTimer(g_hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
-    SetTimer(g_hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
+    /* Drift positions and the heartbeat phase are sampled from absolute
+     * time, so restarting here is visually seamless. */
+    SetTimer(g_hwnd, TIMER_FIELD_DRIFT, DRIFT_TICK_MS, on_timer_field_drift);
     g_decor_paused = 0;
     /* Hide→show cycle: re-kick the backdrop (the desktop-sampling wiring is
      * per-composition, see WinMain) — covers tray/hotkey surfaces and
@@ -2425,8 +2419,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     /* Window-level Esc handling (settings page: revert port edits). */
     ui_window_on_key(g_win, on_window_key, NULL);
     g_chat_ui_timer = SetTimer(hwnd, TIMER_CHAT_UI, CHAT_UI_FRAME_MS, on_timer_chat_ui);
-    SetTimer(hwnd, TIMER_AMBIENT, LED_HEARTBEAT_MS, on_timer_ambient);
-    SetTimer(hwnd, TIMER_FIELD_DRIFT, 33, on_timer_field_drift);
+    SetTimer(hwnd, TIMER_FIELD_DRIFT, DRIFT_TICK_MS, on_timer_field_drift);
     SetTimer(hwnd, TIMER_BG_TRIM, BG_TRIM_INTERVAL_MS, on_timer_bg_trim);
     if (g_autostart_silent)
         on_window_hidden();   /* tray mode mounts the page unshown */
@@ -2497,7 +2490,6 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
         g_chat_ui_timer = 0;
     }
     /* KillTimer on an idle id is a harmless no-op (pulse is one-shot-ish). */
-    KillTimer(hwnd, TIMER_AMBIENT);
     KillTimer(hwnd, TIMER_PULSE);
     KillTimer(hwnd, TIMER_FIELD_DRIFT);
     KillTimer(hwnd, TIMER_BG_TRIM);

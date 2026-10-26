@@ -346,9 +346,10 @@ export default {
     height: 10px;
     border-radius: 9999px;
     background: var(--fg-3);
-    /* Heartbeat: ambientGlow is ping-ponged by TIMER_AMBIENT while running;
-       duration matches LED_HEARTBEAT_MS in main.cpp for a seamless loop. */
-    transition: opacity 1400ms ease-in-out;
+    /* Heartbeat: while running, main.cpp's drift tick sets ambientGlow to a
+       2.8s sine sampled at 10Hz — discrete steps. NO transition here: a
+       tween runs the animation host at ~60Hz, repainting the whole window
+       for one 10px dot. */
   }
 
   .status-dot.running { background: #4d7a5c; }
