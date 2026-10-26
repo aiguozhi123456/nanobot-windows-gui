@@ -172,6 +172,11 @@ One of the large, faint gradient blobs that form the liquid-glass dashboard's ba
 
 The blurred desktop is the real backdrop, so fields stay translucent accents — dense fields read as an opaque wash — and they must never intercept input: they paint over content but sit outside the hit chain.
 
+### Backdrop Field Drift
+The continuous slow-path animation of the Backdrop Hue Fields, republished on a short timer rather than on interaction.
+
+Because every republished field marks the page tree dirty, each animation tick re-runs a full layout pass at frame rate. Per-widget work inside a layout pass — text measurement above all — therefore multiplies by frame rate and must be cached or bounded: a page that looks idle can be spending a full core re-measuring unchanged text, and any interaction queues behind the current pass.
+
 ## UI Text & Localization
 
 ### Language Table
