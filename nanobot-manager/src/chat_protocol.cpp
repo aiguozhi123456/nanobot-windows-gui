@@ -39,8 +39,10 @@ int chat_protocol_should_persist_unsafe(int fresh_pending, int resume_safe) {
 }
 
 int chat_protocol_send_allowed(int turn_active, int is_new) {
-    /* Normal text is always sendable: the gateway queues it into the active
-     * turn's _pending_queues. A fresh /new needs an idle turn. */
+    /* Models gateway queueing only (turn_active vs is_new): mid-turn normal
+     * text is queued into the active turn's _pending_queues, while a fresh
+     * /new needs an idle turn. The UI layer enforces stricter send gating on
+     * top of this (e.g. it blocks input while a NewWaitAck is pending). */
     return !turn_active || !is_new;
 }
 

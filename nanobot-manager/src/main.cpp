@@ -126,6 +126,9 @@ static HANDLE    g_ui_surface_event = NULL;
 /* 0 = none applied, 1 = Win11 system backdrop (theme-aware, no re-apply
  * needed), 2 = accent policy (tint must be re-applied on theme change). */
 static int g_backdrop_kind = 0;
+/* File-level (not function-static): every re-schedule must start a fresh
+ * two-shot sequence, so backdrop_kick_schedule resets this counter. */
+static int g_backdrop_kick_shots = 0;
 
 static int apply_accent_acrylic(HWND hwnd, int dark) {
     typedef BOOL (WINAPI *SetWindowCompositionAttributeFn)(HWND, const WINCOMPATTRDATA*);
@@ -198,7 +201,6 @@ static void backdrop_reapply_for_theme(int dark) {
 static VOID CALLBACK on_timer_backdrop_kick(HWND hwnd, UINT msg, UINT_PTR id, DWORD tick) {
     (void)msg; (void)tick;
     if (!g_hwnd || !g_cfg.window_transparent || !g_backdrop_kind) return;
-    static int fired = 0;
     int dark = ui_theme_get_mode() == UI_THEME_DARK;
     if (g_backdrop_kind == 1) {
         set_immersive_dark(g_hwnd, !dark);
@@ -206,11 +208,12 @@ static VOID CALLBACK on_timer_backdrop_kick(HWND hwnd, UINT msg, UINT_PTR id, DW
     } else if (g_backdrop_kind == 2) {
         apply_accent_acrylic(g_hwnd, dark);
     }
-    if (++fired < 2)
+    if (++g_backdrop_kick_shots < 2)
         SetTimer(hwnd, id, 550, on_timer_backdrop_kick);   /* second shot for cold starts */
 }
 
 static void backdrop_kick_schedule(HWND hwnd) {
+    g_backdrop_kick_shots = 0;
     SetTimer(hwnd, TIMER_BACKDROP_KICK, 250, on_timer_backdrop_kick);
 }
 
@@ -751,6 +754,9 @@ static void apply_health_worker_failure(void) {
 static int s_health_fail_streak = 0;
 
 static void apply_health_result(int running, int actual_port) {
+    /* A probe that raced the UI thread's stop transition must not resurrect
+     * state mid-stop; drop it (the worker-side guard has the same TOCTOU). */
+    if (nm_state_get() == NM_STATE_STOPPING) return;
     if (running) {
         if (actual_port >= 1 && actual_port <= 65535)
             g_effective_health_port = actual_port;
@@ -1481,7 +1487,9 @@ static void on_change_path(UiWidget w, void* ud) {
     ofn.lpstrTitle = L"Select nanobot executable";
 
     if (GetOpenFileNameW(&ofn)) {
-        char utf8[MAX_PATH];
+        /* MAX_PATH wide chars can need up to 3 UTF-8 bytes each (CJK paths
+         * overflow a MAX_PATH-byte buffer well before the path gets long). */
+        char utf8[MAX_PATH * 3];
         if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, file, -1,
                                  utf8, _countof(utf8), NULL, NULL)) {
             MessageBoxW((HWND)ui_window_hwnd(g_win),

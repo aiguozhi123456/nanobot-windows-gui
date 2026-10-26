@@ -15,9 +15,12 @@ typedef enum {
 } nm_log_level;
 
 /* Initialize the logger writing <dir>\nanobot-manager.log. dir == NULL means
- * beside the current exe. On any failure the logger degrades to a no-op:
+ * beside the current exe. Early failures (path too long, exe path lookup)
+ * return -1 leaving existing logger state untouched: an already-initialized
+ * logger keeps writing to its previous destination. Only a failed file open
+ * degrades the logger to a no-op that retries the open on later calls;
  * logging must never take the app down. Re-init (after shutdown) is allowed.
- * Returns 0 on success, -1 on failure (logger stays usable as a no-op). */
+ * Returns 0 on success, -1 on failure. */
 int  logger_init(const wchar_t* dir, nm_log_level level);
 void logger_shutdown(void);
 

@@ -219,7 +219,10 @@ int config_parse_json(app_config* cfg, const char* json) {
     }
     cJSON* item = cJSON_GetObjectItem(root, "nanobot_path");
     if (item && cJSON_IsString(item) && item->valuestring[0]) {
-        free(cfg->nanobot_path); cfg->nanobot_path = _strdup(item->valuestring);
+        /* Duplicate before freeing: on OOM keep the previous value instead of
+         * dropping it while still reporting success. */
+        char* dup = _strdup(item->valuestring);
+        if (dup) { free(cfg->nanobot_path); cfg->nanobot_path = dup; }
     }
     item = cJSON_GetObjectItem(root, "autostart_nanobot");
     if (item && cJSON_IsBool(item)) cfg->autostart_nanobot = item->valueint;
@@ -552,9 +555,10 @@ int config_scrub_adjacent_legacy_auth(void) {
     wchar_t adjacent[MAX_PATH];
     int result;
     get_legacy_adjacent_path(adjacent);
-    if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; return -1; }
     AcquireSRWLockExclusive(&g_lock);
-    result = config_scrub_legacy_auth_locked(adjacent);
+    /* g_last_error is lock-guarded: classify the bad path inside the lock. */
+    if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; result = -1; }
+    else result = config_scrub_legacy_auth_locked(adjacent);
     ReleaseSRWLockExclusive(&g_lock);
     return result;
 }
@@ -564,11 +568,12 @@ int config_adjacent_legacy_auth_present(int* out_present) {
     app_config scanned;
     config_file_status status;
     int result = 0;
-    if (!out_present) { g_last_error = ERROR_INVALID_PARAMETER; return -1; }
+    AcquireSRWLockExclusive(&g_lock);
+    /* g_last_error is lock-guarded: failure classification stays in the lock. */
+    if (!out_present) { g_last_error = ERROR_INVALID_PARAMETER; ReleaseSRWLockExclusive(&g_lock); return -1; }
     *out_present = 0;
     get_legacy_adjacent_path(adjacent);
-    if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; return -1; }
-    AcquireSRWLockExclusive(&g_lock);
+    if (!adjacent[0]) { g_last_error = ERROR_BAD_PATHNAME; ReleaseSRWLockExclusive(&g_lock); return -1; }
     config_apply_defaults(&scanned);
     status = read_config_file(&scanned, adjacent);
     if (status == CONFIG_FILE_ABSENT) {

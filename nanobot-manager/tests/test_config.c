@@ -128,6 +128,15 @@ static void test_ports_and_theme(void) {
     TEST_CHECK(cfg.health_check_port == 1 && cfg.webui_port == 65535 && cfg.theme_mode == 2);
     TEST_CHECK(config_parse_json(&cfg, "{\"health_check_port\":0,\"webui_port\":65536,\"theme_mode\":3}") == 0);
     TEST_CHECK(cfg.health_check_port == 0 && cfg.webui_port == 65535 && cfg.theme_mode == 2);
+    /* Re-check from defaults: stacked on the 65535 above, a rejected 65536 is
+     * indistinguishable from a clamped one. Negative ports likewise. */
+    config_apply_defaults(&cfg);
+    TEST_CHECK(config_parse_json(&cfg, "{\"webui_port\":65536}") == 0);
+    TEST_CHECK(cfg.webui_port == 0);
+    TEST_CHECK(config_parse_json(&cfg, "{\"webui_port\":-1}") == 0);
+    TEST_CHECK(cfg.webui_port == 0);
+    TEST_CHECK(config_parse_json(&cfg, "{\"health_check_port\":-1}") == 0);
+    TEST_CHECK(cfg.health_check_port == 0);
     config_free(&cfg);
 }
 
@@ -158,6 +167,7 @@ static void test_language_and_path(void) {
     config_apply_defaults(&cfg);
     TEST_CHECK(config_parse_json(&cfg, "{\"nanobot_path\":null,\"language\":\"abcdefgh\"}") == 0);
     TEST_CHECK(cfg.nanobot_path == NULL && cfg.language[sizeof(cfg.language) - 1] == '\0');
+    TEST_CHECK(strcmp(cfg.language, "zh") == 0);   /* invalid language keeps the default */
     TEST_CHECK(config_parse_json(&cfg, "{\"nanobot_path\":\"C:\\\\nb.exe\"}") == 0);
     TEST_CHECK(cfg.nanobot_path && strcmp(cfg.nanobot_path, "C:\\nb.exe") == 0);
     config_free(&cfg);

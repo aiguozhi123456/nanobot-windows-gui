@@ -278,18 +278,28 @@ int ChatClient::httpGetBootstrap(int port, const char* secret,
 int ChatClient::wsConnect(int port, const char* path, const char* token,
                           HINTERNET* session_out, HINTERNET* connect_out,
                           HINTERNET* websocket_out) {
-    char path_a[1024];
+    /* Build the path with std::string so a long token cannot be silently
+     * truncated the way a fixed snprintf buffer would. */
+    std::string path_a;
     if (token && token[0]) {
         std::string token_enc = nm_percent_encode(token);
-        snprintf(path_a, sizeof(path_a), "%s%stoken=%s&client_id=nanobot-manager",
-            path, strchr(path, '?') ? "&" : "?", token_enc.c_str());
+        path_a = std::string(path) + (strchr(path, '?') ? "&" : "?") +
+                 "token=" + token_enc + "&client_id=nanobot-manager";
     } else {
-        snprintf(path_a, sizeof(path_a), "%s%sclient_id=nanobot-manager",
-            path, strchr(path, '?') ? "&" : "?");
+        path_a = std::string(path) + (strchr(path, '?') ? "&" : "?") +
+                 "client_id=nanobot-manager";
     }
 
-    wchar_t path_w[1024];
-    MultiByteToWideChar(CP_UTF8, 0, path_a, -1, path_w, 1024);
+    /* UTF-8 never expands to more UTF-16 code units than input bytes, so a
+     * buffer sized from path_a cannot truncate. Fail on a zero return
+     * instead of proceeding with a conversion that did not happen. */
+    std::wstring path_w(path_a.size() + 1, L'\0');
+    if (MultiByteToWideChar(CP_UTF8, 0, path_a.c_str(), -1,
+                            &path_w[0], (int)path_w.size()) == 0) {
+        nm_log(NM_LOG_WARN, CHAT_LOG_MODULE,
+               "ws: request path conversion failed (%lu)", GetLastError());
+        return -1;
+    }
 
     HINTERNET session = WinHttpOpen(L"nanobot-manager/1.0",
         WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
@@ -304,7 +314,7 @@ int ChatClient::wsConnect(int port, const char* path, const char* token,
         return -1;
     }
 
-    HINTERNET req = WinHttpOpenRequest(conn, L"GET", path_w,
+    HINTERNET req = WinHttpOpenRequest(conn, L"GET", path_w.c_str(),
         NULL, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
     if (!req) {
         WinHttpCloseHandle(conn);
@@ -605,6 +615,12 @@ void ChatClient::connectThreadMain(ConnectContext context) {
             return;
         }
 
+        /* Decide under cs_, then post events after releasing it: postEvent()
+         * takes cs_ itself, so calling it inside this scope would self-
+         * deadlock on the non-recursive mutex. */
+        bool connect_abort = false;
+        char* error_detail = NULL;      /* post CHAT_EVT_ERROR first when set */
+        bool post_disconnected = false; /* post CHAT_EVT_DISCONNECTED after */
         {
             std::lock_guard<std::mutex> lock(cs_);
             if (stop_.load() || recv_thread_.joinable()) {
@@ -619,42 +635,48 @@ void ChatClient::connectThreadMain(ConnectContext context) {
                 transitionState(ChatConnState::Connecting, ChatConnState::Idle);
                 SecureZeroMemory(secret, sizeof(secret));
                 SecureZeroMemory(token, sizeof(token));
-                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
-                connect_finished_.store(true);
-                return;
-            }
-
-            destroyConnectionHandlesLocked();
-            session_ = session;
-            connect_ = connect;
-            websocket_ = websocket;
-            /* Publish readiness before the worker can observe an immediate
-             * peer close; a lost CAS here means a teardown already won. */
-            if (!transitionState(ChatConnState::Connecting, ChatConnState::Connected)) {
+                post_disconnected = true;
+                connect_abort = true;
+            } else {
                 destroyConnectionHandlesLocked();
-                SecureZeroMemory(secret, sizeof(secret));
-                SecureZeroMemory(token, sizeof(token));
-                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
-                connect_finished_.store(true);
-                return;
+                session_ = session;
+                connect_ = connect;
+                websocket_ = websocket;
+                /* Publish readiness before the worker can observe an immediate
+                 * peer close; a lost CAS here means a teardown already won. */
+                if (!transitionState(ChatConnState::Connecting, ChatConnState::Connected)) {
+                    destroyConnectionHandlesLocked();
+                    SecureZeroMemory(secret, sizeof(secret));
+                    SecureZeroMemory(token, sizeof(token));
+                    post_disconnected = true;
+                    connect_abort = true;
+                } else {
+                    recv_finished_ = false;
+                    try {
+                        recv_thread_ = std::thread(&ChatClient::recvThreadMain, this,
+                                                   RecvContext{websocket, generation});
+                    } catch (...) {
+                        destroyConnectionHandlesLocked();
+                        SecureZeroMemory(secret, sizeof(secret));
+                        SecureZeroMemory(token, sizeof(token));
+                        forceStateIdle();
+                        error_detail = chat_strdup("Failed to start receive thread");
+                        post_disconnected = true;
+                        connect_abort = true;
+                    }
+                    /* Socket is up; a READY frame must still offer a session
+                     * for attachment. */
+                }
             }
+        }
 
-            recv_finished_ = false;
-            try {
-                recv_thread_ = std::thread(&ChatClient::recvThreadMain, this,
-                                           RecvContext{websocket, generation});
-            } catch (...) {
-                destroyConnectionHandlesLocked();
-                SecureZeroMemory(secret, sizeof(secret));
-                SecureZeroMemory(token, sizeof(token));
-                forceStateIdle();
-                postEvent(CHAT_EVT_ERROR, generation, chat_strdup("Failed to start receive thread"));
-                postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
-                connect_finished_.store(true);
-                return;
-            }
-            /* Socket is up; a READY frame must still offer a session for
-             * attachment. */
+        if (error_detail)
+            postEvent(CHAT_EVT_ERROR, generation, error_detail);
+        if (post_disconnected)
+            postEvent(CHAT_EVT_DISCONNECTED, generation, NULL);
+        if (connect_abort) {
+            connect_finished_.store(true);
+            return;
         }
 
         SecureZeroMemory(secret, sizeof(secret));
@@ -663,6 +685,8 @@ void ChatClient::connectThreadMain(ConnectContext context) {
                (unsigned long long)generation);
         postEvent(CHAT_EVT_CONNECTED, generation, NULL);
     } catch (...) {
+        SecureZeroMemory(secret, sizeof(secret));
+        SecureZeroMemory(token, sizeof(token));
         nm_log(NM_LOG_ERROR, CHAT_LOG_MODULE, "connect worker: unexpected exception");
         forceStateIdle();
         postEvent(CHAT_EVT_ERROR, generation, chat_strdup("Connect worker failed"));
@@ -948,6 +972,7 @@ int ChatClient::attach(const char* chat_id) {
         payload = cJSON_PrintUnformatted(root);
         cJSON_Delete(root);
         if (!payload) return -1;
+        /* Hold cs_ across send so disconnect cannot close the handle mid-call. */
         err = WinHttpWebSocketSend(ws, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE,
             payload, (DWORD)strlen(payload));
         free(payload);
@@ -1035,9 +1060,21 @@ void ChatClient::shutdown() {
 
 ChatClient::~ChatClient() {
     /* shutdown() (WM_DESTROY) owns teardown; join defensively so a missed
-     * call can never terminate the process via a joinable std::thread. */
-    if (lifecycle_thread_.joinable())
+     * call can never terminate the process via a joinable std::thread. If
+     * the lifecycle worker is still parked on lifecycleCv_.wait, it must be
+     * nudged first or the join below would hang forever. requestLifecycle()
+     * cannot be used here (it no-ops once !inited_ or shutting_down_), so
+     * write the shutdown request directly under cs_. */
+    if (lifecycle_thread_.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(cs_);
+            if (lifecycle_running_ && !shutting_down_) {
+                lifecycle_request_ = LIFECYCLE_SHUTDOWN;
+                lifecycleCv_.notify_one();
+            }
+        }
         lifecycle_thread_.join();
+    }
     if (recv_thread_.joinable())
         recv_thread_.join();
     if (connect_thread_.joinable())

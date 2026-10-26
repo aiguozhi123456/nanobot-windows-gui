@@ -15,7 +15,8 @@
  * execution (tool events are unimplemented upstream), and tool chains with
  * flaky network retries observed > 5 minutes of pure silence - so the
  * ceiling is generous. A genuinely hung gateway costs at most this long;
- * the send button turns into a "stop waiting" control meanwhile. */
+ * the dedicated stop button (btn_chat_stop / cancelWait) can soft-abort
+ * the wait at any time. */
 #define CHAT_TURN_TIMEOUT_MS   600000ULL
 /* After a user-requested /stop, wait only this long for the gateway's own
  * TURN_END / terminal MESSAGE before falling back to the local soft abort. */
@@ -344,6 +345,10 @@ void ChatUi::setTurnState(ChatTurnState s) {
 
 void ChatUi::statusKey(const char* key) {
     nm_page_set_utf8(page_, "chatStatusKey", key ? key : "");
+    /* Clear any stale error detail in the same update: the template prefers
+     * chatStatusDetail over the resolved key, so a leftover detail from an
+     * earlier failure would mask every later status. */
+    statusDetail("");
 }
 
 void ChatUi::statusDetail(const char* utf8) {
@@ -585,8 +590,12 @@ void ChatUi::onMessage(const char* detail) {
             turn_deadline_ = 0;
             persistBinding(1);
             setCanSend(canSendNow() ? 1 : 0);
+        } else if (!stop_requested_) {
+            /* Empty tool-result / reasoning frame: no text to commit, but
+             * still gateway activity - re-arm the turn watchdog like every
+             * other MESSAGE frame. */
+            turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
         }
-        /* Empty tool-result / reasoning frame: keep the turn alive (flush only). */
     } else if (turn_state_ == ChatTurnState::NormalActive) {
         if (stop_requested_) {
             /* /stop's router reply ("Stopped N task(s).") is the turn's real
@@ -623,6 +632,7 @@ void ChatUi::onTurnEnd() {
     if (turn_state_ == ChatTurnState::NormalWaitActivity) {
         /* /stop (or a silent cancel) of a turn that produced no output: the
          * gateway sends only turn_end, with no draft to fixate. */
+        if (stop_requested_) statusKey("chat_status_stopped");
         stop_requested_ = false;
         setTurnState(ChatTurnState::Idle);
         turn_deadline_ = 0;
@@ -634,6 +644,7 @@ void ChatUi::onTurnEnd() {
     if (turn_state_ != ChatTurnState::NormalActive) return;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate a stream without canonical text */
+    if (stop_requested_) statusKey("chat_status_stopped");
     stop_requested_ = false;
     setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
@@ -836,6 +847,8 @@ void ChatUi::resetIdle() {
 
 void ChatUi::shutdown() {
     flushMessagesUi();
+    if (draft_.active)
+        commitCanonical(NULL);   /* fixate a half-streamed reply */
     restoreNewHistoryBackup();
     saveIfDirty();
     discardNewHistoryBackup();

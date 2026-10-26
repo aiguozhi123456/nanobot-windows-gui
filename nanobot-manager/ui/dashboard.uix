@@ -30,6 +30,7 @@ export default {
       installing: false,
       lang: "zh",
       logLevel: "info",
+      footer_version: "",
       messages: [],
       draft: "",
       canSend: true,
@@ -169,7 +170,6 @@ export default {
        smooth field reads as a plain solid strip (nothing to frost). */
     background: rgba(255, 255, 255, 0.12);
     backdrop-filter: blur(20px);
-    border-right: 1px solid rgba(255, 255, 255, 0.20);
   }
 
   .nav {
@@ -496,7 +496,6 @@ export default {
     color: var(--fg-3);
     background: rgba(255, 255, 255, 0.06);
     backdrop-filter: blur(20px);
-    border-bottom: 1px solid rgba(255, 255, 255, 0.10);
     min-height: 24px;
     justify-content: center;
   }
@@ -549,14 +548,20 @@ export default {
     align-self: flex-end;
     background: var(--accent);
     color: var(--fg-on-accent);
-    border-bottom-right-radius: 2px;
   }
 
   .msg.bot {
     align-self: flex-start;
     background: var(--bg-2);
     color: var(--fg);
-    border-bottom-left-radius: 2px;
+  }
+
+  .msg.user .msg-text {
+    color: var(--fg-on-accent);
+  }
+
+  .msg.bot .msg-text {
+    color: var(--fg);
   }
 
   .msg-text {
@@ -569,7 +574,6 @@ export default {
        label's intrinsic SizeHint width, clamped by max-width. */
     display: block;
     font-size: 13px;
-    color: inherit;
   }
 
   .composer {
@@ -592,7 +596,6 @@ export default {
     padding: 8px 10px;
     background: rgba(255, 255, 255, 0.10);
     backdrop-filter: blur(24px);
-    border-top: 1px solid rgba(255, 255, 255, 0.14);
     box-shadow: 0 -6px 20px rgba(0, 0, 0, 0.08);
   }
 
@@ -825,7 +828,7 @@ export default {
   .credential-btn-label {
     font-size: 12px;
     font-weight: 600;
-    color: inherit;
+    color: var(--fg-2);
   }
 
   .theme-row {
@@ -973,7 +976,6 @@ export default {
               id="chat_input"
               class="chat-input"
               v-model="draft"
-              :placeholder="$t('chat_placeholder')"
             />
             <div id="btn_chat_stop" class="btn-chat-stop" focusable="true" :enabled="turnWaiting"
                  :opacity="hover=='btn_chat_stop' && turnWaiting && page=='chat' ? 0.92 : 1"
@@ -1199,7 +1201,7 @@ export default {
           </div>
 
           <div class="settings-footer">
-            <label class="footer-ver" id="footer_version">v1.6.2</label>
+            <label class="footer-ver" id="footer_version">{{ footer_version }}</label>
             <div id="btn_webui" class="footer-link" focusable="true">
               <label class="footer-link-text">{{ $t('open_webui') }}</label>
               <svg width="10" height="10" viewBox="0 0 24 24">

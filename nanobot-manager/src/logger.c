@@ -109,6 +109,47 @@ static FILE* rotate_locked(void) {
     return g_file;
 }
 
+/* Truncation by vsnprintf/snprintf can split a UTF-8 multi-byte sequence: if
+ * the first length bytes end with a lead byte or a dangling chain of
+ * continuation bytes ((c & 0xC0) == 0x80), back up (at most 3 bytes) and drop
+ * the incomplete tail so logged text stays valid UTF-8. NUL-terminates at the
+ * cut when trimming; returns the resulting length. No-op for complete tails. */
+static size_t utf8_trim_incomplete_tail(char* s, size_t length) {
+    size_t end = length;
+    unsigned int continuations = 0;
+    unsigned char lead;
+    size_t expected;
+
+    if (!s || length == 0) return 0;
+    while (end > 0 && continuations < 3 && ((unsigned char)s[end - 1] & 0xC0) == 0x80) {
+        end--;
+        continuations++;
+    }
+    if (end == 0) {   /* nothing but continuation bytes: all dangling */
+        s[0] = '\0';
+        return 0;
+    }
+    lead = (unsigned char)s[end - 1];
+    expected = (lead >= 0xC2 && lead <= 0xDF) ? 2 :
+               (lead >= 0xE0 && lead <= 0xEF) ? 3 :
+               (lead >= 0xF0 && lead <= 0xF4) ? 4 : 0;
+    if (expected == 0) {
+        /* Not a lead byte (ASCII or invalid): any continuation bytes walked
+         * over are a dangling chain without their lead. */
+        if (continuations) {
+            s[end] = '\0';
+            return end;
+        }
+        return length;
+    }
+    if (continuations + 1 < expected) {   /* lead byte missing continuations */
+        end--;
+        s[end] = '\0';
+        return end;
+    }
+    return length;   /* trailing sequence is complete: nothing to trim */
+}
+
 int logger_init(const wchar_t* dir, nm_log_level level) {
     wchar_t path[MAX_PATH];
 
@@ -170,6 +211,9 @@ void nm_log(nm_log_level level, const char* module, const char* fmt, ...) {
     vsnprintf(body, sizeof(body), fmt, ap);
     va_end(ap);
     body[sizeof(body) - 1] = '\0';
+    /* A body-level truncation can split a UTF-8 sequence: drop the dangling
+     * tail (no-op when the body ends on a complete sequence). */
+    utf8_trim_incomplete_tail(body, strlen(body));
     /* Enforce the single-line contract even for caller-supplied %s text
      * (e.g. the gateway state-file identity read in process.c). */
     for (char* p = body; *p; p++) {
@@ -182,8 +226,10 @@ void nm_log(nm_log_level level, const char* module, const char* fmt, ...) {
              level_tag(level), module ? module : "-", body);
     if (n < 0) return;
     if ((size_t)n >= sizeof(line)) {
-        /* Truncated: mark the cut so the loss is visible, still one line. */
-        memcpy(&line[sizeof(line) - 5], "...\n", 5);   /* 4 chars + NUL */
+        /* Truncated: mark the cut so the loss is visible, still one line.
+         * Trim a split UTF-8 tail first so "..." does not land mid-sequence. */
+        size_t kept = utf8_trim_incomplete_tail(line, sizeof(line) - 5);
+        memcpy(&line[kept], "...\n", 5);   /* 4 chars + NUL */
     }
 
     AcquireSRWLockExclusive(&g_lock);

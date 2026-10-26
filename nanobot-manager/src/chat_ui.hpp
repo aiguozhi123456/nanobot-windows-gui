@@ -38,7 +38,7 @@ struct ChatMsg {
  * history-file boundary (chat_history API keeps its cJSON-based document)
  * and the publish boundary (ui_page_set_json). The streaming reply lives in
  * a ChatDraft and is published as a virtual trailing bubble; canonical text
- * commits it as a real message (one bubble per turn).
+ * commits it as a real message (one bubble per streamed segment).
  *
  * Publish path: every model change only sets a dirty flag; the 66 ms UI
  * timer (publishTick), the scroll mount hook, and shutdown are the only
@@ -95,10 +95,9 @@ private:
     char* serializeVisible();   /* malloc'd JSON, caller frees */
     cJSON* messagesToJson(const std::vector<ChatMsg>& messages);
     void appendMsg(const char* role, const std::string& text);
-    /* Canonical assistant text: replaces the turn's bubble while mid-turn
-     * (streamed or already-committed text), else appends (deduped against an
-     * identical last assistant message). Returns 0 when over the size bound
-     * (draft/content kept). */
+    /* Canonical assistant text: always appends a bubble (one per streamed
+     * segment); a redelivery identical to the last assistant message is
+     * deduplicated. Returns 0 when over the size bound (draft/content kept). */
     int commitCanonical(const char* canonical_or_null);
 
     /* --- history ---------------------------------------------------------- */

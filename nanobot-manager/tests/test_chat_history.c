@@ -145,17 +145,20 @@ static void test_strict_load_limits(void) {
 static void test_archive_copy_preserves_source_and_policy(void) {
     wchar_t path[MAX_PATH], archive[MAX_PATH + 64]; HANDLE file; DWORD written; char source[8] = {0};
     chat_history_document d;
+    archive[0] = L'\0';   /* copy failure leaves the buffer untouched: keep cleanup safe */
     make_temp_path(path, _countof(path), L"copy-history.json"); DeleteFileW(path);
     file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     TEST_CHECK(file != INVALID_HANDLE_VALUE);
     if (file == INVALID_HANDLE_VALUE) return;
     TEST_CHECK(WriteFile(file, "source", 6, &written, NULL) && written == 6); CloseHandle(file);
-    TEST_CHECK(chat_history_copy_to_archive(path, archive, _countof(archive), NULL) == 0);
+    int copied = chat_history_copy_to_archive(path, archive, _countof(archive), NULL) == 0;
+    TEST_CHECK(copied);
     TEST_CHECK(GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES);
     file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     TEST_CHECK(file != INVALID_HANDLE_VALUE);
     if (file != INVALID_HANDLE_VALUE) { TEST_CHECK(ReadFile(file, source, 6, &written, NULL) && written == 6); CloseHandle(file); }
-    TEST_CHECK(strcmp(source, "source") == 0); DeleteFileW(path); DeleteFileW(archive);
+    TEST_CHECK(strcmp(source, "source") == 0); DeleteFileW(path);
+    if (copied && archive[0] != L'\0') DeleteFileW(archive);
     make_v2(&d, cJSON_CreateArray());
     TEST_CHECK(chat_history_document_can_resume(&d, 8765));
     d.resume_safe = 0; TEST_CHECK(!chat_history_document_can_resume(&d, 8765));

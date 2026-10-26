@@ -97,7 +97,9 @@ int   nanobot_unverified_candidate_is_owned(DWORD launcher_wait,
 typedef struct {
     int   found;        /* file present + parseable; 0 if missing/unreadable        */
     DWORD pid;          /* real foreground gateway pid; 0 if !found or no pid field */
-    int   port;         /* from state file; informational only (manager uses cfg)   */
+    int   port;         /* state-file port; adopted as the effective health port
+                           when valid (nanobot_start / nanobot_detect_running_port);
+                           the config value is only the next-launch preference */
     /* Windows: decimal FILETIME ull as str(GetProcessTimes create)
      * (upstream `_windows_process_identity`). Prefer over started_at. */
     char  identity[64];
@@ -165,8 +167,11 @@ typedef struct {
     HANDLE      handle;             /* borrowed copy: valid only while the state
                                        machine still tracks it (see snapshot note) */
     ULONGLONG   start_tick;
-    FILETIME    create_ft;          /* PID-reuse guard (P4); cleared together with
-                                       the handle by nm_state_close_handle/_clear */
+    FILETIME    create_ft;          /* PID-reuse guard (P4); zeroed only by
+                                       nm_state_clear() and nanobot_stop's cleanup --
+                                       the crash branch's nm_state_close_handle
+                                       deliberately keeps it frozen (display +
+                                       later stop guards) */
 } nm_process_view;
 
 /* Call once at WinMain start, before any worker thread exists. */

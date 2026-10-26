@@ -55,10 +55,14 @@ if exist "%VS_PATH%\MSBuild\Current\Bin\MSBuild.exe" (
     ) do set "VS_YEAR=%%i"
     if defined VS_YEAR (
         if "!VS_YEAR!"=="2026" set "CMAKE_GENERATOR=Visual Studio 18 2026"
+        rem VS 18's vswhere catalog reports the product line version ("18"),
+        rem not the year; both spellings map to the same generator below.
+        if "!VS_YEAR!"=="18" set "CMAKE_GENERATOR=Visual Studio 18 2026"
         if "!VS_YEAR!"=="2022" set "CMAKE_GENERATOR=Visual Studio 17 2022"
         if "!VS_YEAR!"=="2019" set "CMAKE_GENERATOR=Visual Studio 16 2019"
     )
-    rem Fallback: VS 18 path layout without catalog year
+    rem Fallback: catalog_productLineVersion is absent on some installs
+    rem (e.g. non-standard install roots); detect VS 18 by path layout.
     echo !VS_PATH! | findstr /I "\\18\\" >nul && set "CMAKE_GENERATOR=Visual Studio 18 2026"
 )
 

@@ -50,15 +50,29 @@ Function .onInit
     ${EndIf}
 
     ${If} $R0 != ""
+        ; Remember which hive the previous location came from ($R4): a legacy
+        ; HKLM per-machine entry must go through its own uninstaller even when
+        ; its directory happens to be writable by this per-user installer.
+        StrCpy $R4 ""
         ReadRegStr $R1 HKLM "${PRODUCT_UNINST_KEY}" "InstallLocation"
         ${If} $R1 == ""
             ReadRegStr $R1 HKCU "${PRODUCT_UNINST_KEY}" "InstallLocation"
+            ${If} $R1 != ""
+                StrCpy $R4 "hkcu"
+            ${EndIf}
+        ${Else}
+            StrCpy $R4 "hklm"
         ${EndIf}
 
         ${If} $R1 == ""
             ReadRegStr $R2 HKLM "${PRODUCT_UNINST_KEY}" "UninstallString"
             ${If} $R2 == ""
                 ReadRegStr $R2 HKCU "${PRODUCT_UNINST_KEY}" "UninstallString"
+                ${If} $R2 != ""
+                    StrCpy $R4 "hkcu"
+                ${EndIf}
+            ${Else}
+                StrCpy $R4 "hklm"
             ${EndIf}
             ${If} $R2 != ""
                 StrCpy $R3 $R2 1
@@ -82,9 +96,11 @@ upgrade:
     Sleep 500
 
     ${If} $R1 != ""
-        ; Reuse the previous location only when it is writable without
-        ; elevation (per-user locations). Legacy Program Files installs
-        ; (admin-era setup) are not writable by this per-user installer.
+    ${AndIf} $R4 == "hkcu"
+        ; Reuse the previous location only when it came from the per-user
+        ; (HKCU) hive and is writable without elevation. Legacy HKLM
+        ; per-machine installs are never reused -- even in a user-writable
+        ; directory -- so their own uninstaller below can remove the key.
         ClearErrors
         FileOpen $6 "$R1\~nmwrite.tmp" w
         ${IfNot} ${Errors}
@@ -95,10 +111,12 @@ upgrade:
         ${EndIf}
     ${EndIf}
 
-    ; Legacy elevated install. This installer can neither replace nor remove
-    ; it silently, and sharing the HKCU uninstall key with a half-removed
-    ; install would orphan the old copy -- so the old uninstaller must run
-    ; first (it elevates itself). Fresh installs then go to the per-user dir.
+    ; Previous install not reusable: an HKLM (per-machine) location, or a
+    ; directory this per-user installer cannot write to. This installer can
+    ; neither replace nor remove it silently, and sharing the HKCU uninstall
+    ; key with a half-removed install would orphan the old copy -- so the old
+    ; uninstaller must run first (it elevates itself). Fresh installs then go
+    ; to the per-user dir.
     ${If} ${FileExists} "$R1\uninstall.exe"
         MessageBox MB_YESNO|MB_ICONINFORMATION \
             "The previous installation (v$R0 at $R1) requires administrator rights to remove.$\r$\nRun its uninstaller now? Windows will ask for administrator confirmation; run this setup again afterwards." \
@@ -128,7 +146,7 @@ Section "MainSection" SEC01
     File "..\assets\app.ico"
 
     SetOutPath "$INSTDIR\ui"
-    File /nonfatal /r "..\ui\*.*"
+    File /r "..\ui\*.*"
 
     CreateDirectory "$SMPROGRAMS\${PRODUCT_NAME}"
     CreateShortCut "$SMPROGRAMS\${PRODUCT_NAME}\${PRODUCT_NAME}.lnk" "$INSTDIR\nanobot-manager.exe"
@@ -162,20 +180,25 @@ Section Uninstall
 
     DeleteRegValue HKCU "${PRODUCT_AUTORUN_KEY}" "${PRODUCT_AUTORUN_NAME}"
 
-    ; Credential Manager records are scoped to a Windows user. This elevated
-    ; uninstaller can only remove the credential visible in its current context.
+    ; Credential Manager records are scoped to a Windows user. This per-user
+    ; (unelevated) uninstaller can only remove the credential visible in its
+    ; current context.
     nsExec::ExecToLog '"$INSTDIR\nanobot-manager.exe" --delete-credential'
     Pop $0
     ${If} $0 != 0
         DetailPrint "Warning: bootstrap credential cleanup failed (exit $0). It can only remove the credential for the current executing Windows user."
     ${EndIf}
 
+    ; nm_log files live beside the exe; the credential-cleanup run above
+    ; re-creates nanobot-manager.log, so delete the logs only after it.
     Delete "$INSTDIR\nanobot-manager.exe"
     Delete "$INSTDIR\core-ui.dll"
     Delete "$INSTDIR\app.ico"
     Delete "$INSTDIR\uninstall.exe"
     Delete "$INSTDIR\config.json"
-    Delete "$INSTDIR\nanobot-manager-autostart.log"
+    Delete "$INSTDIR\nanobot-manager.log"
+    Delete "$INSTDIR\nanobot-manager.log.bak"
+    Delete "$INSTDIR\nanobot-gateway.log"
     RMDir /r "$INSTDIR\ui"
     RMDir "$INSTDIR"
 

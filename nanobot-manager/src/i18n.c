@@ -4,9 +4,10 @@
 #include <string.h>
 #include <windows.h>   /* INIT_ONCE */
 
-/* Capacity of the assembled tables. The prefix is ~1.4 KB and the status
- * table adds ~30 short lines; 8192 matches the WinMain stack buffers this
- * module replaced. */
+/* Capacity of the assembled tables. Each prefix block holds 34 keys (~1.1 KB
+ * zh, ~1.4 KB en) and the status table adds 56 entries; the assembled tables
+ * run ~3.5 KB (zh) / ~3.8 KB (en) — about half of 8192, which matches the
+ * WinMain stack buffers this module replaced. */
 #define I18N_TABLE_CAP 8192
 
 /* --- Non-status keys ---------------------------------------------------------
@@ -17,7 +18,6 @@
 static const char s_prefix_zh[] =
     "app_title=nanobot 管理器\n"
     "chat_empty=开始对话\n"
-    "chat_placeholder=输入消息…\n"
     "chat_send=发送\n"
     "install_not_found=未找到 nanobot\n"
     "install_hint=PowerShell 一键安装：irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex\n"
@@ -54,7 +54,6 @@ static const char s_prefix_zh[] =
 static const char s_prefix_en[] =
     "app_title=nanobot manager\n"
     "chat_empty=Start a conversation\n"
-    "chat_placeholder=Type a message…\n"
     "chat_send=Send\n"
     "install_not_found=nanobot not found\n"
     "install_hint=One-click install in PowerShell: irm https://raw.githubusercontent.com/HKUDS/nanobot/main/scripts/install.ps1 | iex\n"

@@ -156,9 +156,13 @@ int credential_load_for_target(const char* target, char* out, size_t cap, DWORD*
         out[credential->CredentialBlobSize] = '\0';
         result = 1;
     } else {
-        /* Only a too-small caller buffer is a capacity problem; a NULL/empty
-         * or out-of-range blob is bad data a bigger buffer cannot fix. */
-        local_error = (credential->CredentialBlob && credential->CredentialBlobSize >= cap)
+        /* Range first, capacity second: only a blob that is valid data but
+         * does not fit the caller's buffer is a capacity problem. A NULL/
+         * empty blob or one larger than CREDENTIAL_SECRET_MAX is bad data a
+         * bigger buffer can never fix. */
+        local_error = (credential->CredentialBlob && credential->CredentialBlobSize >= 1 &&
+                       credential->CredentialBlobSize <= CREDENTIAL_SECRET_MAX &&
+                       credential->CredentialBlobSize >= cap)
             ? ERROR_INSUFFICIENT_BUFFER : ERROR_INVALID_DATA;
     }
     if (credential->CredentialBlob && credential->CredentialBlobSize)

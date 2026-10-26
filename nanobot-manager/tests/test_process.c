@@ -257,6 +257,7 @@ static void test_candidates_managed_venv_absent(void) {
     } else {
         TEST_CHECK(index_of_candidate(exes, count, expect_nb) < 0);
         TEST_CHECK(index_of_candidate(exes, count, expect_py) < 0);
+        TEST_CHECK(first_index_with_source(sources, count, NM_SRC_MANAGED_VENV) < 0);
     }
 
     nm_candidates_free(exes, is_py, sources, count);

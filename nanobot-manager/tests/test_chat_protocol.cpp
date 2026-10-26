@@ -32,7 +32,7 @@ static void test_attached_resolution(void) {
 static void test_generation_reservation(void) {
     uint64_t generation = 41;
     uint64_t replacement = chat_protocol_next_generation(generation);
-    TEST_CHECK(replacement == 42 && generation == 41);
+    TEST_CHECK(replacement == 42);
     TEST_CHECK(chat_protocol_next_generation(replacement) == 43);
 }
 

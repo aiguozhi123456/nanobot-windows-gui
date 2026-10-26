@@ -556,7 +556,8 @@ static struct {
     DWORD       pid;
     HANDLE      handle;
     ULONGLONG   start_tick;
-    FILETIME    create_ft;              /* PID-reuse guard (P4); zeroed when handle==NULL       */
+    FILETIME    create_ft;              /* PID-reuse guard (P4); zeroed only by nm_state_clear() */
+                                         /* and nanobot_stop cleanup; crash-path close freezes it */
     char        resolved_exe[MAX_PATH]; /* cache for stop-CLI spawn (P4)                        */
     int         resolved_is_python;     /*    "                                                  */
     HANDLE      wait_handle;            /* P5a: thread-pool wait registration; NULL when unarmed  */
@@ -766,17 +767,22 @@ int nanobot_watch_handle(HWND hwnd, UINT msg) {
     if (nm_state_get_wait_handle() != NULL)
         nanobot_unwatch_handle();
 
+    /* Publish ctx BEFORE registering: with an already-signaled process the
+     * callback can run (consume + free g_wait_ctx) before the register call
+     * returns. A failed registration means the callback never ran and never
+     * will, so clearing + freeing in the error branch is safe. */
+    g_wait_ctx = ctx;
     HANDLE wait = NULL;
     BOOL ok = RegisterWaitForSingleObject(&wait, h, wait_callback, ctx, INFINITE,
                   WT_EXECUTEONLYONCE | WT_EXECUTEINPERSISTENTTHREAD);
     if (!ok) {
         DWORD err = GetLastError();
+        g_wait_ctx = NULL;
         free(ctx);
         nm_log(NM_LOG_ERROR, "process", "watch_handle: RegisterWaitForSingleObject failed err=%d", (int)err);
         return (int)err ? (int)err : 1;
     }
 
-    g_wait_ctx = ctx;
     nm_state_set_wait_handle(wait);
     nm_log(NM_LOG_DEBUG, "process", "watch_handle: armed one-shot wait");
     return 0;
@@ -914,7 +920,10 @@ int nanobot_attach_running(void) {
  *      seconds. Naive (no zone) timestamps accept a match against EITHER
  *      UTC or local interpretation within ±30s (avoids TZ false mismatches
  *      without weakening real pid-reuse detection, which is minutes+ off).
- * Parse/conversion failure => skip the cross-check (defense-in-depth, not a gate).
+ * Parse/conversion failure => skip the cross-check (defense-in-depth, not a
+ * gate). Scope: this lenient policy governs nanobot_start's cross-check only;
+ * gateway_state_pid_is_verified_live intentionally FAILS CLOSED when identity
+ * is present but unparseable (returns 0 = do not trust the state file).
  */
 
 /* ±30s in FILETIME 100ns units. */
@@ -1434,7 +1443,15 @@ static HANDLE open_gateway_log_handle(void) {
     HANDLE h = CreateFileW(path, GENERIC_WRITE,
                            FILE_SHARE_READ | FILE_SHARE_DELETE, &sa,
                            OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return NULL;
+    if (h == INVALID_HANDLE_VALUE) {
+        /* Keep the degrade-to-no-redirection behavior (logging must never
+         * fail the start), but leave a trace -- e.g. ERROR_SHARING_VIOLATION
+         * while a previous gateway still holds the log open. */
+        nm_log(NM_LOG_WARN, "process",
+            "open_gateway_log_handle: CreateFileW failed err=%d (spawning without redirection)",
+            (int)GetLastError());
+        return NULL;
+    }
     SetFilePointer(h, 0, NULL, FILE_END); /* append across manager restarts */
     return h;
 }
@@ -1809,12 +1826,24 @@ int nanobot_start(const char* exe, int is_python, int health_port, int* out_pid,
     return 0;
 }
 
+/* Depth cap for the kill recursion: deeper than any real process tree, but
+ * finite -- PID reuse can forge a cycle in the snapshot's parent chain, which
+ * would otherwise recurse forever. */
+#define NM_KILL_TREE_MAX_DEPTH 32
+
 /* Recursively terminate a process and its descendants. `expected_create` is an
  * optional PID-reuse guard: if non-NULL and the live process's creation time
  * differs, the pid has been recycled by the OS and we MUST NOT terminate it.
  * Children are always recursed with NULL (we have no create-time history for
  * them). */
-static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
+static void kill_process_tree_impl(DWORD pid, const FILETIME* expected_create,
+                                   int depth) {
+    if (depth > NM_KILL_TREE_MAX_DEPTH) {
+        nm_log(NM_LOG_WARN, "process",
+            "kill_process_tree: depth cap %d exceeded at pid=%u (parent-pid cycle?)",
+            NM_KILL_TREE_MAX_DEPTH, (unsigned)pid);
+        return;
+    }
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap != INVALID_HANDLE_VALUE) {
         PROCESSENTRY32W pe;
@@ -1822,7 +1851,7 @@ static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
         if (Process32FirstW(snap, &pe)) {
             do {
                 if (pe.th32ParentProcessID == pid)
-                    kill_process_tree(pe.th32ProcessID, NULL);
+                    kill_process_tree_impl(pe.th32ProcessID, NULL, depth + 1);
             } while (Process32NextW(snap, &pe));
         }
         CloseHandle(snap);
@@ -1844,10 +1873,21 @@ static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
 
     HANDLE h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
     if (h) {
-        TerminateProcess(h, 0);
-        WaitForSingleObject(h, 3000);
+        if (!TerminateProcess(h, 0))
+            nm_log(NM_LOG_WARN, "process",
+                "kill_process_tree: TerminateProcess failed pid=%u err=%d",
+                (unsigned)pid, (int)GetLastError());
+        if (WaitForSingleObject(h, 3000) == WAIT_FAILED)
+            nm_log(NM_LOG_WARN, "process",
+                "kill_process_tree: post-terminate wait failed pid=%u err=%d",
+                (unsigned)pid, (int)GetLastError());
         CloseHandle(h);
     }
+}
+
+/* Public entry: see kill_process_tree_impl above. */
+static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
+    kill_process_tree_impl(pid, expected_create, 0);
 }
 
 /* --- nanobot_stop (P4: control-plane-first) ---------------------------------
@@ -1855,20 +1895,26 @@ static void kill_process_tree(DWORD pid, const FILETIME* expected_create) {
  * Strategy (in order, escalating only on failure):
  *   1. Reconcile target pid: prefer our tracked gateway pid; if we never
  *      tracked one (e.g. the manager didn't start it) but the state file has
- *      a live pid, adopt that.
+ *      a live pid, adopt that and capture its creation time as the tier-2
+ *      PID-reuse guard (a pid that cannot be opened is already dead: treat
+ *      it as "not running").
  *   2. Spawn `nanobot gateway stop --timeout 20` (the state file is the
  *      rendezvous -- P3a starts via --background so it is always present).
  *      Capture stdout to a temp file so we can match the result tokens.
  *   3. Parse stdout (case-insensitive substring match -- survives wording
  *      drift between Rich and plain output):
  *        "gateway stopped."      -> clean success
- *        "gateway_not_running"   -> nothing to stop (still verify via handle)
+ *        "gateway_not_running"   -> nothing to stop. With a tracked handle,
+ *                                   still confirm death via the handle; with
+ *                                   none, skip the kill entirely (the CLI's
+ *                                   state-file rendezvous saw no gateway).
  *        "gateway_stop_timeout"  -> escalate
  *        "gateway_state_stale"   -> escalate
  *        (any other non-zero)    -> escalate
  *   4. Death confirmation: wait on the tracked handle (8s). If it doesn't
- *      die, escalate to TerminateProcess (tier 1). If we have no tracked
- *      handle, skip straight to tier 2 (kill_process_tree).
+ *      die, escalate to TerminateProcess (tier 1). With no tracked handle,
+ *      "gateway_not_running" goes straight to cleanup; every other outcome
+ *      escalates to tier 2 (kill_process_tree, PID-reuse-guarded).
  *
  * All handles/resources are closed on every path: stop_pi process+thread,
  * the stdout temp file handle + DeleteFileW, the snapshot handle (closed
@@ -1880,6 +1926,12 @@ int nanobot_stop(void) {
 
     /* --- Step 1: reconcile the target pid. --------------------------------- */
     DWORD effective_pid = v.pid;
+    /* Create time captured when adopting a state-file pid with no tracked
+     * handle: becomes the tier-2 PID-reuse guard below. Zeroed on capture
+     * failure => guard inert (mirrors attach step 5). */
+    FILETIME adopted_create;
+    int      adopted_create_known = 0;
+    ZeroMemory(&adopted_create, sizeof(adopted_create));
     if (effective_pid == 0) {
         /* We're not tracking a gateway -- but the user (or another manager
          * instance) may have started one. The state file is the rendezvous:
@@ -1896,6 +1948,26 @@ int nanobot_stop(void) {
             effective_pid = gs.pid;
             nm_log(NM_LOG_INFO, "process", "nanobot stop: adopting state-file pid=%d (no tracked handle)",
                 (int)effective_pid);
+            if (v.handle == NULL) {
+                /* The adopted pid has no tracked handle, so the tier-2 kills
+                 * below would otherwise run with no PID-reuse guard at all.
+                 * Open it with the attach mask and capture its create time
+                 * (mirrors attach step 5). */
+                HANDLE adopted = OpenProcess(SYNCHRONIZE |
+                                             PROCESS_QUERY_LIMITED_INFORMATION |
+                                             PROCESS_TERMINATE, FALSE, effective_pid);
+                if (!adopted) {
+                    /* Unopenable => pid already dead: stale state file,
+                     * nothing to stop. */
+                    nm_log(NM_LOG_INFO, "process", "nanobot stop: adopted pid=%d already dead",
+                        (int)effective_pid);
+                    /* I2: do NOT flip to IDLE here -- same as above. */
+                    return 0;
+                }
+                adopted_create_known =
+                    get_process_creation_time(adopted, &adopted_create) ? 1 : 0;
+                CloseHandle(adopted);
+            }
         }
     }
 
@@ -1904,6 +1976,17 @@ int nanobot_stop(void) {
         /* I2: do NOT flip to IDLE here -- same as above. */
         return 0;
     }
+
+    /* Tier-2 PID-reuse guard for every kill_process_tree call below: the
+     * create time just captured for an adopted state-file pid, else the
+     * tracked v.create_ft while its handle still exists. The crash branch's
+     * frozen v.create_ft pairs with the old (cleared) pid, so it is never a
+     * valid guard for an adopted pid. NULL when neither is known => inert. */
+    const FILETIME* reuse_guard = NULL;
+    if (adopted_create_known)
+        reuse_guard = &adopted_create;
+    else if (v.handle && (v.create_ft.dwLowDateTime || v.create_ft.dwHighDateTime))
+        reuse_guard = &v.create_ft;
 
     /* --- Step 2: resolve the stop-CLI exe (cached from start, else probe). - */
     char resolved_exe[MAX_PATH];
@@ -1958,12 +2041,14 @@ int nanobot_stop(void) {
                     "falling back to direct kill pid=%d", (int)effective_pid);
         /* No CLI -> skip tiers 0/1, go straight to the kill tree. */
         if (v.handle) {
-            TerminateProcess(v.handle, 0);
-            WaitForSingleObject(v.handle, 3000);
+            if (!TerminateProcess(v.handle, 0))
+                nm_log(NM_LOG_WARN, "process", "nanobot stop: TerminateProcess failed pid=%d err=%d",
+                    (int)effective_pid, (int)GetLastError());
+            if (WaitForSingleObject(v.handle, 3000) == WAIT_FAILED)
+                nm_log(NM_LOG_WARN, "process", "nanobot stop: post-terminate wait failed pid=%d err=%d",
+                    (int)effective_pid, (int)GetLastError());
         } else {
-            kill_process_tree(effective_pid,
-                (v.create_ft.dwLowDateTime || v.create_ft.dwHighDateTime)
-                    ? &v.create_ft : NULL);
+            kill_process_tree(effective_pid, reuse_guard);
         }
         goto cleanup;
     }
@@ -2096,16 +2181,26 @@ int nanobot_stop(void) {
             }
             nm_log(NM_LOG_WARN, "process", "nanobot stop: clean exit not confirmed, escalating "
                 "(tier 1: TerminateProcess) pid=%d", (int)effective_pid);
-            TerminateProcess(v.handle, 0);
-            WaitForSingleObject(v.handle, 3000);
+            if (!TerminateProcess(v.handle, 0))
+                nm_log(NM_LOG_WARN, "process", "nanobot stop: TerminateProcess failed pid=%d err=%d",
+                    (int)effective_pid, (int)GetLastError());
+            if (WaitForSingleObject(v.handle, 3000) == WAIT_FAILED)
+                nm_log(NM_LOG_WARN, "process", "nanobot stop: post-terminate wait failed pid=%d err=%d",
+                    (int)effective_pid, (int)GetLastError());
+            goto cleanup;
+        }
+        if (tok_not_running) {
+            /* The CLI's state-file rendezvous already proved no gateway is
+             * running, and we hold no handle to second-guess it with -- the
+             * effective pid may since have been recycled. Skip the hard kill. */
+            nm_log(NM_LOG_INFO, "process", "nanobot stop: gateway_not_running with no tracked "
+                "handle; skipping tier-2 kill pid=%d", (int)effective_pid);
             goto cleanup;
         }
         /* No tracked handle -> tier 2. */
         nm_log(NM_LOG_WARN, "process", "nanobot stop: no tracked handle, escalating (tier 2: "
             "kill_process_tree) pid=%d", (int)effective_pid);
-        kill_process_tree(effective_pid,
-            (v.create_ft.dwLowDateTime || v.create_ft.dwHighDateTime)
-                ? &v.create_ft : NULL);
+        kill_process_tree(effective_pid, reuse_guard);
         goto cleanup;
     }
 
@@ -2114,13 +2209,15 @@ int nanobot_stop(void) {
         escalate, (int)effective_pid);
     if (v.handle) {
         /* Tier 1: we own the handle, hard-kill it. */
-        TerminateProcess(v.handle, 0);
-        WaitForSingleObject(v.handle, 3000);
+        if (!TerminateProcess(v.handle, 0))
+            nm_log(NM_LOG_WARN, "process", "nanobot stop: TerminateProcess failed pid=%d err=%d",
+                (int)effective_pid, (int)GetLastError());
+        if (WaitForSingleObject(v.handle, 3000) == WAIT_FAILED)
+            nm_log(NM_LOG_WARN, "process", "nanobot stop: post-terminate wait failed pid=%d err=%d",
+                (int)effective_pid, (int)GetLastError());
     } else {
         /* Tier 2: no handle, kill the tree by pid (reuse-guarded). */
-        kill_process_tree(effective_pid,
-            (v.create_ft.dwLowDateTime || v.create_ft.dwHighDateTime)
-                ? &v.create_ft : NULL);
+        kill_process_tree(effective_pid, reuse_guard);
     }
 
 cleanup:

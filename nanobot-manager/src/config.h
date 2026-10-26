@@ -41,7 +41,8 @@ const wchar_t* config_get_active_path(void);
 void config_apply_defaults(app_config* cfg);
 
 /* Overlay parsed JSON fields onto cfg (call config_apply_defaults first).
- * Returns 0 on success (invalid JSON is tolerated: fields keep prior values).
+ * Returns 0 on success, -1 on invalid/non-object JSON (fields keep prior
+ * values on failure); config_load tolerates -1 and keeps defaults.
  * Validates ranges: ports 0..65535 (0 = auto sentinel), theme 0..2;
  * out-of-range values ignored. */
 int  config_parse_json(app_config* cfg, const char* json);

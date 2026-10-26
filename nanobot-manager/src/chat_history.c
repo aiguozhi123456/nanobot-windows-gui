@@ -5,9 +5,9 @@
 #include <string.h>
 #include <wchar.h>
 
+/* RFC 8259 insignificant whitespace is exactly space, tab, CR and LF. */
 static int is_json_trim_space(unsigned char value) {
-    return value == ' ' || value == '\t' || value == '\r' || value == '\n' ||
-        value == '\v' || value == '\f';
+    return value == ' ' || value == '\t' || value == '\r' || value == '\n';
 }
 
 static int json_contains_decoded_nul_escape(const char* json, size_t length) {
@@ -140,11 +140,15 @@ int chat_history_is_new_command(const char* text) {
 }
 
 int chat_history_path_from_config(const wchar_t* config_path, wchar_t* out_path, size_t out_count) {
+    const wchar_t* backslash;
     const wchar_t* slash;
     size_t directory_length;
     if (!config_path || !config_path[0] || !out_path || out_count == 0) return -1;
-    slash = wcsrchr(config_path, L'\\');
-    if (!slash) slash = wcsrchr(config_path, L'/');
+    /* Mixed-separator paths: cut at whichever separator occurs later; with no
+     * separator at all the file name alone is the whole path (prior behavior). */
+    backslash = wcsrchr(config_path, L'\\');
+    slash = wcsrchr(config_path, L'/');
+    if (backslash && (!slash || backslash > slash)) slash = backslash;
     directory_length = slash ? (size_t)(slash - config_path + 1) : 0;
     if (directory_length + wcslen(L"chat-history.json") + 1 > out_count) return -1;
     if (directory_length) memcpy(out_path, config_path, directory_length * sizeof(wchar_t));

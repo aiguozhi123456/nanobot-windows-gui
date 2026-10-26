@@ -100,6 +100,10 @@ static void snapshot_free(reg_snapshot* s) {
 static void test_autostart_roundtrip(void) {
     reg_snapshot snap;
     snapshot_capture(&snap);
+    /* The value exists but its bytes could not be captured: the destructive
+     * body below would delete the user's real Run entry with no way to
+     * restore it, so skip (snapshot_capture already latched the failure). */
+    if (snap.present && !snap.captured) { snapshot_free(&snap); return; }
 
     /* Clean slate regardless of prior state. */
     autostart_disable();

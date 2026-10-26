@@ -147,7 +147,7 @@ Scope note: the ~20 `is_zh() ? L"…" : L"…"` `MessageBoxW` dialog strings int
 `tests/test_i18n.c` parses both assembled tables and mechanically checks what this doc asks humans to remember (6 tests):
 
 1. **Shape** — every line is `key=value\n` with non-empty key and value; the table ends with `\n`.
-2. **Parity** — zh/en key sets are identical (91 = 35 prefix + 56 `g_status_i18n` entries); a mismatch fails naming the exact missing key (`key 'setting_advanced' exists in zh but is missing in en`), instead of a raw key rendering in the UI for a user to report.
+2. **Parity** — zh/en key sets are identical (90 = 34 prefix + 56 `g_status_i18n` entries); a mismatch fails naming the exact missing key (`key 'setting_advanced' exists in zh but is missing in en`), instead of a raw key rendering in the UI for a user to report.
 3. **Status single-source** — every `status_*` key in the generated table resolves via `i18n_status` in both languages; hand-writing a `status_*` line into the prefix literals (a second wording source) makes this fail.
 4. **Fallbacks** — missing key returns the key itself; unknown locale returns NULL.
 5. **Duplicate-key rejection** — no key may appear twice in an assembled table; a duplicate would make core-ui's first-wins/last-wins behavior part of the contract.
