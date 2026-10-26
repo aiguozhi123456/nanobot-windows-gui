@@ -83,6 +83,9 @@ public:
     bool gatewayRunning() const { return !health_fn_ || health_fn_() != 0; }
     void attachScroll(UiWidget widget);
     void detachScroll(UiWidget widget);
+    /* Summon-time jump to the newest message when the chat page is already
+     * mounted (no remount -> attachScroll will not fire). */
+    void scrollToBottom();
 
 private:
     /* --- model + publish ------------------------------------------------- */

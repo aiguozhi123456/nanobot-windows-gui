@@ -359,6 +359,14 @@ void ChatUi::detachScroll(UiWidget widget) {
     if (chat_scroll_ == widget) chat_scroll_ = 0;
 }
 
+/* Summon (hotkey/tray) on an already-mounted chat page: hiding the window
+ * does not unmount the v-if, so attachScroll never re-fires — flush and
+ * jump here so the user always lands on the latest messages. */
+void ChatUi::scrollToBottom() {
+    flushMessagesUi();
+    if (chat_scroll_) ui_scroll_to_end(chat_scroll_);
+}
+
 void ChatUi::attachAfterReady(const char* offered_id) {
     const char* wanted = offered_id;
     if (!chat_history_is_valid_chat_id(offered_id)) {

@@ -272,6 +272,7 @@ static void show_main_window(void) {
     surface_main_window();
 
     ui_page_set_text(g_page, "page", L"chat");
+    chat_ui().scrollToBottom();   /* already on chat: no remount -> no attachScroll jump */
     UiWidget root = ui_page_root(g_page);
     UiWidget input = ui_widget_find_by_id(root, "chat_input");
     if (input)
@@ -1379,9 +1380,11 @@ static LRESULT CALLBACK subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         }
     }
     if (msg == WM_HOTKEY && wp == ID_HOTKEY_SUMMON) {
-        /* Toggle: only hide when the window is fully visible (not minimized).
-         * If minimized, restore it so the hotkey always surfaces the UI. */
-        if (IsWindowVisible(g_hwnd) && !IsIconic(g_hwnd)) {
+        /* Toggle: hide only when the window itself is the foreground window.
+         * Visible-but-covered still counts as IsWindowVisible, which would
+         * misfire and hide a covered window the user meant to summon;
+         * minimized summons it (restore) like any hidden state. */
+        if (GetForegroundWindow() == g_hwnd && !IsIconic(g_hwnd)) {
             ui_window_hide(g_win);
             ShowWindow(g_hwnd, SW_HIDE);
             on_window_hidden();
