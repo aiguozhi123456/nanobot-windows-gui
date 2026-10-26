@@ -1,7 +1,7 @@
 ---
 title: "core-ui Overview — UI 框架子模块的整体画像"
 date: 2026-07-11
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: reference
 module: submodule/core-ui
 problem_type: reference_overview
@@ -19,7 +19,7 @@ tags: [core-ui, ui-framework, win32, direct2d, quickjs, uix, reactive, submodule
 
 ## Overview
 
-core-ui 是一个 Windows 原生桌面 UI 框架（作为本仓库的 git submodule 存在于 `core-ui/`）。其定位是 **"Electron 开发体验 + 原生性能 + Fluent 2 外观 + Vue 响应式模型"**。当前 pin 为 fork `main` = upstream **v1.8.0 build 294** + manager 专有移植提交（chat scroll API，见 `CHANGELOG.md` 顶部）。1.7.0 把渲染提交迁移到独立渲染线程；v1.8.0 增收了 chips-input / OCR 划词组件 / HTML5 拖放 / widget 级 contextmenu 与 submit 回调 / TextArea 选区 / SVG 引擎与长列表性能一揽子工作。
+core-ui 是一个 Windows 原生桌面 UI 框架（作为本仓库的 git submodule 存在于 `core-ui/`）。其定位是 **"Electron 开发体验 + 原生性能 + Fluent 2 外观 + Vue 响应式模型"**。当前 pin 为 fork `main` 的 **7193235** = upstream **v1.8.0 build 294**（126330e）+ 六个 manager 专有提交：chat scroll API 移植（75aaaa8）、translucent 主窗口模式（df655f5）、single-source 焦点 + tabNavigation（0d89b0f）、滚轮路径免 relayout 修复（03e6f70）、label 测量缓存 / DWrite wrap 高度（11d7bd4）、绝对控件 `:left`/`:top` move-only 快路径（7193235）。1.7.0 把渲染提交迁移到独立渲染线程；v1.8.0 增收了 chips-input / OCR 划词组件 / HTML5 拖放 / widget 级 contextmenu 与 submit 回调 / TextArea 选区 / SVG 引擎与长列表性能一揽子工作。
 
 它在 nanobot-manager 中的角色：提供 `dashboard.uix`（SFC）的加载、响应式状态绑定、原生控件渲染、i18n、主题切换等全部 UI 能力。manager 通过动态链接 `core-ui.dll` + 外部 `.uix` 文件路径消费它（非单 exe 内嵌）。本文档为"更好地利用 core-ui"提供完整的能力地图与边界认知。
 
@@ -126,7 +126,7 @@ ui_page_destroy(UiPage page);
 ui_page_reload(UiPage page);   /* 重解析，但按名保留响应式变量值 */
 ui_page_root(void);
 ui_page_open_window(...);
-ui_page_prepare_window(...);   /* 隐藏窗预创建，首帧零闪烁（autostart 用） */
+ui_page_prepare_window(...);   /* 隐藏窗预创建，首帧零闪烁（正常启动与 autostart 均用此） */
 ui_page_last_error(void);
 ```
 
@@ -153,7 +153,7 @@ ui_page_on_widget_unmount(UiPage page, const char* widget_id,
                           UiWidgetUnmountCallback cb, void* userdata);
 ```
 
-> 每次 `v-if` remount / `v-for` 重建都会重新 fire，传**新的** `UiWidget` 实例。这是 v-if 子树挂 `ui_widget_on_click` 的**官方姿势**（manager 的 13 个 mount hook 均用此）。
+> 每次 `v-if` remount / `v-for` 重建都会重新 fire，传**新的** `UiWidget` 实例。这是 v-if 子树挂 `ui_widget_on_click` 的**官方姿势**（manager 的 27 个 `ui_page_on_widget_mount` 注册均用此，main.cpp:2353-2379、2419）。
 
 ### Widget 通用 / 树
 
@@ -320,12 +320,15 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 | 能力 | manager 用法 |
 |------|--------------|
 | 生命周期 | `ui_init_with_theme` / `ui_run` / `ui_page_load_file` |
-| 首帧零闪烁 | `ui_page_prepare_window`（autostart）vs `ui_page_open_window`（正常启动） |
+| 首帧零闪烁 | `ui_page_prepare_window`（正常启动与 autostart 统一走此，main.cpp:2385；`ui_page_open_window` 已不再被 manager 调用） |
 | 响应式 C→JS | `set_bool` / `set_text` / `set_json` 大量使用（status / uptime / pid / canStart / messages / canSend / draft） |
-| 响应式 JS→C | `get_json` + `free`（如读取 draft / webuiPort / webuiAuth） |
-| 生命周期回调 | 13 个 `ui_page_on_widget_mount` 挂 native click（`btn_start` / `btn_stop` / `toggle_*` / `btn_change_path` / `btn_webui` / `btn_apply_network` / `btn_send` / `theme_*` / `lang_*`） |
+| 响应式 JS→C | `get_json` + `free`（如读取 draft / healthPort / webuiPort——空串即 0=auto 哨兵；secret 不经此路径，在 Credential Manager） |
+| 生命周期回调 | 27 个 `ui_page_on_widget_mount` 挂 native click / submit（`btn_start` / `btn_stop` / `toggle_*` / `btn_change_path` / `btn_webui` / `btn_apply_network` / `*_port_input` / `btn_send` / `chat_input` / `theme_*` / `lang_*` / `log_*`） |
 | 主题 | `set_mode` / `set_cjk_font`（Segoe UI + Microsoft YaHei UI）/ `set_accent_hex("#4a7a8c")` |
 | i18n | `load_language_string` 接收 `src/i18n.c` 组装的 zh / en 语言表（**非外部 `.lang` 文件**）；`set_locale` |
+| 键盘焦点 / Tab 导航 | `tabNavigation="true"`（dashboard.uix:1）；`ui_window_focus_widget`（main.cpp:276、1773，chat_input 挂载即聚焦） |
+| 窗口级按键 | `ui_window_on_key`（main.cpp:2421，Esc 还原设置页端口编辑） |
+| 透窗模式 | `<window translucent="true"/>` + `ui_window_set_translucent`（main.cpp:2404，无 DWM 亚克力时降级不透明）；DWM 背景由 manager 侧涂（见 `docs/solutions/architecture-patterns/translucent-window-dwm-acrylic.md`） |
 
 ### 未利用的能力（潜在扩展点）
 
@@ -349,12 +352,12 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 
 | 风险点 | 说明 |
 |--------|------|
-| 子模块 pin 独立 | core-ui 的 pin 与 manager 版本独立，可独立升级；升级时关注 `CHANGELOG.md` 的 API 签名变化（400+ 函数，命名稳定 `ui_<noun>_<verb>`）。fork `main` = upstream v1.8.0 + chat scroll API 移植；旧 lineage 保留在 fork 的 `legacy-v1.7-fork` 分支 |
+| 子模块 pin 独立 | core-ui 的 pin 与 manager 版本独立，可独立升级；升级时关注 `CHANGELOG.md` 的 API 签名变化（400+ 函数，命名稳定 `ui_<noun>_<verb>`）。fork `main` = upstream v1.8.0 build 294 + 六个 manager 专有提交（见 Overview）；旧 lineage 保留在 fork 的 `legacy-v1.7-fork` 分支 |
 | QuickJS 仅 Options API | 限制了组件复用：多页面须复制模板，或 C 端组合多 page |
 | "必须整体替换数组"约束 | 易踩；manager chat 消息用 `set_json` 整体推（正确） |
 | 1.7.0 渲染线程迁移 | 是干净基线，未来 overlay / submenu 服务可能在此上演进 |
 | 无 `ui_text_input_on_changed` | 文本 / 数字 input 须用 Apply 按钮读回（已是 manager 的既定模式）。v1.8.0 起可用 `ui_widget_on_submit`（build 287）做 Enter 提交，但变更回调仍缺 |
-| 无 `type="password"` 渲染 | input factory 落到普通 `TextInput`，无掩码；`webui_auth` 明文显示（框架限制） |
+| 无 `type="password"` 渲染 | input factory 落到普通 `TextInput`，无掩码（框架限制仍在）。manager 的明文示例已移除：secret 走 Credential Manager + 原生输入对话框（`ES_PASSWORD`），不经 uix 渲染 |
 | 自绘 TextInput 的 IME 候选位置 | **已于 v1.8.0 在框架内修复**（`UpdateImeCompositionPos`）；历史分析见 `docs/solutions/ui-bugs/ime-candidate-window-top-left-custom-textinput.md` |
 
 ## Reference Index
@@ -378,7 +381,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 | `core-ui/docs/debug-simulation.md` | Debug / 自动化 |
 | `core-ui/CMakeLists.txt` | 构建配置 |
 | `core-ui/CHANGELOG.md` | 变更日志（升级时必读） |
-| `core-ui/VERSION/version.json` | 版本信息（当前 1.8.0 build 294） |
+| `core-ui/VERSION` | 版本信息（纯文本文件，内容 `1.8.0.294`；不存在 version.json） |
 
 ### 本仓库 manager 侧
 
@@ -386,7 +389,7 @@ Fluent2 级原生 UI（25+ 控件）、Vue3 风格声明式响应式、CSS 子�
 |------|------|
 | `nanobot-manager/src/main.cpp` | UI 挂载回调、tray、主题 / locale、健康定时器、chat UI 接线 |
 | `nanobot-manager/src/i18n.c` | zh / en 语言表字面量 + status 单一来源表（组装后喂 `load_language_string`） |
-| `nanobot-manager/src/chat_ui.c` | 聊天 UI 状态层（`ui_page_get_json` / `set_json` 模式范例） |
+| `nanobot-manager/src/chat_ui.cpp`（+ `chat_ui.hpp`，`ChatUi` 单例） | 聊天 UI 状态层（`ui_page_get_json` / `set_json` 模式范例） |
 | `nanobot-manager/CMakeLists.txt` | core-ui 消费方式（`add_subdirectory` + link + POST_BUILD 拷贝） |
 | `nanobot-manager/ui/dashboard.uix` | 核心 UI SFC（布局 + 响应式状态 + 聊天页） |
 

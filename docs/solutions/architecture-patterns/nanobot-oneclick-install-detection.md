@@ -1,7 +1,7 @@
 ---
 title: "nanobot 一键安装形态的发现与对齐（不落 PATH 的安装如何被检测）"
 date: 2026-10-24
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/process
 problem_type: integration_alignment
@@ -38,7 +38,7 @@ install.ps1 的安装形态与此前 manager 假设的所有安装方式都不�
 
 ## Solution
 
-三层对齐（manager v1.6.0）：
+三层对齐（manager v1.6.0，现版本 1.6.2）：
 
 ### 1. 解析器新增"托管 venv"探测层
 
@@ -92,7 +92,7 @@ config nanobot_path
 - 上游 install.ps1 改 venv 路径或 `NANOBOT_VENV` 语义 → 改 `managed_venv_dir()` + 本文档
 - 上游取消 wheel console script（`Scripts\nanobot.exe` 消失）→ venv python 候选已覆盖，确认探测仍通过即可
 - 上游推出独立 exe / 服务安装形态 → 需要新的候选层（不是改本层），并评估是否绕过 Python 层
-- manager "未找到" 排查：看 `nanobot-manager.log` 的 `[process]` 行的候选与探测结果（候选与探测细节为 DEBUG 级，需在设置页把日志级别切到 debug），先确认 venv 层是否命中
+- manager "未找到" 排查：按解析状态键区分失败层级——`status_not_found`（没有一层命中）、`status_incompatible`（探到 nanobot 但缺 `gateway --background` 能力）、`status_probe_failed`（候选探测本身失败），先确认 venv 层是否命中。注意：解析路径目前**没有**候选/探测的 DEBUG 日志（`nanobot_resolve` / `nanobot_resolve_candidates` / 探测均不写 `nm_log`），若需要逐候选排查得先补上 DEBUG 级探针日志
 
 ## Related
 

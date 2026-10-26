@@ -1,6 +1,7 @@
 ---
 title: "Measure gateway uptime from the process's creation time, not from GUI detection time"
 date: 2026-08-01
+last_updated: 2026-10-27
 category: runtime-errors
 module: nanobot-manager/process
 problem_type: runtime_error
@@ -105,5 +106,5 @@ Open with `PROCESS_QUERY_LIMITED_INFORMATION` and fall back to `PROCESS_QUERY_IN
 
 - `docs/solutions/architecture-patterns/state-driven-gateway-lifecycle.md` — the broader gateway-identity model (Gateway State Record, Gateway Process Identity via `FILETIME`); this uptime fix is one consumer of the same `GetProcessTimes` creation-time read that underpins PID-reuse protection.
 - Commit `9572c05` — the original fix (`fix(uptime): measure from gateway process start time, not GUI detection time`).
-- `nanobot-manager/src/process.c:476` — `nanobot_get_process_uptime_seconds`.
-- `nanobot-manager/src/main.cpp:206` — `update_uptime` / `start_uptime_timer` consumers.
+- `nanobot-manager/src/process.c:520` — `nanobot_get_process_uptime_seconds`.
+- `nanobot-manager/src/main.cpp:379` / `400` — `update_uptime` / `start_uptime_timer` consumers (`on_timer_uptime`, main.cpp:397, now also drives the chat UI tick).

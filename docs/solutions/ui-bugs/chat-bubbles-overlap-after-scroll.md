@@ -1,7 +1,7 @@
 ---
 title: "Chat message bubbles overlap after scrolling (core-ui ScrollView relayout)"
 date: 2026-07-31
-last_updated: 2026-10-26
+last_updated: 2026-10-27
 category: ui-bugs
 module: core-ui / chat scroll
 problem_type: ui_bug
@@ -66,7 +66,7 @@ The canonical fix for the overlap (routing every interactive relayout through `u
 The freeze needed a second fix — core-ui `11d7bd4` — because two costs multiply:
 
 1. **Uncached per-label measurement.** `LabelWidget::HeightForWidth` and `LabelWidget::SizeHint` create a fresh `IDWriteTextLayout` per wrapped label *on every layout pass* (via `MeasureContext::MeasureTextHeight` / `MeasureTextWidth` — one `CreateTextLayout` per call, no memoization). For long CJK text that is milliseconds per label.
-2. **Frame-rate relayout from a cosmetic timer.** The 33 ms field-drift timer (`TIMER_FIELD_DRIFT` in `main.cpp`) republishes the backdrop fields via `ui_page_set_float`, which marks the whole tree dirty (`RequestLayout`), so a full-tree relayout runs ~30 times per second while the window is shown — on every page, forever.
+2. **Frame-rate relayout from a cosmetic timer.** At the time of the freeze this was the 33 ms field-drift timer (`TIMER_FIELD_DRIFT` in `main.cpp`) republishing the backdrop fields via `ui_page_set_float`, which marks the whole tree dirty (`RequestLayout`) — a full-tree relayout ~30 times per second while the window was shown, on every page, forever. It has since been cut to a 100 ms tick (`DRIFT_TICK_MS`, code comment: "10Hz tick, not 30") with a 0.35-DIP delta skip and an early-out when the window is hidden/iconic (commit `64a21d9`).
 
 On a page with long-text labels up to the chat display cap (200), one pass costs seconds, the UI thread never idles, and queued input waits behind the current pass.
 
@@ -107,7 +107,7 @@ CJK fallback fonts push real line spacing past both 1.4×fs and the 1.3×fs line
 - **Scrolling** fired `OnMouseWheel`/`OnMouseDown`/`OnMouseMove`, which called `DoLayout()` directly on a call stack with **no** `ActiveMeasureContextScope`. The recursive relayout reached `HeightForWidth` with `g_activeMeasureContext == nullptr`, the inner branch was skipped, and the height collapsed to a single `lineH`.
 - `ui::RequestLayout()` only marks the tree dirty and invalidates the windows; the actual relayout then happens on the next frame inside `LayoutRoot`'s scope, where the measure context is guaranteed non-null. Deferring to the next frame costs nothing perceptible (60 Hz repaint keeps scroll/drag smooth) and also coalesces multiple rapid scroll events into one layout per frame instead of one per event.
 
-The freeze is the same hazard with a cost multiplier. Even a *correct* scoped layout is expensive when it re-measures every label from scratch, and the drift timer converts "once per interaction" into "30 times per second". With memoized measurement, a full pass on a 500-message page is milliseconds of hash comparisons instead of hundreds of `IDWriteTextLayout` creations, so the message pump keeps up. Verified on a seeded 500 × ~1.5 KB page: `/new` completes in under 2 s with the window responsive throughout (previously a 34 s hang).
+The freeze is the same hazard with a cost multiplier. Even a *correct* scoped layout is expensive when it re-measures every label from scratch, and the drift timer (33 ms at the time of the freeze; 100 ms with a delta skip today — see Prevention) converted "once per interaction" into a continuous background cadence. With memoized measurement, a full pass on a 500-message page is milliseconds of hash comparisons instead of hundreds of `IDWriteTextLayout` creations, so the message pump keeps up. Verified on a seeded 500 × ~1.5 KB page: `/new` completes in under 2 s with the window responsive throughout (previously a 34 s hang).
 
 The `display: block` change on `.msg-text` is harmless and complementary: on the *scoped* path it keeps the measured width equal to the drawn width for shrink-to-fit bubbles, but it is not load-bearing for this fix.
 
@@ -118,9 +118,9 @@ The `display: block` change on `.msg-text` is harmless and complementary: on the
 - **Treat null measure context as a degraded mode.** Any measurement that depends on the measure context (wrap height, caret advance) silently degrades outside the scope — multi-line height collapses to one line, caret advance reports zero. If a widget measures text, assume it is only correct when laid out under the scope.
 - **Keep wrap-label measure/draw width consistent** on shrink-to-fit containers (e.g. `display: block` or an explicit width) so the scoped path measures at the same width it draws.
 - **Treat layout passes as frame-rate work.** Any per-widget measurement in a layout path runs at relayout frequency — and cosmetic reactive timers multiply that frequency to frame rate. Memoize text measurement keyed on its inputs (width, font size, line-height, weight, padding, text identity), checked on read so no setter hooks are needed.
-- **Audit what a reactive field write costs.** `ui_page_set_float` on a drift field marks the entire tree dirty. Position-only bindings ideally should not require a measure pass at all — a subtree rect shift, the way `ApplyScrollDelta_` works, would be enough.
+- **Audit what a reactive field write costs.** `ui_page_set_float` on a drift field used to mark the entire tree dirty; that was the original hazard here. Position-only bindings should not require a measure pass at all — and since core-ui `7193235` they no longer do: absolute `:left`/`:top` writes now take a move-only fast path (`ApplyDynamicAbsSideBinding`, `page_state.cpp`) that moves the already-laid-out widget rect and invalidates paint only, exactly the subtree-rect-shift this bullet originally asked for.
 - **When a page feels sluggish with no visible cause, measure the UI thread's CPU while idle.** A saturated core with `Responding=True` is the signature of an over-frequent relayout; a deadlock shows `Wait` thread states with zero CPU. The two need opposite fixes.
-- **Residual, not fixed:** even fully cached, the 30 Hz full-window drift repaint (three large gradients over the acrylic backdrop) still costs ~75–85 % of one core on this machine. That is the animation's own paint cost, independent of measurement; gating the drift when the backdrop is fully covered would be a separate change.
+- **Residual, not fixed:** even fully cached and at the current 10 Hz tick with move-only writes, each drift tick still pays a full-window repaint (three large gradients over the acrylic backdrop; core-ui has no partial present). The older numbers are superseded: at the historical 30 Hz full-tree-relayout cadence this cost ~75–85 % of one core on this machine, while commit `64a21d9` (10 Hz + delta skip + move-only writes) reports visible idle CPU around ~10 % of one core. What remains is the animation's own paint cost, independent of measurement; gating the drift when the backdrop is fully covered would be a separate change.
 
 ## Related Issues
 

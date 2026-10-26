@@ -1,7 +1,7 @@
 ---
 title: "Unit-test framework, CTest wiring, and CI for a Win32 GUI app"
 date: 2026-07-11
-last_updated: 2026-08-01
+last_updated: 2026-10-27
 category: infrastructure
 module: nanobot-manager/tests
 problem_type: tooling_setup
@@ -28,7 +28,7 @@ This documents how a pragmatic unit-test layer + CTest + GitHub Actions CI were 
 
 ### Pick the cleanly testable surface, then grow it
 
-The suite started with two modules and has since grown to seven test executables. The testability picture is now:
+The suite started with two modules and has since grown to nine test executables. The testability picture is now:
 
 | Module | Testable? | Why |
 |---|---|---|
@@ -37,12 +37,12 @@ The suite started with two modules and has since grown to seven test executables
 | `credential.c` | ✅ `test_credential` | Wraps Windows Credential Manager. Testable against the real Cred API using a **process-unique target name** so it never touches the product's `nanobot-manager/bootstrap-secret/v1`. |
 | `process.c` | ✅ `test_process` | The pure-logic helpers (PID-reuse guards, `FILETIME` comparisons, port parsing, uptime math) are unit-testable; the network/spawn side is still exercised manually. (Originally deferred — the extractable helpers were carved out later.) |
 | `chat_history.c` | ✅ `test_chat_history` | Local history persistence (append/trim/resume, size caps). File-format logic without the transport. |
-| `chat_protocol.c` | ✅ `test_chat_protocol` | The WebSocket JSON frame protocol, decoded independently of WinHTTP. Compiles `chat_history.c` alongside it. |
+| `chat_protocol.cpp` | ✅ `test_chat_protocol` | The WebSocket JSON frame protocol, decoded independently of WinHTTP. Compiles `chat_history.c` alongside it. |
 | `i18n.c` | ✅ `test_i18n` | Pure string-table assembly: parses both assembled zh/en tables for line shape and key parity (prints the exact missing key), and checks every `status_*` key resolves in both languages (anti-drift). No platform deps. |
-| `chat.c` (transport) | ❌ no | WinHTTP WebSocket + connect/recv threads. The JSON frame-parsing logic now lives in `chat_protocol.c` (tested); the threaded transport remains manual. |
+| `chat.cpp` (transport) | ❌ no | WinHTTP WebSocket + connect/recv threads. The JSON frame-parsing logic now lives in `chat_protocol.cpp` (tested); the threaded transport remains manual. |
 | `main.cpp` | ❌ no | `WinMain`, tray, UI callbacks, message loop. Integration-test territory, not unit. |
 
-The ROI pattern: extract pure logic into a sibling file (`chat_protocol.c`, `chat_history.c`) and test *that*, leaving the I/O-heavy parent (`chat.c`) for manual verification. Seven executables now, grown incrementally as logic was carved out — not a big-bang effort.
+The ROI pattern: extract pure logic into a sibling file (`chat_protocol.cpp`, `chat_history.c`) and test *that*, leaving the I/O-heavy parent (`chat.cpp`) for manual verification. Nine executables now, grown incrementally as logic was carved out — not a big-bang effort.
 
 ### Use a self-contained framework instead of vendoring one
 
@@ -78,7 +78,12 @@ endif()
 
 ```cmake
 function(nm_add_test name)
-    add_executable(${name} ${name}.c ${ARGN})          # ARGN = module .c source(s)
+    if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp)   # auto-pick the .cpp variant when it exists
+        set(_nm_test_src ${name}.cpp)
+    else()
+        set(_nm_test_src ${name}.c)
+    endif()
+    add_executable(${name} ${_nm_test_src} ${ARGN})      # ARGN = module source(s)
     target_link_libraries(${name} PRIVATE nm_test)
     target_compile_definitions(${name} PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _CRT_SECURE_NO_WARNINGS)
     target_compile_options(${name} PRIVATE /utf-8 /EHsc)
@@ -87,12 +92,13 @@ function(nm_add_test name)
 endfunction()
 
 nm_add_test(test_config ${CMAKE_SOURCE_DIR}/src/config.c)
+target_include_directories(test_config PRIVATE ${CMAKE_SOURCE_DIR}/src ${cjson_SOURCE_DIR})
 target_link_libraries(test_config PRIVATE cjson shell32 ole32 advapi32)
 
 nm_add_test(test_credential ${CMAKE_SOURCE_DIR}/src/credential.c)
 target_link_libraries(test_credential PRIVATE advapi32)
 
-nm_add_test(test_process ${CMAKE_SOURCE_DIR}/src/process.c)
+nm_add_test(test_process ${CMAKE_SOURCE_DIR}/src/process.c ${CMAKE_SOURCE_DIR}/src/logger.c)  # process.c now calls nm_log
 target_link_libraries(test_process PRIVATE cjson winhttp shell32 ole32 advapi32)
 
 nm_add_test(test_autostart ${CMAKE_SOURCE_DIR}/src/autostart.c)
@@ -101,7 +107,7 @@ target_link_libraries(test_autostart PRIVATE advapi32)
 nm_add_test(test_chat_history ${CMAKE_SOURCE_DIR}/src/chat_history.c)
 target_link_libraries(test_chat_history PRIVATE cjson)
 
-nm_add_test(test_chat_protocol ${CMAKE_SOURCE_DIR}/src/chat_protocol.c ${CMAKE_SOURCE_DIR}/src/chat_history.c)
+nm_add_test(test_chat_protocol ${CMAKE_SOURCE_DIR}/src/chat_protocol.cpp ${CMAKE_SOURCE_DIR}/src/chat_history.c)
 target_link_libraries(test_chat_protocol PRIVATE cjson)
 
 nm_add_test(test_i18n ${CMAKE_SOURCE_DIR}/src/i18n.c)
@@ -158,10 +164,11 @@ The workflow (`.github/workflows/ci.yml`) does **not** reimplement the build. It
 - uses: actions/cache@v4
   with: { path: nanobot-manager/build/_deps, key: "${{ runner.os }}-deps-${{ hashFiles('**/CMakeLists.txt') }}" }
 - { name: Configure & build, shell: cmd, run: nanobot-manager\scripts\build.bat }
-- { name: Test, shell: cmd, run: ctest --test-dir nanobot-manager\build -C Release --output-on-failure --no-tests=error }
+- { name: Test, shell: cmd, run: ctest --test-dir nanobot-manager\build -C Release --output-on-failure --no-tests=error --timeout 120 }
+- { name: Upload test logs on failure, if: failure(), uses: actions/upload-artifact@v4, with: { name: ctest-logs, path: nanobot-manager/build/Testing/Temporary/, if-no-files-found: ignore } }
 ```
 
-`build/_deps` (cJSON + core-ui's QuickJS-NG) is the slow part of a cold configure, so it is cached keyed on the CMakeLists hash. `windows-latest` now ships VS 2026, which `build.bat` already supports (the `\\18\\` path fallback covers it). `fetch-depth: 1` is enough because `version.h` is derived from `NANOBOT_MANAGER_VERSION` in CMakeLists, not from `git describe`.
+`build/_deps` (cJSON + core-ui's QuickJS-NG) is the slow part of a cold configure, so it is cached keyed on the CMakeLists hash. `windows-latest` now ships VS 2026, which `build.bat` already supports (the `\\18\\` path fallback covers it). `fetch-depth: 1` is enough because `version.h` is derived from `NANOBOT_MANAGER_VERSION` in CMakeLists, not from `git describe`. `--timeout 120` makes a single hung test (winhttp polls / real Credential Manager / registry round-trips) fail fast instead of stalling the job. The workflow also pins `permissions: contents: read` and declares a `concurrency` group (`cancel-in-progress`) so rapid pushes to the same branch/PR cancel redundant full MSVC builds.
 
 ## Why This Matters
 
@@ -213,13 +220,13 @@ scripts\build.bat
 ctest --test-dir build -C Release --output-on-failure
 ```
 
-Current suite: `test_config`, `test_credential`, `test_process`, `test_autostart`, `test_chat_history`, `test_chat_protocol` — six console executables under `tests/`, all wired through `nm_add_test`. Runs in well under a second.
+Current suite: `test_config`, `test_credential`, `test_process`, `test_autostart`, `test_chat_history`, `test_chat_protocol`, `test_chat_draft`, `test_logger`, `test_i18n` — nine console executables under `tests/`, all wired through `nm_add_test`. Runs in well under a second.
 
 ## Related
 
 - `nanobot-manager/tests/nm_test.h` — the self-contained framework.
-- `nanobot-manager/tests/test_config.c` / `test_credential.c` / `test_process.c` / `test_autostart.c` / `test_chat_history.c` / `test_chat_protocol.c` — the test cases.
-- `nanobot-manager/tests/CMakeLists.txt` — `nm_add_test` + per-test wiring (six executables).
+- `nanobot-manager/tests/test_config.c` / `test_credential.c` / `test_process.c` / `test_autostart.c` / `test_chat_history.c` / `test_chat_protocol.cpp` / `test_chat_draft.cpp` / `test_logger.c` / `test_i18n.c` — the test cases.
+- `nanobot-manager/tests/CMakeLists.txt` — `nm_add_test` + per-test wiring (nine executables; `nm_add_test` auto-picks the `.cpp` variant when it exists).
 - `nanobot-manager/CMakeLists.txt` — `BUILD_TESTING` gate + `enable_testing()`.
 - `.github/workflows/ci.yml` — the CI workflow.
 - `docs/solutions/architecture-patterns/config-system.md` — the config testability refactor that made `test_config` possible.

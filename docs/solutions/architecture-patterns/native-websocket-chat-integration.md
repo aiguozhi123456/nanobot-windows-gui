@@ -1,7 +1,7 @@
 ---
 title: Native WebSocket Chat Integration in a Win32/C++ GUI Application
 date: 2026-07-11
-last_updated: 2026-10-26
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/chat
 problem_type: architecture_pattern
@@ -41,25 +41,26 @@ The transport never touches widgets or history files. The storage module never d
 
 ### Express Connection Readiness as a CAS State Machine
 
-The transport's readiness was once three volatile flags (`g_ready`, `g_attached`, `g_connecting`) whose valid combinations were only implicit. They are now one `std::atomic<ChatConnState>` (`Idle / Connecting / Connected / Attached`) moved by `compare_exchange_strong` transitions. A lost CAS — a connect completing while a disconnect lands — is one of the benign races the flag set tolerated, logged at DEBUG and swallowed, never an assertion. `g_stop` (worker cancellation) and the generation counter (stale-event guard) remain separate concerns; folding them in would couple different lifetimes.
+The transport's readiness was once three volatile flags (`g_ready`, `g_attached`, `g_connecting`) whose valid combinations were only implicit. They are now one `std::atomic<ChatConnState>` (`Idle / Connecting / Connected / Attached`) moved by `compare_exchange_strong` transitions. A lost CAS — a connect completing while a disconnect lands — is one of the benign races the flag set tolerated, logged at DEBUG and swallowed, never an assertion. The `stop_` member (worker cancellation) and the generation counter (stale-event guard) remain separate concerns; folding them in would couple different lifetimes.
 
 Every transition, connect attempt, bootstrap result, and dispatched frame logs through the unified `nm_log` pipeline (module `chat`), so `log_level: debug` makes the transport observable end to end. Workers are `std::thread` members joined in the destructor; because `std::thread` has no try-join, each worker sets a `finished_` flag as its last statement and reaping joins only `joinable() && finished` threads — the same semantics the old `WaitForSingleObject(0)` reaping provided.
 
 ### Accumulate Streams in a Draft, Publish Through One Path
 
-The message model is a `std::vector<ChatMsg{id, role, text}>`; cJSON survives only at the history-file boundary and the publish boundary. Streaming deltas append to a `ChatDraft` (amortized O(1); the previous implementation re-copied the whole accumulated text per chunk) which is NOT part of the model: it renders as a virtual trailing bubble and is never persisted mid-stream. Canonical `message`/`stream_end` text commits the draft through one `commitCanonical` path that keeps a turn to one bubble — streamed text and the server's canonical rewrite render as the same message, replacing content instead of appending a duplicate.
+The message model is a `std::vector<ChatMsg{id, role, text}>`; cJSON survives only at the history-file boundary and the publish boundary. Streaming deltas append to a `ChatDraft` (amortized O(1); the previous implementation re-copied the whole accumulated text per chunk) which is NOT part of the model: it renders as a virtual trailing bubble and is never persisted mid-stream. Canonical `message`/`stream_end` text commits the draft through one `commitCanonical` path that renders **one bubble per streamed segment**: `commitCanonical` always appends (deduplicating only an identical redelivery of the *last* assistant message), and a mid-turn user send fixates the live draft into its own bubble before the user message is appended — so a turn with tool calls or injected user messages yields multiple assistant bubbles, while each segment's streamed text and the server's canonical rewrite render as the same message.
 
-Every model change only sets a dirty flag. The 66 ms UI timer (`publishTick`), the scroll mount hook, and shutdown are the only flush entry points; terminal events flush at the end of their handler. Status text is key-based: `ChatUi` pushes a `chat_status_*` key into `chatStatusKey` and the template renders `$t(chatStatusKey)` (locale switches re-resolve immediately); raw server error text rides a separate `chatStatusDetail` field the template prefers when non-empty.
+Every model change only sets a dirty flag. The 66 ms UI timer (`publishTick`, which one tick after mount also re-pins the scroll to the bottom via `resettle_bottom_`), the scroll mount hook, the summon-path `scrollToBottom()` (`main.cpp`), and shutdown are the flush entry points; terminal events flush at the end of their handler. Status text is key-based: `ChatUi` pushes a `chat_status_*` key into `chatStatusKey` and the template renders `$t(chatStatusKey)` (locale switches re-resolve immediately); raw server error text rides a separate `chatStatusDetail` field the template prefers when non-empty.
 
 ### Marshal Network Events to the UI Thread
 
 The receive thread parses complete WebSocket frames and posts a custom window message. Any optional UTF-8 detail is heap-owned by the event and freed by ``ChatUi::onEvent` after processing:
 
 ```c
-static void post_event(WPARAM kind, char* detail) {
-    /* Snapshot the UI target under the transport lock. */
-    if (!PostMessageW(hwnd, msg_id, kind, (LPARAM)detail))
-        free(detail);
+static void postEvent(WPARAM kind, uint64_t generation, char* detail_or_null) {
+    /* Snapshot the UI target under the transport lock; stale generations are
+       dropped on the UI thread side before dispatch. */
+    if (!PostMessageW(hwnd, msg_id, kind, (LPARAM)detail_or_null))
+        free(detail_or_null);
 }
 
 /* Window subclass, on the UI thread. */
@@ -73,11 +74,13 @@ This keeps all cJSON message-array mutations and Core UI calls on the window thr
 
 ### Persist a Normalized Local History
 
-Chat history lives beside the active `config.json` as a separate `chat-history.json`; it is not another settings field and contains no credential or WebSocket token. The version-1 schema stores only durable message meaning:
+Chat history lives beside the active `config.json` as a separate `chat-history.json`; it is not another settings field and contains no credential or WebSocket token. The current version-2 schema stores durable message meaning plus the session binding:
 
 ```json
-{"version":1,"messages":[{"role":"user","text":"hello"},{"role":"assistant","text":"hi"}]}
+{"version":2,"webui_port":8765,"chat_id":"a1b2...","resume_safe":true,"messages":[{"role":"user","text":"hello"},{"role":"assistant","text":"hi"}]}
 ```
+
+Version 1 is accepted only as an unbound legacy document (messages, no binding). The binding gates re-attach: `canResume` (via `chat_history_document_can_resume`) resumes the stored `chat_id` only when it matches the current `webui_port` and `resume_safe` is set — an attempted message marks the binding unsafe — and a fresh session first archives the previous history (`chat_history_copy_to_archive`, reached through `ChatUi::prepareFreshSession`) before the new binding is written.
 
 UI-only identifiers are regenerated after load. The reader validates the exact root/message shape, version, roles, text types, message count, per-message size, total text size, physical or escaped NULs, and file size. The writer normalizes the current UI array and retains the newest bounded suffix when a long-running conversation exceeds the persistence limits.
 
@@ -91,7 +94,7 @@ Use an atomic replacement sequence:
 
 An invalid history file is moved to a unique `.invalid.*` backup before a clean history may replace it. A true I/O read error instead closes a write gate: sending retries the read, and no subsequent save may overwrite an unreadable source until it is recovered, confirmed absent, or successfully quarantined.
 
-Streaming deltas update memory and mark the snapshot dirty, but do not write on every chunk. Stable boundaries such as a sent user message, complete response, stream end, turn end, compensation, disconnect, and shutdown call `save_if_dirty`. A failed save leaves the revision dirty so a later boundary can retry. (With the `ChatDraft` model, the streamed text itself becomes durable only when it is committed — canonical text, fixation at `TURN_END`/disconnect, or teardown — so each turn lands on disk as one atomic content update.)
+Streaming deltas update memory and mark the snapshot dirty, but do not write on every chunk. Stable boundaries such as a sent user message, complete response, stream end, turn end, compensation, disconnect, and shutdown call `save_if_dirty`. A failed save leaves the revision dirty so a later boundary can retry. (With the `ChatDraft` model, the streamed text itself becomes durable only when its segment is committed — canonical text, fixation at `TURN_END`/disconnect, a mid-turn user send, or teardown — so each streamed segment lands on disk as one atomic content update; a multi-segment turn writes several bubbles.)
 
 ### Treat `/new` as a Process-Local Compensating Transition
 
@@ -127,24 +130,28 @@ NEW_WAIT_ACK
   ERROR / disconnect / stop / close -> restore backup, IDLE
 
 NORMAL_WAIT_ACTIVITY
-  MESSAGE -> render complete reply, IDLE            # non-stream / inline
-  DELTA / STREAM_END -> NORMAL_ACTIVE               # streaming response
-  TURN_END -> ignore                                # stale terminal event
+  MESSAGE (stop_requested_) -> append nothing, stopped status, IDLE   # /stop's "Stopped N task(s)."
+  MESSAGE (has text) -> append reply bubble, IDLE                     # non-stream / inline
+  DELTA / STREAM_END -> NORMAL_ACTIVE                                 # streaming response
+  TURN_END -> IDLE                                                    # stop with no output, or a silent cancel
 
 NORMAL_ACTIVE
+  MESSAGE (stop_requested_) -> fixate draft, stopped status, IDLE    # /stop's "Stopped N task(s)."
   DELTA / MESSAGE / STREAM_END -> remain active
   TURN_END -> IDLE
 ```
 
+A mid-turn normal send keeps the current state (the gateway queues the extra text into the active turn) instead of transitioning; only a send from `IDLE` enters `NORMAL_WAIT_ACTIVITY`.
+
 `NEW_WAIT_ACK` ignores content and terminal events other than the exact acknowledgement because an active queue may still deliver events from the turn that `/new` cancelled. `IDLE` likewise ignores unsolicited content and terminal events, preventing tails that arrive after acknowledgement from repopulating the cleared history.
 
-A normal request distinguishes a complete first `message` from a streaming response. A first `message` is sufficient to finish a non-stream or inline command, including commands whose inline path does not publish `turn_end`. A first `delta` or `stream_end` establishes streaming activity and advances to `NORMAL_ACTIVE`; only then may `turn_end` complete the turn. This prevents a delayed old terminal event from re-enabling send during the next streamed turn.
+A normal request distinguishes a complete first `message` from a streaming response. A first `message` is sufficient to finish a non-stream or inline command, including commands whose inline path does not publish `turn_end`. A first `delta` or `stream_end` establishes streaming activity and advances to `NORMAL_ACTIVE`; `turn_end` completes the turn from either normal state, including a turn that produced no output (a stop with no output, or a silent cancel). Delayed terminal events from an earlier turn are ignored only while `IDLE`.
 
 ### Watchdog on True Silence, Not on Tool Latency
 
 An agent turn can legitimately run minutes: MCP tools (web fetches, shell) and reasoning phases happen before the first content frame. Interim frames — `message` frames with `kind: tool_hint/progress/reasoning` and every other unhandled event (`reasoning_delta`, `goal_status`, `file_edit`, ...) — are not rendered, but each one is posted as `CHAT_EVT_ACTIVITY` and re-arms the in-flight-turn watchdog (when the turn is still waiting for its first content frame, the status bar also shows a "working" hint). The watchdog therefore means *N seconds with zero frames of any kind*, not *N seconds without a reply*: a 45 s MCP fetch that times out and is retried no longer reads as a hung gateway.
 
-When the watchdog does fire — or the user clicks the send button, which doubles as a "stop waiting" control while a turn is open (`turnWaiting` page field drives the label/enabled bindings) — the turn aborts SOFTLY: the partial draft is fixated, the binding is marked unsafe, the status shows the timeout, but the socket stays up and sending re-enables immediately (no disconnect, no auto-connect block). A genuinely dead socket surfaces on the next send or via the receive worker; killing a healthy connection over a slow turn, as an earlier hard-timeout did, lost the eventual reply entirely. The ceiling is 10 minutes of true silence: an observed tool chain (flaky-network web fetches retried for ~4 minutes, no ws traffic at all) outlived the original 60 s and a first 90 s cut.
+When the watchdog does fire, or the stop button is used, the turn ends without a hard disconnect. Stopping is a dedicated control — `btn_chat_stop` (`:enabled="turnWaiting"`) — whose `cancelWait()` sends the gateway's `/stop` command and then grants a 15 s grace window (`CHAT_STOP_GRACE_MS`) for the normal `turn_end` / terminal `MESSAGE` teardown before falling back to the local soft abort (a `/stop` send failure soft-aborts immediately). The send button itself stays enabled mid-turn: the gateway queues extra text into the active turn (`canSendNow` / `chat_protocol_send_allowed`), and only the `/new`-acknowledgement window blocks it. Either way the abort is SOFT: the partial draft is fixated, the binding is marked unsafe, the status shows the timeout, but the socket stays up and sending re-enables immediately (no disconnect, no auto-connect block). A genuinely dead socket surfaces on the next send or via the receive worker; killing a healthy connection over a slow turn, as an earlier hard-timeout did, lost the eventual reply entirely. The ceiling is 10 minutes of true silence: an observed tool chain (flaky-network web fetches retried for ~4 minutes, no ws traffic at all) outlived the original 60 s and a first 90 s cut.
 
 Current upstream behavior gives `/new` the exact acknowledgement on both dispatch paths. The ordinary path then emits `turn_end`; the active-queue inline path does not emit a command-specific terminal event. The state machine therefore commits `/new` only on its acknowledgement and ignores `turn_end` while waiting for it.
 
@@ -154,7 +161,7 @@ The normal-turn branch additionally depends on two verified protocol properties:
 
 `stream_end` and `turn_end` answer different questions:
 
-- `stream_end` finalizes assistant content. Its optional `text`/`content` may contain the server's canonical final text, including rewritten media URLs, so it replaces the turn's bubble instead of appending a duplicate.
+- `stream_end` finalizes assistant content. Its optional `text`/`content` may contain the server's canonical final text, including rewritten media URLs, so it commits the current segment as one bubble (appending, with dedup only against an identical immediately-preceding assistant message) instead of rendering streamed and canonical text as two bubbles.
 - `turn_end` says a normal active turn has finished and may re-enable sending when the state machine permits it.
 
 The legacy `done` alias maps to two ordered UI events: `STREAM_END` first, then `TURN_END`. Content is therefore finalized before the turn becomes idle.
@@ -184,9 +191,9 @@ Treating a missing, malformed, or temporarily unreadable file as the same empty 
 
 Clearing history immediately after a successful socket write confuses transport acceptance with server success. Keeping a process-local pre-command snapshot until acknowledgement makes reported failure, disconnect, gateway stop, and graceful shutdown converge on one compensation path. It does not provide a distributed rollback or a crash-durable transaction.
 
-### Partial and Final Assistant Text Are One Message
+### One Bubble per Streamed Segment
 
-Rendering both streamed text and canonical final text as separate bubbles misrepresents one logical reply and can lose server-side rewrites. Updating one assistant bubble preserves the semantic relationship between partial and final events.
+A turn renders as one bubble per streamed segment: `commitCanonical` always appends (deduplicating only an identical redelivery of the *last* assistant message), and a mid-turn user send fixates the live draft into its own bubble before the user message is appended, so a turn with tool calls or injected user messages yields multiple assistant bubbles. Within a segment, rendering streamed text and the canonical final text as separate bubbles would still misrepresent one logical reply and could lose server-side rewrites — the partial and final text of one segment update a single bubble.
 
 ## When to Apply
 
@@ -194,7 +201,7 @@ Rendering both streamed text and canonical final text as separate bubbles misrep
 - Commands whose acknowledgement differs from ordinary request completion
 - Clients without a reliable request/turn identifier on every terminal event
 - Local history or cache files that must survive ordinary restarts and failed atomic writes
-- Reactive message lists that combine partial and final representations of one reply
+- Reactive message lists that combine partial and final representations of one streamed segment
 
 ## Examples
 
@@ -226,7 +233,7 @@ A normal user bubble is appended only after the transport accepts the send. A `/
 
 ### Verification Boundaries
 
-`test_chat_history` covers schema and Unicode round trips; `test_chat_draft` covers the bounded streaming buffer (accumulation, empty-chunk no-op, overflow rejection, restart); upstream-compatible `/new` normalization; invalid document shapes and an overlong message; file round trips and empty replacement; physical and escaped NUL rejection; invalid-file quarantine; rolling retention by count and total serialized text; escaped-text file sizing; path derivation; missing files; and invalid-parameter error contracts.
+`test_chat_history` covers schema and Unicode round trips, the upstream-compatible `/new` normalization (`test_commands_and_blank_input`), invalid document shapes and an overlong message, file round trips and empty replacement, physical and escaped NUL rejection, invalid-file quarantine, rolling retention by count and total serialized text, escaped-text file sizing, path derivation, missing files, and invalid-parameter error contracts. `test_chat_draft` covers the bounded streaming buffer (accumulation, empty-chunk no-op, overflow rejection, restart), and `test_chat_protocol` covers the pure decision helpers (attachment resolution, retry eligibility, send/persist policy).
 
 Release verification also includes the full Windows build and CTest suite. The UI/WebSocket state machine does not yet have an automated harness; the missing inline-command completion case was found by manual testing with existing history. Real read faults, oversized-file loading, strict aggregate-load limits, quarantine failure, the UI write gate, and crash recovery are also not covered by the current unit tests. Future state-machine extraction should cover exact acknowledgement, stale content while waiting for acknowledgement, content after acknowledgement, message-only inline completion, delayed `turn_end`, `done`, disconnect/shutdown compensation, and `stream_end.text` replacement.
 

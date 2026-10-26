@@ -1,7 +1,7 @@
 ---
 title: "State-Driven Gateway Lifecycle Management on Windows"
 date: 2026-07-13
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/process
 problem_type: architecture_pattern
@@ -47,7 +47,7 @@ That split authority produced several forms of drift:
 - A stale state record could name a reused PID, and several `GetProcessTimes` calls passed invalid `NULL` output pointers instead of failing closed when identity was unavailable.
 - The optional bootstrap secret was serialized as `webui_auth` in `config.json` and exposed through reactive UI state instead of a native credential boundary.
 
-The durable result is a control-plane-first supervision model: use nanobot's CLI, health endpoint, and state record as the primary lifecycle contract, then use Win32 process APIs as transport, observation, identity verification, and guarded fallback. The implementation is centered in `nanobot-manager/src/process.c` and `nanobot-manager/src/process.h`, with asynchronous orchestration and UI transitions in `nanobot-manager/src/main.cpp`.
+The durable result is a control-plane-first supervision model: use nanobot's CLI, health endpoint, and state record as the primary lifecycle contract, then use Win32 process APIs as transport, observation, identity verification, and guarded fallback. The implementation is centered in `nanobot-manager/src/process.c` and `nanobot-manager/src/nm_process.h`, with asynchronous orchestration and UI transitions in `nanobot-manager/src/main.cpp`.
 
 ### What Did Not Work
 

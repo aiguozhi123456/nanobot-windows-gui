@@ -1,6 +1,7 @@
 ---
 title: "Rejected approach: console CTRL_BREAK_EVENT shutdown for the gateway (decision history)"
 date: 2026-08-01
+last_updated: 2026-10-27
 category: design-patterns
 module: nanobot-manager/process
 problem_type: design_pattern
@@ -82,9 +83,11 @@ Two pieces of the rejected approach are still good Win32 knowledge, just not the
 
 ```c
 /* src/process.c — nanobot_stop */
+/* args are raw, WITHOUT a leading space: build_command_line inserts the
+ * separator between the quoted exe and the argument string (process.c:59-61). */
 wchar_t* cmdline = build_command_line(wide_exe,
-    resolved_is_python ? L" -m nanobot gateway stop --timeout 20"
-                       : L" gateway stop --timeout 20");
+    resolved_is_python ? L"-m nanobot gateway stop --timeout 20"
+                       : L"gateway stop --timeout 20");
 CreateProcessW(NULL, cmdline, ..., CREATE_NO_WINDOW, ...);   /* ask the gateway to stop itself */
 WaitForSingleObject(stop_pi.hProcess, 25000);
 /* match stdout tokens; escalate to TerminateProcess + kill_process_tree on failure/timeout */
@@ -105,5 +108,5 @@ WaitForSingleObject(handle, 5000);
 
 - `docs/solutions/architecture-patterns/state-driven-gateway-lifecycle.md` — the current shutdown model; its "What Did Not Work" section is the one-line conclusion this doc grounds. Cross-link: that doc is the *what*, this doc is the *why-not-the-obvious-thing*.
 - Commit `3553558` — the original `CTRL_BREAK_EVENT` implementation (`feat: graceful nanobot shutdown via CTRL_BREAK_EVENT`).
-- `nanobot-manager/src/process.c` — `nanobot_stop` (~line 1690): the `gateway stop --timeout 20` spawn, stdout-token matching, and `kill_process_tree` escalation with the PID-reuse guard.
+- `nanobot-manager/src/process.c` — `nanobot_stop` (line 1877): the `gateway stop --timeout 20` spawn (~lines 2005-2042), stdout-token matching, and `kill_process_tree` escalation with the PID-reuse guard (~lines 2085-2124).
 - `CONCEPTS.md` → **Gateway Process Identity** — why targeting an *instance* by PID+creation-time, not a group by signal, is the contract the stop path must honor.

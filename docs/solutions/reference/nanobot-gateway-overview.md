@@ -1,7 +1,7 @@
 ---
 title: "nanobot Gateway Overview — 上游被托管网关的整体画像"
 date: 2026-07-11
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: reference
 module: upstream/nanobot
 problem_type: reference_overview
@@ -113,7 +113,7 @@ Authorization: Bearer <secret>
 
 错误码：`401`（认证失败）/ `403`（localhost-only 限制被触发）/ `429`（too many tokens）。
 
-> **manager `chat.c` 解析 `token`（回退 `api_token`）+ `ws_path` 的逻辑正确。**
+> **manager `chat.cpp` 解析 `token`（回退 `api_token`）+ `ws_path` 的逻辑正确。**
 
 ### 3. 聊天 WebSocket（端口 8765，路径=ws_path）
 
@@ -155,7 +155,7 @@ ws://host:8765/?token=<bootstrap_token>
 
 > 兼容旧格式：无 `type` 的纯文本 / `{"content": ...}` 也被接受。
 
-> **manager `chat.c` 出站用 `{"type":"message","chat_id","content"}`、入站以 `event` 为主键（回退 `type`）、处理 `ready` / `delta` / `message` / `stream_end`（+ 自加 `done` 别名）/ `error` —— 正确。**
+> **manager `chat.cpp` 出站用 `{"type":"message","chat_id","content"}`、入站以 `event` 为主键（回退 `type`）、处理 `ready` / `delta` / `message` / `stream_end`（+ 自加 `done` 别名）/ `error` —— 正确。**
 
 ### 认证汇总
 
@@ -189,10 +189,10 @@ modelPresets         # v0.2.0+ 模型预设范式
 | `enabled` | — | — |
 | `host` | `"127.0.0.1"` | — |
 | `port` | **8765** | `config.webui_port` |
-| `path` | `"/"` | chat.c 用此拼 WS URL |
+| `path` | `"/"` | chat.cpp 用此拼 WS URL |
 | `token` | `""` | 静态 WS token |
 | `token_issue_path` | `""` | — |
-| **`token_issue_secret`** | `""` | `config.webui_auth` |
+| **`token_issue_secret`** | `""` | 自动读取为 bootstrap 密钥（`tokenIssueSecret`，回退 `token`，`process.c`）；显式覆盖存 Windows Credential Manager，`config.webui_auth` 仅迁移用、不再序列化 |
 | `token_ttl_s` | `300` | — |
 | `websocket_requires_token` | `true` | — |
 | `allow_from` | `["*"]` | — |
@@ -220,8 +220,8 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 | `process.c` | 状态记录 / PID | 读取 `%USERPROFILE%\.nanobot\run\gateway.json`，用真实 gateway PID `OpenProcess`；启动路径优先校验十进制 FILETIME `identity` |
 | `process.c` | 停止 | 优先 `gateway stop --timeout 20`；失败后才走句柄终止 / process-tree fallback |
 | `process.c` + `main.cpp` | 活跃性 | worker 异步 WinHTTP `GET /health`；`RegisterWaitForSingleObject` 监听进程退出；结果经 `PostMessageW` 回 UI 线程 |
-| `chat.c` | 聊天连接 | `GET /webui/bootstrap`（`X-Nanobot-Auth`）→ WS 升级 → 帧解析 |
-| `config.c` | 端口 / 密钥配置 | `webui_port`（8765）/ `health_check_port`（18790）/ `webui_auth` 与 nanobot 默认端口一致 |
+| `chat.cpp` | 聊天连接 | `GET /webui/bootstrap`（`X-Nanobot-Auth`）→ WS 升级 → 帧解析 |
+| `config.c` | 端口 / 密钥配置 | `webui_port`（0=自动，遗留 8765 归一化为 0）/ `health_check_port`（0=自动，遗留 18790 归一化为 0）；密钥优先级 Credential Manager（`credential.c`）→ nanobot 配置自动读取（`process.c`）→ 无，统一在 `main.cpp` `set_chat_endpoint_effective` 汇聚（`webui_auth` 仅迁移用，不再序列化） |
 
 > manager 退出时只释放自己的观察句柄，不停止后台 gateway；下次启动在健康检查成功后可根据状态记录重新 attach。当前 attach 路径仅确认记录 PID 存活，完整的 `identity` 比对仍是加固项；详见 [State-Driven Gateway Lifecycle Management on Windows](../architecture-patterns/state-driven-gateway-lifecycle.md)。
 
@@ -238,18 +238,18 @@ v0.2.2 "Durability Release"（2026-06-21），几乎每日更新，33+ contribut
 
 | 项 | 现状 | 建议 |
 |----|------|------|
-| `turn_end` 帧未处理 | manager 只处理到 `stream_end` | 长任务（多轮工具调用）下仅靠 `stream_end` 可能过早解锁输入框；建议监听 `turn_end` 作 `canSend` 强信号 |
-| `reasoning_delta` / `reasoning_end` 未显示 | 丢弃 | 思考链不可见，可加可折叠 reasoning 区块 |
-| `file_edit` / tool events / `goal_state` 未渲染 | 丢弃 | 可加工具执行反馈区 |
+| `turn_end` 帧（已处理） | manager 已监听 `turn_end`（`chat.cpp`），并以其作为一轮的权威终止信号（`chat_ui.cpp`：等待期显示 `chat_status_wait_turn_end`，`canSend` 门控生效） | 已落地，无需动作 |
+| `reasoning_delta` / `reasoning_end` 未显示 | 不渲染，但未知事件（含 `reasoning_delta`）会触发 `CHAT_EVT_ACTIVITY` 作为轮中活性证据（`chat.cpp`） | 思考链不可见，可加可折叠 reasoning 区块 |
+| `file_edit` / tool events / `goal_state` 未渲染 | 不渲染，但会触发 `CHAT_EVT_ACTIVITY` 作为轮中活性证据（`chat.cpp`，同未知事件路径） | 可加工具执行反馈区 |
 | bootstrap 的 `model_name` / `api_token` 未用 | 仅取 `token` + `ws_path` | `api_token` 可调 `/api/sessions` 做历史会话管理 |
-| `stream_end` 的 `text` 字段被丢弃 | 仅用 delta 累积 | 该字段是媒体 URL 改写后的完整文本，可作最终校验 / 回退 |
+| `stream_end` 的 `text` 字段（已使用） | 已落地：`chat.cpp` 提取 `text`/`content`，`chat_ui.cpp` 经 `commitCanonical` 将其落为该段气泡（媒体 URL 改写后的完整文本） | 已落地，无需动作 |
 
 ### 🔴 高风险（需监控）
 
 | 项 | 影响 | 对冲策略 |
 |----|------|----------|
 | 端口默认值变更 | 健康 / 聊天全断 | 已 config 驱动 ✓；建议 bootstrap 返回含端口时同步 |
-| `stream_end` 语义被 `turn_end` 弱化 | 完成判定不准 | 同时监听两个完成帧 |
+| `stream_end` 语义被 `turn_end` 弱化 | 完成判定不准 | 已解决：`chat.cpp` 同时监听 `stream_end`/`done` 别名与 `turn_end`，`chat_ui.cpp` 有 `canSend` 门控 |
 | bootstrap 返回结构变更 | 聊天连接失败 | 关键字段缺失时加日志，容错降级 |
 | WS 握手 token 传递方式从 query 改 header | 连接失败 | 关注 CHANGELOG |
 | `tokenIssueSecret` vs `token_issue_secret` 字段名 | 配置不生效 | 注意 camelCase 序列化方向 |
@@ -280,7 +280,7 @@ manager 集成层与 v0.2.2 **完全兼容，无紧急破坏**。聊天适配债
 
 | 文件 | 作用 |
 |------|------|
-| `nanobot-manager/src/chat.c` | WS 聊天客户端（bootstrap + 连接 + 流式） |
+| `nanobot-manager/src/chat.cpp` | WS 聊天客户端（bootstrap + 连接 + 流式；决策/状态层在 `chat_protocol.cpp` + `chat_ui.cpp`） |
 | `nanobot-manager/src/process.c` | 进程管理 + `/health` 健康检查 |
 | `nanobot-manager/src/config.c` | manager config.json（webui_port / health_check_port / webui_auth） |
 

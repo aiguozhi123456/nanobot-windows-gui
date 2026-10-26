@@ -1,6 +1,7 @@
 ---
 title: "core-ui 静默视觉陷阱：height-0 隐藏回退、子树 opacity、百分比圆角、transition 作用域与 CSS 解析盲区（8 例）"
 date: 2026-10-24
+last_updated: 2026-10-27
 category: ui-bugs
 module: core-ui / dashboard UIX bindings
 problem_type: ui_bug
@@ -53,9 +54,9 @@ tags: [core-ui, dashboard-uix, uix-binding, opacity-subtree, border-radius, css-
 - **页面切换淡入动画（已尝试并移除）**：core-ui 的 PaintedOnce 挂载门会在首帧前"拍实"（snap）所有 pre-paint 绑定，任何入场动画启动前都会强制出现约 40ms 的完全不可见拍；且页面脚本里没有 JS 定时器可用，不存在无闪烁的挂载动画路径。该方案整段移除，作为已否决方案记录在案。
 - **`radial-gradient(ellipse at 12% 0%, …)` 定位色晕**：`at` 前缀被静默忽略（值分词器跳过前缀桶），中心永远 50%/50%——写 `at` 与不写结果相同，无告警。
 - **多层背景一次写完**：`background: g1, g2` 的逗号被值分词器当参数分隔符切开，多层语法整体失效（连第一层都不渲染）。每层渐变必须独占一个元素。
-- **`backdrop-filter` 直接写在 ScrollView 上**：`ScrollViewWidget::DrawTree`（controls.cpp:2481）覆写后直接调 `OnDraw`，跳过 `Widget::DrawTree` 基类路径里的 backdrop-blur / box-shadow 绘制——模糊静默 no-op。玻璃必须放在包住 ScrollView 的普通 div 上。
+- **`backdrop-filter` 直接写在 ScrollView 上**：`ScrollViewWidget::DrawTree`（controls.cpp:2530）覆写后直接调 `OnDraw`，跳过 `Widget::DrawTree` 基类路径里的 backdrop-blur / box-shadow 绘制——模糊静默 no-op。玻璃必须放在包住 ScrollView 的普通 div 上。
 - **`position:absolute; left:0; right:0` 期望左右拉伸**：绝对定位宽度只取 `fixedW` 或 `SizeHint()`（widget.cpp:411-421），`posRight` 仅在 `posLeft` 缺席时当定位锚点，不参与宽度求解。满宽必须显式 `width`（窗口固定尺寸时可直接算出）。
-- **净零边距算术只加不减**：`.backdrop-b` 写了 `margin-top:220 + height:300 + margin-bottom:-500`，净流高 = +20 DIP——把标题栏整体顶下来，窗口顶部出现一条背景色带。净零 div 的 margin 必须满足 `margin-top + height + margin-bottom = 0`（此例 -520 才对）。
+- **净零边距算术只加不减**：`.backdrop-b` 写了 `margin-top:220 + height:300 + margin-bottom:-500`，净流高 = +20 DIP——把标题栏整体顶下来，窗口顶部出现一条背景色带。净零 div 的 margin 必须满足 `margin-top + height + margin-bottom = 0`（此例 -520 才对）。（历史背景：正是这条 +20 DIP 幽灵色带成为后来把色场彻底改离 flow 布局、走上绝对定位的动因——现行方案下该算术已不存在。）
 - **DPI 不感知的截图（假警报来源）**：PowerShell PrintWindow（`PW_RENDERFULLCONTENT=2`）在一个 150% 缩放的机器上，采集进程 DPI 不感知，窗口真实物理尺寸 645x750，DC 却硬裁到 430px——"卡片被裁切、第三个 metric 截断"完全是采集侧假象。修正：在 GetWindowRect/PrintWindow 之前先 P/Invoke `SetProcessDPIAware()`。
 - **PrintWindow 采集 DComp 窗口拿到空/旧内容**：透窗版（WS_EX_NOREDIRECTIONBITMAP + DirectComposition）不走重定向表面，PrintWindow 抓不到合成内容——改用 `CopyFromScreen` 按窗口屏幕区域拷屏（代价：重叠窗口/光标会入镜）。**采图前零接触**（2026-10-25 修订）：移动/前置/还原窗口本身就是一次 backdrop 踢，会把死采样踢活、伪造"采集正常"——只做纯查询（GetWindowRect）+ 纯读屏（CopyFromScreen），判别采样死活用壁纸对照，见 architecture-patterns/translucent-window-dwm-acrylic.md 三轮。
 - **视觉模型读小图标不可靠**：对小尺寸图标的判读反复互相矛盾；曾把渲染内容"读"成不存在的"fox logo"（幻觉）。像素扫描才稳定。
@@ -104,7 +105,7 @@ tags: [core-ui, dashboard-uix, uix-binding, opacity-subtree, border-radius, css-
 `nanobot-manager/src/main.cpp`：C 侧一次性重复定时器驱动 `ringSize` 16→28→16：
 
 ```c
-#define TIMER_PULSE   1007
+#define TIMER_PULSE   1006   /* 注意：1007 是 TIMER_FIELD_DRIFT（main.cpp:90-92），勿混用 */
 #define PULSE_TICK_MS 470   /* 450ms CSS transition 落在相邻两拍之间 */
 
 on_timer_pulse:                       /* 3 拍序列 */
@@ -157,7 +158,9 @@ hout(id) { if (this.hover == id) this.hover = ""; }
 
 opacity 表达式里的 `page=='…'` 项是自愈保险：`v-if` 切页时被卸载的控件可能收不到 `mouseleave`，`hover` 会卡住；换页后 page 条件变假，透明度立即回到 1。
 
-### 缺陷 5+6：色场定位用"净零流 div"，每 div 一层渐变
+### 缺陷 5+6：色场定位用"净零流 div"，每 div 一层渐变（历史方案，已被取代）
+
+> **方案已换代（2026-10-27）**：下述"净零流 div"定位写法**已废弃**——现行色场是 `position: absolute` + `hitTransparent="true"` + `:left`/`:top` 漂移绑定（dashboard.uix:109-131、910-912；uix 内注释同述退役）。现行方案见 `docs/solutions/ui-bugs/absolute-positioned-backdrop-divs-swallows-clicks.md`。仍然成立的框架事实：`at` 前缀被静默忽略、多层逗号背景不支持——"每团色晕一个元素、单层渐变"的约束不变。以下净零流写法仅作历史方案存档。
 
 `at` 前缀被忽略、多层逗号背景不支持的组合绕法（液态玻璃的彩色底景）：
 
@@ -203,9 +206,13 @@ opacity 表达式里的 `page=='…'` 项是自愈保险：`v-if` 切页时被�
 
 - **缺陷 5 根因**：core-ui 的渐变值解析器按逗号切参数后逐桶匹配，`at` 位置前缀所在的桶被跳过（不报错、不解析），渐变中心停在默认 50%/50%。
 - **缺陷 6 根因**：CSS 值分词器把函数参数内的逗号也当分隔符，`background: g1, g2` 被切成两个无效值——多层背景语法整体不支持，而非部分支持。
-- **缺陷 7 根因**：`ScrollViewWidget::DrawTree`（controls.cpp:2481）为滚动裁剪覆写了绘制路径，直接调 `OnDraw`（只画滚动条），跳过 `Widget::DrawTree` 基类里的 `DrawBackdropBlur`/`DrawBoxShadow` 段（widget.cpp:518 附近）——基类支持的能力在 ScrollView 子类上静默缺失。同理适用于 box-shadow。
+- **缺陷 7 根因**：`ScrollViewWidget::DrawTree`（controls.cpp:2530）为滚动裁剪覆写了绘制路径，直接调 `OnDraw`（只画滚动条），跳过 `Widget::DrawTree` 基类里的 `DrawBackdropBlur`/`DrawBoxShadow` 段（widget.cpp:518 附近）——基类支持的能力在 ScrollView 子类上静默缺失。同理适用于 box-shadow。
 - **缺陷 8 根因**：绝对定位子节点的求解在 `widget.cpp:411-421`：`w = fixedW > 0 ? fixedW : (hint.width > 0 ? hint.width : cw)`，`left/right` 只决定 `x`（`pr` 仅在 `pl` 缺席时使用）——不存在"两端约束求宽度"的分支。
-- **净零边距**：net-zero 流 div 依赖 `margin-top + height + margin-bottom = 0` 的算术；漏算一项就变成"带残留流高"的占位元素，把后续兄弟顶下来。
+- **净零边距（历史方案，已被绝对定位 + hitTransparent 取代——见缺陷 5+6 的换代说明）**：net-zero 流 div 依赖 `margin-top + height + margin-bottom = 0` 的算术；漏算一项就变成"带残留流高"的占位元素，把后续兄弟顶下来。
+
+### 缺陷 10：叶级 `:opacity` + 长 CSS transition 把动画宿主拖到 ~60 Hz
+
+`status-dot`（10px LED 圆点）的呼吸灯曾用叶级 `:opacity="ambientGlow"` 绑定 + 心跳 `transition` 做渐变：绑定每次变化后，transition 让动画宿主以 ~60 Hz 持续插值，**每个插值帧都是整窗重绘**——为一个 10px 圆点拖着整个窗口跑 60fps。修法（commit 64a21d9）：心跳改为 C 侧离散采样——drift tick（10 Hz）上按 2.8s 正弦直接 `ui_page_set_float("ambientGlow", …)`，**叶级不写 transition**（dashboard.uix:349-353 注释、main.cpp:460 起 drift tick 注释）。教训：transition 的代价不与元素大小成比例——绑定驱动的 opacity 动画哪怕只碰一个小叶子，插值期间都是全窗口重绘；小元素的连续感优先用低频离散采样（10 Hz 步进在 10px 圆点上不可分辨）。
 
 ### 验证方法（目检基建）
 
@@ -233,7 +240,7 @@ core-ui UI 编写清单（每条都对应一个已付过学费的静默陷阱）
 - [ ] **凡做视觉验证，截图脚本必过 DPI 检查**：采集前 `SetProcessDPIAware()`（P/Invoke）；对照 `GetWindowRect` 的宽高与位图像素尺寸是否一致，不一致即采集侧假象，先修采集再下 bug 结论。
 - [ ] **小图标判定以像素普查为准**：GetPixel 颜色普查（带容差窗口）+ 按行聚类；视觉模型读数只作交叉参考，两者矛盾时信像素。
 - [ ] **采图前 `SetCursorPos` 移开鼠标**，避免截到 hover 态造成误读。
-- [ ] **`radial-gradient` 不写 `at` 前缀**（静默忽略，中心恒默认）；要摆位置就用"净零流 div"：元素矩形 + `margin-top + height + margin-bottom = 0` 严格算平（漏算会出现幽灵色带/占位）。
+- [ ] **`radial-gradient` 不写 `at` 前缀**（静默忽略，中心恒默认）；要摆位置用绝对定位 + `hitTransparent="true"`（现行方案，见 absolute-positioned-backdrop-divs-swallows-clicks.md）。旧的"净零流 div"边距算术已废弃，勿再用（漏算会出现幽灵色带/占位）。
 - [ ] **多层逗号背景不支持**——一层渐变一个元素，不要写 `background: g1, g2`。
 - [ ] **`backdrop-filter`/`box-shadow` 不要直接写在 ScrollView 上**（覆写的 DrawTree 跳过基类绘制）——玻璃/投影放包住它的普通 div。
 - [ ] **绝对定位满宽写显式 `width`**——`left`+`right` 组合不拉伸宽度；固定尺寸窗口可直接算出列宽（如 430 - 48 侧栏 = 382px）。

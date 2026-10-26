@@ -1,6 +1,7 @@
 ---
 title: "透窗（液态玻璃）模式：core-ui DComp 逐像素 alpha + manager 侧 DWM 亚克力与降级链"
 date: 2026-10-25
+last_updated: 2026-10-27
 category: architecture-patterns
 module: core-ui / main.cpp window setup
 problem_type: architecture_pattern
@@ -51,14 +52,14 @@ tags: [core-ui, translucent, directcomposition, dwm-acrylic, premultiplied-alpha
 1. **UIX 属性**：`<window translucent="true"/>` → `WindowHintsFromAttrs`（page_api.cpp）填 `hints.translucent`，`page_open_or_prepare_` 合并进 `UiWindowConfig.translucent`。
 2. **窗口创建**（ui_window.cpp `Create`）：translucent → `CreateWindowExW` 加 `WS_EX_NOREDIRECTIONBITMAP`（无重定向表面，DComp 内容直接合成）；同时强制 `skipOpenAnimation_`（`WS_EX_LAYERED` 的 `SetLayeredWindowAttributes` 淡入与 NOREDIRECTIONBITMAP 上的 DComp 内容不兼容，会黑闪）。
 3. **渲染面**（`RegisterRenderWindow`）：`RenderThread::RegisterWindow` 传 `RenderSurfaceKind::LayeredComposition` → `RenderWindow::RenderFrame` 选 `Renderer::CreateRenderTargetForLayered`（renderer.cpp:471：`CreateSwapChainForComposition` + `DXGI_ALPHA_MODE_PREMULTIPLIED` + `IDCompositionTarget/Visual` 树——上下文菜单弹窗同款、已生产验证的路径）。
-4. **透明清屏**：复用休眠的 `bgMode_` 钩子——`Create` 里 translucent 置 `SetBackgroundMode(1)`，`OnPaint`（ui_window.cpp:2299）已有的 `bgMode_!=0 → Clear({0,0,0,0})` 分支生效。
+4. **透明清屏**：复用休眠的 `bgMode_` 钩子——`Create` 里 translucent 置 `SetBackgroundMode(1)`，`OnPaint`（ui_window.cpp:2349-2353）已有的 `bgMode_!=0 → Clear({0,0,0,0})` 分支生效。
 
 配套守卫：`Show()`/`StartWindowOpenAnimation()`/`StartWindowCloseAnimation()` 三处在 translucent 时直通（不加 `WS_EX_LAYERED`、跳过 alpha 动画，关闭直接 `DestroyWindow`）；公开 API `ui_window_set_translucent(win, 0)` 供运行期降级（恢复不透明清屏；DComp 表面保留，内容全不透明时视觉等同普通窗口）。
 
 ### manager 侧（main.cpp）
 
 - `dashboard.uix`：`<window … translucent="true"/>`。
-- `g_win` 就绪后取 HWND（`ui_window_hwnd`，ui_core.h:218）打 DWM 背景——**此时窗口必须仍未显示**（启动路径统一 `ui_page_prepare_window`，首次显示在 backdrop 之后，见下文"启动透窗无效"节），降级链：
+- `g_win` 就绪后取 HWND（`ui_window_hwnd`，ui_core.h:228）打 DWM 背景——**此时窗口必须仍未显示**（启动路径统一 `ui_page_prepare_window`，首次显示在 backdrop 之后，见下文"启动透窗无效"节），降级链：
   1. 先 `DwmSetWindowAttribute(DWMWA_USE_IMMERSIVE_DARK_MODE, 应用主题)`（属性 20；22621 前的版本同义旗标在 19），**再** `DwmSetWindowAttribute(DWMWA_SYSTEMBACKDROP_TYPE, DWMSBT_TRANSIENTWINDOW)`（Win11 22621+ 文档 API）；
   2. 失败 → `SetWindowCompositionAttribute(ACCENT_ENABLE_ACRYLICBLURBEHIND)`（Win10 1803+ 未文档化；tint 烧死了主题色，`apply_theme` 里 `backdrop_reapply_for_theme` 重涂）；
   3. 都失败或 config 关闭 → `ui_window_set_translucent(g_win, 0)` 回不透明清屏。

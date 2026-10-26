@@ -1,7 +1,7 @@
 ---
 title: "Dual-repo architecture: parent product pin vs core-ui submodule"
 date: 2026-07-31
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: architecture-patterns
 module: submodule/core-ui
 problem_type: architecture_pattern
@@ -35,7 +35,7 @@ tags:
 
 Parent records only a **gitlink SHA** (pin) for `core-ui`. Framework commits live in the core-ui repository. Product work that needs new Core UI APIs must land in core-ui first, then bump the pin in the parent.
 
-> **The pin moves over time.** The concrete SHAs below are historical examples from when this workflow was first documented (the remote-retarget + submit/scroll-API session). Don't treat them as the current pin — verify with `git ls-tree HEAD core-ui` (currently `75aaaa8` = upstream v1.8.0 `126330e` + the chat-scroll port, at last update). The **workflow** is what's durable; the example SHAs are illustrative.
+> **The pin moves over time.** The concrete SHAs below are historical examples from when this workflow was first documented (the remote-retarget + submit/scroll-API session). Don't treat them as the current pin — verify with `git ls-tree HEAD core-ui` (currently `7193235` = "perf(page): move-only fast path for :left/:top writes on absolute widgets", five framework commits past `75aaaa8` — the upstream v1.8.0 rebase + chat-scroll port — adding translucent mode, focus + tabNavigation, the `03e6f70` wheel-path no-relayout fix, the `11d7bd4` DWrite label-metrics cache, and the move-only fast path, at last update). The **workflow** is what's durable; the example SHAs are illustrative.
 
 The original session retargeted the submodule remote from `ghboke/core-ui` to `https://github.com/aiguozhi123456/core-ui`, kept the pin at the submit/scroll-APIs commit (`f0a9537` at the time), and cleaned feature branches after merge. Parent history of note:
 

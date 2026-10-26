@@ -28,7 +28,7 @@ The process-creation identity paired with a Gateway State Record's PID so stale 
 ### Gateway Handle
 The manager-owned process handle on the real Nanobot Gateway — the instance identified by the Gateway State Record — published once and shared by every lifecycle consumer: liveness watch, uptime, and stop.
 
-Its access rights are fixed when it is opened and cannot be elevated later, so that single open must already grant everything those consumers need, most critically the ability to terminate. It is closed only through the centralized close path, which disarms the death-watch callback before closing, and the Gateway Process Identity guard is cleared together with it so a stale identity can never be paired with a later PID. It must never be the background launcher's handle: that process exits moments after a successful start, which would read as an instant crash.
+Its access rights are fixed when it is opened and cannot be elevated later, so that single open must already grant everything those consumers need, most critically the ability to terminate. It is closed only through the centralized close path, which disarms the death-watch callback before closing; the paired Gateway Process Identity is cleared whenever tracked state is reset or a stop completes, so a live guard does not outlive the instance it vouches for — only the crash-path close deliberately freezes the last identity for display. It must never be the background launcher's handle: that process exits moments after a successful start, which would read as an instant crash.
 
 ### Gateway Lifecycle State
 The manager's coordinated status for resolving, idle, startup, running, stopping, and terminal unavailability, used to assign ownership of asynchronous transitions and distinguish an invited stop from an unsolicited failure.
@@ -44,6 +44,32 @@ Each tier runs only when the previous one failed to end the process; a tier that
 The on-disk form of nanobot's official Windows one-click install: an isolated venv at `~\.nanobot\venv` (or `%NANOBOT_VENV%`) with entry points `Scripts\nanobot.exe` / `Scripts\python.exe -m nanobot`.
 
 Unlike pip PATH installs or uv tool / pipx shims, it touches neither PATH nor the registry nor any shim directory, so it is discoverable only by probing the canonical location — which is why command resolution has a dedicated tier for it.
+
+### Command Resolution
+The ordered search that turns "run nanobot" into one concrete launch candidate — configured path, PATH install, Managed Venv Install, then Python interpreters — each candidate carrying attribution for which tier supplied it.
+
+An "installed" status in the UI means resolution produced a usable launch candidate; it is not a claim that an installer or package manager was detected.
+
+### Capability Probe
+The resolve-time probe that verifies a candidate launcher actually supports the background start form (and its gateway CLI) before the manager commits to that candidate.
+
+An auto-discovered candidate that fails the probe is skipped and the next tier is tried; an explicitly configured candidate that fails the probe fails resolution outright rather than falling through to lower tiers.
+
+### Attach
+Latching onto an already-running Nanobot Gateway identified by its Gateway State Record — adopting its process identity and opening a Gateway Handle for liveness, uptime, and stop — as distinct from starting a new instance.
+
+An attached handle carries the same access requirements as a started one, and observations made through attach (such as the effective ports of the running instance) do not change the manager's next-launch preferences.
+
+### Auto Sentinel
+A reserved zero value for a port setting meaning "discover the effective value automatically" rather than pinning one.
+
+Legacy serialized values that once meant "the default port" normalize to the sentinel on load, so a fresh install and an upgraded one converge on auto-detection instead of drifting apart.
+
+### Installed Mode
+The configuration placement where the manager's settings live in the per-user local application data location, used when the executable is a proper installation; it supersedes an older config file found beside the executable by migrating it.
+
+### Portable Mode
+The configuration placement where settings live beside the executable, selected by a marker file or a non-installed executable location, keeping a self-contained copy-on-stick layout.
 
 ### WebUI Port
 The Nanobot Gateway endpoint used for its web interface, Bootstrap, and Chat Session transport; it is independent of the Gateway Health Port.
@@ -78,7 +104,7 @@ An unreadable existing history is never treated as permission to overwrite it. A
 ### Message Bubble
 A display item representing one user or assistant message in Chat History.
 
-An assistant bubble may be built from partial response events and then normalized by a complete response; transient rendering identity is not part of durable Chat History.
+An assistant turn yields one bubble per streamed segment: a streamed partial grows its own bubble, and the complete response commits as a further bubble unless it exactly repeats the previous one, so a turn with tool calls or injected user messages shows several assistant bubbles. Transient rendering identity is not part of durable Chat History.
 
 ## Branding & Packaging
 
@@ -136,6 +162,11 @@ An absolutely positioned widget that is skipped as a hit result when nothing in 
 
 Absolute positioning in Core UI carries overlay semantics for painting and hit-testing alike: such children draw above flow content and are probed for hits before it. A purely decorative overlay therefore needs the hit-transparent switch; overlays meant to take input (floating input bars, context menus) leave it off.
 
+### Mount Hook
+The framework callback fired when a widget instance is created into the page tree — in particular when a conditional branch finishes mounting — and the single correct moment to wire native behavior to that instance.
+
+Anything that must act on a possibly-unmounted widget (focusing an input after a page switch, attaching handlers) keys off this moment rather than a timer guess; for a widget already mounted, direct lookup is fine.
+
 ## Core UI Layout & Text Measurement
 
 ### Measure Context Scope
@@ -173,9 +204,9 @@ One of the large, faint gradient blobs that form the liquid-glass dashboard's ba
 The blurred desktop is the real backdrop, so fields stay translucent accents — dense fields read as an opaque wash — and they must never intercept input: they paint over content but sit outside the hit chain.
 
 ### Backdrop Field Drift
-The continuous slow-path animation of the Backdrop Hue Fields, republished on a short timer rather than on interaction.
+The continuous slow-path animation of the Backdrop Hue Fields, republished on a slow fixed tick rather than per frame or on interaction.
 
-Because every republished field marks the page tree dirty, each animation tick re-runs a full layout pass at frame rate. Per-widget work inside a layout pass — text measurement above all — therefore multiplies by frame rate and must be cached or bounded: a page that looks idle can be spending a full core re-measuring unchanged text, and any interaction queues behind the current pass.
+Position writes to already-laid-out absolutely positioned widgets move the widget rect without re-running layout, and text measures are cached, so the tick no longer multiplies layout work. What remains per tick is one full-window repaint — there is no partial present — so any work scheduled to ride the tick still multiplies by tick rate, and near-stationary samples should be skipped by a movement threshold rather than republished.
 
 ## UI Text & Localization
 
@@ -186,21 +217,26 @@ The bilingual key-to-copy mapping the UI resolves `$t()` lookups against, assemb
 A key missing from the active language renders as the raw key, so zh/en parity is enforced by a unit test rather than review discipline.
 
 ### Status Key
-A UI state wording key (running, stopped, starting, stopping, and their sub-lines) that is consumed through two paths at once: template `$t()` lookups and direct C++ status pushes.
+A UI wording key (gateway states like running/stopped/starting, and chat turn states) consumed through two paths at once: template `$t()` lookups and C++ pushes — either pushing resolved wording directly, or pushing the key itself into a page field the template resolves, which re-resolves when the locale switches.
 
-Because of that dual consumption, each Status Key's wording is defined exactly once and the Language Table's status entries are generated from that definition; hand-writing status wording anywhere else creates a second source that can drift.
+Because of that dual consumption, each key's wording is defined exactly once and the Language Table's status entries are generated from that definition; hand-writing the wording anywhere else creates a second source that can drift.
 
 ## Window Management
+
+### Surface
+To bring the hidden main window back on screen and activate it despite Windows' foreground lock, by temporarily sharing the input queue with the foreground thread.
+
+All summon paths — tray click, Global Hotkey Summon, and a second launch's activation request — surface the window rather than merely showing it; the detach must use the thread id captured before the activation attempt.
 
 ### System Tray
 The Windows notification area that hosts the manager's icon when the main window is hidden, allowing the app to stay resident without a visible taskbar presence.
 
-The user interacts with the tray icon through double-click (summon) or the right-click context menu (show / quit). Closing the main window while tray mode is active routes that close into a hide rather than an exit, so the process continues running until the user explicitly quits from the tray menu.
+The user interacts with the tray icon through single or double click (summon) or the right-click context menu (show / quit). Closing the main window while tray mode is active routes that close into a hide rather than an exit, so the process continues running until the user explicitly quits from the tray menu.
 
 ### Global Hotkey Summon
 A registered system-wide keyboard shortcut (Ctrl+Shift+N) that brings the manager window to the foreground from any application.
 
-Because Windows enforces a foreground-lock that silently rejects `SetForegroundWindow` from background threads, the implementation must use `AttachThreadInput` to temporarily share the input queue with the foreground thread before activating. The hotkey is registered against the window HWND after creation and unregistered before destruction; if another application already owns the key combo, registration fails silently with no crash or popup.
+Because Windows enforces a foreground-lock that silently rejects `SetForegroundWindow` from background threads, the implementation must use `AttachThreadInput` to temporarily share the input queue with the foreground thread before activating, detaching from the thread id captured *before* the activation attempt (re-querying the foreground window afterwards is a silent no-op that leaks the attachment). The hotkey toggles: it summons the window, and hides it only when the manager window is already the foreground one and not minimized. The hotkey is registered against the window HWND after creation and unregistered before destruction; if another application already owns the key combo, registration fails silently with no crash or popup.
 
 ### System Theme
 The user's chosen Windows light/dark personalization for applications, which the manager mirrors when its theme mode is set to "follow system."

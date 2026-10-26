@@ -25,7 +25,7 @@ Native Windows GUI manager for [nanobot](https://github.com/HKUDS/nanobot). Prod
 | `docs/solutions/` | Documented solutions to past problems (bugs, best practices, architecture patterns), organized by category with YAML frontmatter (`module`, `tags`, `problem_type`). Relevant when implementing or debugging in documented areas |
 | `CONCEPTS.md` | Shared domain vocabulary (entities, named processes, status concepts) — relevant when orienting to the codebase or discussing domain concepts |
 
-Generated at configure time: `build/generated/version.h`, `build/generated/version.nsh` from `NANOBOT_MANAGER_VERSION` in CMakeLists (`1.5.0` today).
+Generated at configure time: `build/generated/version.h`, `build/generated/version.nsh` from `NANOBOT_MANAGER_VERSION` in CMakeLists (`1.6.2` today).
 
 ## Build & package
 

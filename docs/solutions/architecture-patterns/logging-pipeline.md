@@ -1,7 +1,7 @@
 ---
 title: "Logging pipeline: one module, levels, and file-redirection child capture"
 date: 2026-10-24
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/logger
 problem_type: architecture_pattern
@@ -29,9 +29,7 @@ gateway launcher with `bInheritHandles=FALSE` and no std handles, so
 nanobot's own output — import errors, dependency tracebacks, the single most
 valuable signal when a start fails — was silently discarded.
 
-The unified pipeline (all verified: MSVC build, CTest 8/8 including the new
-suite, manual run confirming file creation, line format, and config-driven
-level switching) replaced both helpers with one module (`src/logger.c` /
+The unified pipeline (verified at the time of writing: MSVC build, CTest green including the new suite — 9 test targets today —, manual run confirming file creation, line format, and config-driven level switching) replaced both helpers with one module (`src/logger.c` /
 `src/logger.h`), gave every line a level and module, made writes
 thread-safe and crash-proof, and redirected the child's stdout/stderr into a
 log file beside the exe.
@@ -56,9 +54,11 @@ properties:
   emitted.
 - Level filtering happens before formatting; the filter is re-checked under
   the exclusive lock so a concurrent `logger_set_level` can't race the write.
-- On any file failure the logger degrades to a **no-op**: `nm_log` before
-  `logger_init`, after `logger_shutdown`, or with an unopenable path simply
-  returns. Logging must never block or crash the app.
+- On file failure the logger degrades to a **no-op** but self-heals: `nm_log`
+  before `logger_init` or after `logger_shutdown` simply returns (nothing to
+  retry), while a file that was lost or could not be opened after init is
+  retried lazily on the next `nm_log` call. Logging must never block or crash
+  the app.
 - Rotation keeps the old autostart policy: above 512 KiB (overridable via
   `logger_set_max_bytes`, mainly a test hook) the file is renamed to `.bak`
   (`MoveFileExW`, `MOVEFILE_REPLACE_EXISTING`) and reopened fresh — one
@@ -88,7 +88,9 @@ the logger is a no-op and startup proceeds regardless.
 ### Migration and level classification policy
 
 The 53 helper call sites were converted mechanically to
-`nm_log(..., "autostart"/"process", ...)` calls, but each got a deliberate
+`nm_log(..., "autostart"/"process", ...)` calls — later modules joined the
+same pipeline with their own stable tags (`"chat"` via `CHAT_LOG_MODULE` in
+`chat.cpp`, and `"app"` in `main.cpp`) — but each got a deliberate
 level under one policy:
 
 | Situation | Level |

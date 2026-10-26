@@ -1,14 +1,14 @@
 ---
 title: "Config module: a testable pure-logic core behind filesystem I/O"
 date: 2026-07-11
-last_updated: 2026-10-24
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/config
 problem_type: module_architecture
 component: tooling
 severity: low
 applies_when:
-  - "Reading/writing a JSON config file (cJSON) next to the executable in a Win32 app"
+  - "Reading/writing a JSON config file (cJSON) in a Win32 app (installed or exe-adjacent portable location)"
   - "Wanting unit tests for config parsing/validation without running beside the real exe or touching disk"
   - "Separating filesystem I/O from parse/serialize/validation logic so the logic is testable in isolation"
 tags: [config, cJSON, json, testability, unit-testing, refactor, win32, c, atomic-save]
@@ -18,7 +18,7 @@ tags: [config, cJSON, json, testability, unit-testing, refactor, win32, c, atomi
 
 ## Context
 
-`nanobot-manager` keeps its own settings in a `config.json` sitting next to the executable (not to be confused with nanobot's own `~/.nanobot/config.json`). The struct (`config.h`):
+`nanobot-manager` keeps its own settings in a `config.json` (not to be confused with nanobot's own `~/.nanobot/config.json`). The active file is selected once under a module SRWLOCK: a `portable.flag` beside the exe — or any non-installed location — pins the exe-adjacent `config.json` (portable mode); an installed build (exe under Program Files or matching its uninstall-registry `InstallLocation`) uses `%LOCALAPPDATA%\nanobot-manager\config.json` (installed mode, which also scans the old adjacent file for a lingering legacy secret). The struct (`config.h`):
 
 ```c
 typedef struct {
@@ -26,13 +26,21 @@ typedef struct {
     int   autostart_nanobot;
     int   stay_in_tray;
     int   hotkey_enabled;            /* global Ctrl+Shift+N summon hotkey, default on */
-    int   health_check_port;         /* default 18790 */
+    int   health_check_port;         /* 0 = auto: follow the running gateway, start on
+                                         18790 (default); legacy serialized 18790
+                                         normalizes to 0; other values pin the port */
     int   theme_mode;                /* 0=system 1=dark 2=light */
+    int   window_transparent;        /* 1 = translucent window + DWM acrylic (default);
+                                         0 = escape hatch for DWM/driver trouble */
     char  language[8];               /* "zh" / "en", default "zh" */
     char  log_level[8];              /* "debug"/"info"/"warn"/"error", default "info" */
-    int   webui_port;                /* default 8765 */
+    int   webui_port;                /* 0 = auto-detect from nanobot config (default);
+                                         legacy serialized 8765 normalizes to 0;
+                                         other values pin the port explicitly */
     char  legacy_webui_auth[128];    /* transient old JSON secret; NEVER serialized */
-    int   legacy_migration_pending;  /* while set, config_save refuses (ERROR_BUSY) */
+    int   legacy_migration_pending;  /* tri-state: 0 none / 1 secret captured /
+                                         2 oversize secret; while set, config_save
+                                         refuses (ERROR_BUSY) */
     wchar_t legacy_source_path[MAX_PATH]; /* file containing the transient legacy secret */
 } app_config;
 ```
@@ -53,7 +61,7 @@ int   config_parse_json(app_config* cfg, const char* json); // overlay parsed fi
 char* config_serialize_json(const app_config* cfg);         // malloc'd JSON, caller frees
 ```
 
-`config_load` / `config_save` became thin wrappers: defaults + read-file + `config_parse_json` (load), and `config_serialize_json` + write-file (save). `get_config_path()` (the only `GetModuleFileNameA` call) stays private and is never reached by tests.
+`config_load` / `config_save` became thin wrappers: defaults + read-file + `config_parse_json` (load), and `config_serialize_json` + write-file (save), all SRWLOCK-guarded around installed/portable path selection in `select_config_path_locked` (load also runs the adjacent-legacy migration scan and orphaned-temp cleanup). There is no `get_config_path()`; path selection lives in `select_config_path_locked`, and `GetModuleFileNameW` appears in three statics (`select_config_path_locked`, `get_legacy_adjacent_path`, `path_is_legacy_adjacent`) — none reached by tests.
 
 This is the single load-bearing refactor for testability: pull the logic out of the I/O function so a test can call `config_apply_defaults` → `config_parse_json(json)` → assert, or `config_serialize_json` → round-trip, with zero disk access.
 
@@ -62,7 +70,7 @@ This is the single load-bearing refactor for testability: pull the logic out of 
 The refactor must not change behavior. The original load was deliberately lenient, and the core keeps it:
 
 - **Invalid JSON is tolerated, not fatal.** `config_parse_json` returns `-1` when `cJSON_Parse` fails, but the caller (`config_load`) ignores the return and keeps whatever defaults were applied first. A test asserts `config_parse_json(cfg, "garbage") == -1` *and* that the defaults survived.
-- **Missing file / empty file → defaults, return 0.** `config_load` returns `0` (not an error) when the file is absent or empty; only a `get_config_path` allocation failure returns `-1`.
+- **Missing file / empty file → defaults, return 0.** `config_load` returns `0` (not an error) when the active file is absent or empty; it returns `-1` on path-selection failures, file IO errors, and a failed first-run installed-mode legacy-migration save.
 - **Partial JSON keeps defaults for unspecified fields.** Each field is overlaid independently and only when present + well-typed.
 
 ### Encode validation as range guards per field
@@ -71,17 +79,18 @@ Validation lives inline in `config_parse_json` and silently ignores out-of-range
 
 | Field | Rule | Out-of-range behavior |
 |---|---|---|
-| `health_check_port` | `> 0 && <= 65535` | ignored, default kept |
-| `webui_port` | `> 0 && <= 65535` | ignored, default kept |
+| `health_check_port` | `>= 0 && <= 65535` (0 = auto sentinel); serialized 18790 normalizes to 0 | ignored, default kept |
+| `webui_port` | `>= 0 && <= 65535` (0 = auto sentinel); serialized 8765 normalizes to 0 | ignored, default kept |
 | `theme_mode` | `>= 0 && <= 2` | ignored, default kept |
-| `language` | `char[8]`, truncated + NUL-terminated | safe truncation |
+| `language` | exactly `"zh"` or `"en"` | ignored, prior value kept |
 | `log_level` | one of `"debug"`/`"info"`/`"warn"`/`"error"` | ignored, prior value kept |
 | `nanobot_path` | non-empty string → `_strdup`; null/empty → NULL | no leak |
 | `hotkey_enabled` | bool | ignored if not boolean |
+| `window_transparent` | bool, or non-zero number (treated as true) | ignored if not bool/number |
 
 The `legacy_webui_auth[128]` field is intentionally **absent** from this table: it is a transient migration input, not a validated/saved config field. It is populated from an old `config.json` only to be migrated into Credential Manager and then scrubbed. Do not add a validation row for it, and never add it to `config_serialize_json` — a test asserts it is absent from serialized output.
 
-Tests cover both boundaries (1 and 65535 accepted) and the out-of-range cases (0, -1, 70000 rejected). The truncation tests pass a value longer than the buffer and assert the result is exactly NUL-terminated at the cap — this is the guard against a future buffer overrun.
+Tests cover both boundaries (1 and 65535 accepted), the out-of-range cases (65536 for ports, 3 for theme, rejected), the 0 auto sentinel, and the 18790/8765 → 0 normalization. The old "truncation" narrative is vestigial: `language` accepts exactly `"zh"`/`"en"`, so an overlong value is rejected and the prior value kept — the test that passes `"abcdefgh"` and asserts `cfg.language` stays NUL-terminated now passes trivially because the value is ignored (there is no truncation path to guard).
 
 ### Guard against double-parse leaks
 
@@ -97,7 +106,7 @@ The deliberate exception is the legacy secret: `config_serialize_json` **omits**
 
 ### Why extract the core instead of testing through the file
 
-Testing `config_load` directly requires either (a) running the test exe next to a fixture file with exactly the right name in the right directory, or (b) refactoring `get_config_path` to accept an injectable path. Both couple the test to the filesystem and to `GetModuleFileNameA`. Extracting `config_parse_json` / `config_serialize_json` makes 13 cases (defaults, full parse, partial parse, invalid JSON, port/theme validation, two round-trips, two truncations, null-vs-string path, null args) run in <50 ms with no disk at all.
+Testing `config_load` directly requires either (a) running the test exe next to a fixture file at exactly the path `select_config_path_locked` would pick, or (b) refactoring the path selection to accept an injectable path. Both couple the test to the filesystem and to `GetModuleFileNameW`. Extracting `config_parse_json` / `config_serialize_json` makes 14 tests (defaults, full parse, partial parse, invalid JSON, port/theme validation and the port auto-sentinel normalization, two round-trips, language/null-vs-string path, the strict `config_parse_port` parser, the `config_remove_legacy_auth_json` duplicate-key scrub, the oversize-migration sentinel, the `config_should_scan_adjacent_legacy` policy, and the secret-never-serialized assertion) run in <50 ms with no disk at all.
 
 ### Why tolerate invalid JSON
 
@@ -123,20 +132,19 @@ int   config_parse_json(app_config* cfg, const char* json);
 char* config_serialize_json(const app_config* cfg);
 ```
 
-### config_load reduced to a thin wrapper
+### config_load stays a thin wrapper (current shape)
 
 ```c
 int config_load(app_config* cfg) {
-    config_apply_defaults(cfg);
-    char* path = get_config_path();
-    if (!path) return -1;
-    FILE* f = fopen(path, "rb");
-    free(path);
-    if (!f) return 0;
-    /* ...read whole file into buf... */
-    config_parse_json(cfg, buf);   /* invalid JSON tolerated: defaults preserved */
-    free(buf);
-    return 0;
+    int result;
+    AcquireSRWLockExclusive(&g_lock);
+    result = config_load_locked(cfg);   /* defaults -> select_config_path_locked()
+                                           -> read_config_file -> config_parse_json
+                                           (invalid JSON tolerated: defaults kept)
+                                           -> orphaned-temp cleanup, plus the
+                                           adjacent-legacy scan in installed mode */
+    ReleaseSRWLockExclusive(&g_lock);
+    return result;
 }
 ```
 
@@ -157,13 +165,13 @@ static void test_roundtrip(void) {
 }
 ```
 
-### A truncation safety test
+### A rejected-language test
 
 ```c
-/* language is char[8]; overlong input must be capped + NUL-terminated. */
-config_parse_json(&cfg, long_language_json);
+/* language accepts exactly "zh"/"en"; anything else is ignored and the
+ * default survives — there is no truncation path to exercise. */
+config_parse_json(&cfg, "{\"language\":\"abcdefgh\"}");
 TEST_CHECK(cfg.language[sizeof(cfg.language) - 1] == '\0');
-TEST_CHECK(strlen(cfg.language) == sizeof(cfg.language) - 1);
 ```
 
 ### The secret-never-serialized test
@@ -180,7 +188,7 @@ free(json);
 ## Related
 
 - `nanobot-manager/src/config.c` / `config.h` — the module under test (apply_defaults / parse_json / serialize_json + atomic load/save wrappers).
-- `nanobot-manager/tests/test_config.c` — unit cases covering defaults, full/partial/invalid parse, port/theme validation, round-trips, truncations, null-vs-string path, and the secret-never-serialized assertion.
+- `nanobot-manager/tests/test_config.c` — 14 unit cases covering defaults, full/partial/invalid parse, port/theme validation and auto-sentinel normalization, round-trips, language validation, null-vs-string path, the strict `config_parse_port` parser, the `config_remove_legacy_auth_json` duplicate-key scrub, the oversize-migration sentinel, the `config_should_scan_adjacent_legacy` policy, and the secret-never-serialized assertion.
 - `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — why `legacy_webui_auth` is migration-only, the migrate-verify-delete flow, and the atomic `config_save` (temp + `FlushFileBuffers` + `MoveFileExW`) implementation.
 - `docs/solutions/infrastructure/testing-and-ci-setup.md` — the CMake test wiring, the self-contained `nm_test.h` framework, CTest, and CI; also the autostart registry round-trip pattern.
 - `docs/solutions/design-patterns/core-ui-input-read-pattern.md` — how `webui_port` / `health_check_port` (defined here) are surfaced in the settings UI via the read-on-click Apply pattern.

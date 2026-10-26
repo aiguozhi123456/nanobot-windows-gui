@@ -1,6 +1,7 @@
 ---
 title: "绝对定位色场吞掉整页输入：core-ui HitTest 覆盖层优先序、注入输入假象与 hitTransparent 逃逸口"
 date: 2026-10-25
+last_updated: 2026-10-27
 category: ui-bugs
 module: dashboard UIX bindings / core-ui hit-testing
 problem_type: ui_bug
@@ -20,16 +21,16 @@ related_components: [dashboard.uix, main.cpp]
 
 ## Problem
 
-液态玻璃底景的三团"色场"div（`backdrop-a/b/c`，约 300x300 DIP 的大块 radial-gradient 色晕）原本走 flow 布局 + 净零边距算术（`margin-top + height + margin-bottom = 0`）。这套算术历史上就翻过车——漏算一次留下 +20 DIP 残留流高，把标题栏整体顶下来，窗口顶部出现一条幽灵色带（见姊妹篇 core-ui-silent-rendering-traps）。
+液态玻璃底景的三团"色场"div（`backdrop-a/b/c`，300x300 / 300x300 / 260x240 DIP 的大块 radial-gradient 色晕）原本走 flow 布局 + 净零边距算术（`margin-top + height + margin-bottom = 0`）。这套算术历史上就翻过车——漏算一次留下 +20 DIP 残留流高，把标题栏整体顶下来，窗口顶部出现一条幽灵色带（见姊妹篇 core-ui-silent-rendering-traps）。
 
-为了让色晕"活"起来，feature commit **dbb60fc** 把三团色场从 flow 布局改成 `position: absolute`，由 `src/main.cpp` 新增的 `TIMER_FIELD_DRIFT`（33ms Win32 定时器，delta 跳帧，窗口隐藏/最小化时暂停）驱动缓慢的 Lissajous 漂移，通过 6 个响应式 float（`fieldAx..fieldCy`）写进 `:left`/`:top` 绑定；三层 alpha 0.32/0.28/0.25 保持不变。
+为了让色晕"活"起来，feature commit **dbb60fc** 把三团色场从 flow 布局改成 `position: absolute`，由 `src/main.cpp` 新增的 `TIMER_FIELD_DRIFT`（100ms Win32 定时器——`DRIFT_TICK_MS`，main.cpp:91，性能提交 64a21d9 从 33ms 放宽；delta 跳帧，窗口隐藏/最小化时暂停）驱动缓慢的 Lissajous 漂移，通过 6 个响应式 float（`fieldAx..fieldCy`）写进 `:left`/`:top` 绑定；三层 alpha 0.32/0.28/0.25 保持不变。
 
 改动本身看起来是纯视觉的：布局方式换了、动画加上了，没动任何 handler、没碰任何控件。但它悄悄把三团色场从"流内子节点"变成了"绝对定位子节点"——而 core-ui 的 `HitTest` 对这两类子节点的**探测优先级完全不同**。紧接着用户用真实鼠标一碰，设置页整页死掉。
 
 ## Symptoms
 
 - **设置页整页无响应**：用户复现"滚不动，到设置页啥都点不动了"——没有任何 toggle/button/input 可点，滚轮也死。
-- **分布模式（关键线索）**：聊天/仪表盘页在无色场覆盖的角落点击仍然正常。不是某个控件坏了，而是"被色场矩形罩住的区域"全死——三团 ~300x300 DIP 的色场几乎罩住了全部控件。
+- **分布模式（关键线索）**：聊天/仪表盘页在无色场覆盖的角落点击仍然正常。不是某个控件坏了，而是"被色场矩形罩住的区域"全死——三团 ~260-300 DIP 见方的色场几乎罩住了全部控件。
 - **注入测试时好时坏**：注入滚轮在"热"实例上能滚、全新实例上静默失败——这个不稳定的假象后来被误判为"注入伪影"，把真回归又埋了一层（见 What Didn't Work）。
 
 ## What Didn't Work
@@ -44,9 +45,9 @@ related_components: [dashboard.uix, main.cpp]
 
 ## Solution
 
-**根因**：`core-ui/src/ui/widget.cpp` 的 `Widget::HitTest`（widget.cpp:575-586）**先按逆 DOM 序探测所有绝对定位子节点，然后才探测 flow 子节点**。这是覆盖层（overlay）语义——聊天 composer（同为绝对定位）正是靠同一优先序浮在消息之上并接住输入。改动前三团色场是 flow 子节点，排在内容之后被探测，对输入无害；改成 `position: absolute` 后它们变成了"最先被探测"的覆盖层，三团矩形几乎罩住所有控件——命中落在色场上，冒泡链 field→root 上没有任何 handler，点击/滚轮被整个吞掉。
+**根因**：`core-ui/src/ui/widget.cpp` 的 `Widget::HitTest`（widget.cpp:571-585）**先按逆 DOM 序探测所有绝对定位子节点，然后才探测 flow 子节点**。这是覆盖层（overlay）语义——聊天 composer（同为绝对定位）正是靠同一优先序浮在消息之上并接住输入。改动前三团色场是 flow 子节点，排在内容之后被探测，对输入无害；改成 `position: absolute` 后它们变成了"最先被探测"的覆盖层，三团矩形几乎罩住所有控件——命中落在色场上，冒泡链 field→root 上没有任何 handler，点击/滚轮被整个吞掉。
 
-HitTest 的优先序（widget.cpp:575-586）：
+HitTest 的优先序（widget.cpp:571-585）：
 
 ```
 for (int i = (int)children_.size() - 1; i >= 0; --i) {

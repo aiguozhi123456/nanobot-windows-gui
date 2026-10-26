@@ -1,6 +1,7 @@
 ---
 title: "Reading the Windows system theme from the registry (AppsUseLightTheme) before first paint"
 date: 2026-08-01
+last_updated: 2026-10-27
 category: design-patterns
 module: nanobot-manager/main
 problem_type: design_pattern
@@ -145,6 +146,6 @@ ui_init_with_theme(initial_theme == 1 ? UI_THEME_DARK : UI_THEME_LIGHT);
 
 - `docs/solutions/architecture-patterns/config-system.md` — the `theme_mode` field (0/1/2) in `app_config` and its validation.
 - `docs/solutions/architecture-patterns/credential-manager-secret-storage.md` — the atomic `config_save` that makes persist-on-every-click safe.
-- `nanobot-manager/src/main.cpp` — `apply_theme` (~line 1260) and the startup theme resolution (~line 1590); both contain the registry read.
+- `nanobot-manager/src/main.cpp` — `apply_theme` (line 1835) and the startup theme resolution (lines 2262-2274); both contain the registry read.
 - `nanobot-manager/ui/dashboard.uix` — the window root element; must NOT carry a `theme=` attribute.
 - Commit `52a85d4` — the original fix (`feat: persist theme mode to config and fix system theme on startup`), which included both the registry read and removing the hard-coded `theme=light`.

@@ -1,6 +1,7 @@
 ---
 title: "Storing the bootstrap secret in Windows Credential Manager with migrate-then-verify-then-delete"
 date: 2026-08-01
+last_updated: 2026-10-27
 category: architecture-patterns
 module: nanobot-manager/credential
 problem_type: architecture_pattern
@@ -39,10 +40,18 @@ This is the architectural record of that change — the two existing docs it tou
 ```c
 /* src/credential.h */
 #define CREDENTIAL_TARGET "nanobot-manager/bootstrap-secret/v1"
+#define CREDENTIAL_SECRET_MAX 127  /* longest accepted secret, in bytes (no NUL);
+                                      loads accept the same bound */
 
 int credential_store(const char* secret, DWORD* error);   /* CredWriteW */
 int credential_load(char* out, size_t cap, DWORD* error); /* CredReadW  */
 int credential_delete(DWORD* error);                      /* CredDeleteW */
+
+/* Same operations against an explicit target (store uses
+ * write-verify-rollback); the fixed-target wrappers above call these. */
+int credential_store_for_target(const char* target, const char* secret, DWORD* error);
+int credential_load_for_target(const char* target, char* out, size_t cap, DWORD* error);
+int credential_delete_for_target(const char* target, DWORD* error);
 ```
 
 `CRED_TYPE_GENERIC` + `CRED_PERSIST_LOCAL_MACHINE`. The blob is the raw secret bytes (length 1..127). Three deliberate properties:
@@ -71,12 +80,13 @@ The previous blob is captured (into a `malloc`'d buffer, zeroed on free) *before
 
 ### Migrate-then-verify-then-delete from the legacy source
 
-The legacy `webui_auth` in `config.json` is migrated on load, not silently overwritten. The ordering is load-bearing:
+The legacy `webui_auth` in `config.json` is migrated on load, never silently overwritten. The ordering is load-bearing (mirrors the 5-step migration in `state-driven-gateway-lifecycle.md`):
 
 1. **Detect** the legacy plaintext secret in the adjacent `config.json` (`config_adjacent_legacy_auth_present`), gated by `config_should_scan_adjacent_legacy`.
-2. **Store** it into Credential Manager via `credential_store` (write-then-verify above).
-3. **Verify** it reads back from Credential Manager before touching the plaintext.
-4. **Only then scrub** the plaintext from `config.json` (`config_scrub_adjacent_legacy_auth`).
+2. **Read the current credential first and reject conflicts.** `migrate_legacy_credential` calls `credential_load`: absent → store the legacy value via `credential_store` (write-then-verify above); present and byte-identical → already safe, nothing to store; present and different → **MIGRATION_CONFLICT** (`ERROR_ALREADY_EXISTS`) — neither source is changed, no store or overwrite.
+3. **Save the active config** without `webui_auth` (`config_save`; blocked while `legacy_migration_pending` — see below). This save itself scrubs the active path.
+4. **Scrub any separate legacy file** (`config_scrub_legacy_auth`) — skipped when the legacy source *is* the active path (step 3 already scrubbed it); on `ERROR_ACCESS_DENIED` only, the fixed-token elevated helper runs.
+5. **Verify the plaintext is gone** where elevation was required (`config_adjacent_legacy_auth_present` re-checked after the helper exits).
 
 A migration flag (`legacy_migration_pending` in `app_config`) owns the run: while a migration is in progress, `config_save` **refuses to run** (`return -1` with `ERROR_BUSY`) so a concurrent save cannot re-serialize the secret into plaintext mid-migration. The struct field is `legacy_webui_auth` with a comment `transient old JSON secret; never serialized`, and `config_serialize_json` deliberately omits it — confirmed by a test asserting `strstr(json, "webui_auth") == NULL`.
 
@@ -119,7 +129,7 @@ Five details that each prevent a corruption class:
 
 ### Zero secrets on every teardown path
 
-The chat transport keeps a short-lived copy of the bootstrap secret for the `X-Nanobot-Auth` header; that copy is `SecureZeroMemory`'d on every teardown — disconnect, shutdown, endpoint change (`src/chat.c`). Likewise `credential.c` zeroes the wide target string, the read-back blob, and the rollback buffer on every path (including error paths). `config_free` zeroes `legacy_webui_auth` and `legacy_source_path`. The discipline: a secret's lifetime ends with `SecureZeroMemory`, never with `free` alone.
+The chat transport keeps a short-lived copy of the bootstrap secret for the `X-Nanobot-Auth` header; that copy is `SecureZeroMemory`'d on every teardown — disconnect, shutdown, endpoint change (`src/chat.cpp`). Likewise `credential.c` zeroes the wide target string, the read-back blob, and the rollback buffer on every path (including error paths). `config_free` zeroes `legacy_webui_auth` and `legacy_source_path`. The discipline: a secret's lifetime ends with `SecureZeroMemory`, never with `free` alone.
 
 ## Why This Matters
 

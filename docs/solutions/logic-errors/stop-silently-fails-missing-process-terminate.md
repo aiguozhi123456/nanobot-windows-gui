@@ -1,6 +1,7 @@
 ---
 title: "Gateway stop silently fails — tracked handle opened without PROCESS_TERMINATE"
 date: 2026-10-25
+last_updated: 2026-10-27
 category: logic-errors
 module: nanobot-manager/process
 problem_type: logic_error
@@ -113,7 +114,7 @@ The comment on the `nanobot_start` mask is the load-bearing part: it states that
 
 Related same-session fix (same symptom family): the PID-reuse guard `g_state.create_ft` is now zeroed whenever the handle is cleared (`nm_state_clear()` and `nanobot_stop`'s cleanup path). Previously a stale creation time survived the handle close, so a later stop that adopted a state-file pid passed the OLD creation time as the expected identity, `kill_process_tree` logged "pid reuse suspected" and skipped `TerminateProcess` — again reporting success while the gateway survived. `nanobot_detect_running_port()` was also tightened to only suppress the configured-port probe when the state branch actually verified that port (`state_probed` flag).
 
-Verified: `scripts\build.bat` rebuild OK; `ctest -C Release` 8/8 pass (`test_process` covers the state-machine and guard logic around these paths).
+Verified (at time of writing): `scripts\build.bat` rebuild OK; `ctest -C Release` 8/8 pass. The suite has since grown to 9 test targets.
 
 ## Why This Works
 
@@ -125,7 +126,7 @@ Verified: `scripts\build.bat` rebuild OK; `ctest -C Release` 8/8 pass (`test_pro
 
 1. **Derive the access mask from ALL consumers of shared state, not the current call path.** When publishing a long-lived handle into guarded module state (here `g_state.handle`), enumerate everything that will ever read that field — watch, uptime, stop escalation — and union their required rights into the single mask at open time. A comment at the open site naming the consumer that forces each right (as the fix does) keeps future edits from re-narrowing it.
 2. **Check and log `TerminateProcess`/`WaitForSingleObject` results in stop flows** so access denial cannot masquerade as success (recommended follow-up). The tier-1 call sites in `nanobot_stop` still ignore both return values; logging `GetLastError()` on FALSE and distinguishing `WAIT_TIMEOUT` from `WAIT_OBJECT_0` before cleanup would have surfaced this bug on day one and would catch any future mask regression.
-3. **The stop-correctness test family in `tests/test_process.c` guards the pid-reuse guard behavior** — the zeroing of `g_state.create_ft` on handle clear, so a stale creation time can no longer make a later stop skip the kill while reporting success. Extend this family when touching stop-flow identity or handle-lifetime logic.
+3. **No test currently guards the zeroing of `g_state.create_ft` on handle clear.** The zeroing is enforced only in code — `nm_state_clear()` and `nanobot_stop`'s cleanup path (`process.c:829-836` / `2137-2144`) — while `tests/test_process.c` contains only owned-candidate, managed-venv candidate, and `config_webui_info` tests; nothing in `tests/` references `create_ft` or `nm_state_clear`. A regression here (stale creation time making a later stop skip the kill while reporting success) would surface only manually — this is a candidate for a future stop-flow identity/handle-lifetime test.
 
 ## Related Issues
 
