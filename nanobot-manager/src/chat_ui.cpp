@@ -356,6 +356,7 @@ void ChatUi::attachScroll(UiWidget widget) {
      * the end, so re-entering chat shows the latest stream state. */
     flushMessagesUi();
     ui_scroll_to_end(widget);
+    resettle_bottom_ = true;
 }
 
 void ChatUi::detachScroll(UiWidget widget) {
@@ -879,6 +880,12 @@ void ChatUi::tick(ULONGLONG now) {
 
 void ChatUi::publishTick() {
     flushMessagesUi();
+    /* One publish tick (66ms) after mount the layout has settled; re-pin to
+     * the bottom so tab-switch lands exactly where summon lands. */
+    if (resettle_bottom_ && chat_scroll_) {
+        resettle_bottom_ = false;
+        ui_scroll_to_end(chat_scroll_);
+    }
 }
 
 /* --- mount trampolines ------------------------------------------------------------ */

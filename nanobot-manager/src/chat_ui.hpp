@@ -179,6 +179,10 @@ private:
 
     bool auto_connect_blocked_ = false;
     UiWidget chat_scroll_ = 0;
+    /* Mount-time ui_scroll_to_end can freeze an inflated content height from
+     * the first layout pass; the summon path re-scrolls after settle and is
+     * the trusted semantic — mirror it one publish tick after mount. */
+    bool resettle_bottom_ = false;
     bool messages_ui_dirty_ = false;
 };
 
