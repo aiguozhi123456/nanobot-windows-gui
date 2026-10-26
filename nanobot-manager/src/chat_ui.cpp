@@ -17,6 +17,9 @@
  * ceiling is generous. A genuinely hung gateway costs at most this long;
  * the send button turns into a "stop waiting" control meanwhile. */
 #define CHAT_TURN_TIMEOUT_MS   600000ULL
+/* After a user-requested /stop, wait only this long for the gateway's own
+ * TURN_END / terminal MESSAGE before falling back to the local soft abort. */
+#define CHAT_STOP_GRACE_MS     15000ULL
 #define CHAT_FOLLOW_THRESHOLD_DIP 32.0f
 /* UI renders at most the newest N messages so per-push work (serialize +
  * JSON parse + v-for rebind) stays bounded on long histories. The full
@@ -126,23 +129,18 @@ int ChatUi::commitCanonical(const char* canonical_or_null) {
     const std::string replacement = canonical_or_null ? canonical_or_null : draft_.text;
     if (replacement.size() > CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES) return 0;
     bool was_streaming = draft_.active;
-    /* Mid-turn commits (canonical text after deltas, or fixation at
-     * TURN_END / disconnect) keep the turn to ONE bubble: the canonical
-     * text replaces the streamed text. A commit outside a turn starts a
-     * new bubble. */
-    bool mid_turn = was_streaming || turn_state_ == ChatTurnState::NormalActive;
+    /* Every streamed segment is its own bubble: a turn with tool calls or
+     * injected user messages keeps each assistant segment. Commits only
+     * append; identical redelivery is deduplicated below. */
     draft_.clear();
     bool last_is_assistant = !messages_.empty() && messages_.back().role == "assistant";
-    if (mid_turn && last_is_assistant) {
-        if (messages_.back().text != replacement) {
-            messages_.back().text = replacement;
-            revision_++;
-        }
-        setDirty();
+    if (replacement.empty()) {
+        /* Nothing to show (empty draft fixation); keep prior bubbles. */
+        if (was_streaming) setDirty();
         return 1;
     }
     if (last_is_assistant && messages_.back().text == replacement) {
-        /* Duplicate delivery of an identical non-stream reply. */
+        /* Duplicate delivery of an identical reply. */
         if (was_streaming) setDirty();
         return 1;
     }
@@ -317,7 +315,9 @@ bool ChatUi::recoverHistoryBeforeSend() {
 /* --- derived state ---------------------------------------------------------- */
 
 bool ChatUi::canSendNow() const {
-    return turn_state_ == ChatTurnState::Idle && chat_client().isReady() &&
+    /* Sending is allowed while idle AND mid-turn (the gateway queues extra
+     * text into the active turn); only the /new-ack window blocks it. */
+    return turn_state_ != ChatTurnState::NewWaitAck && chat_client().isReady() &&
         (!health_fn_ || health_fn_());
 }
 
@@ -336,7 +336,10 @@ void ChatUi::setCanSend(int enabled) {
 
 void ChatUi::setTurnState(ChatTurnState s) {
     turn_state_ = s;
-    if (page_) ui_page_set_bool(page_, "turnWaiting", s != ChatTurnState::Idle ? 1 : 0);
+    if (page_) {
+        ui_page_set_bool(page_, "turnWaiting", s != ChatTurnState::Idle ? 1 : 0);
+        setCanSend(canSendNow() ? 1 : 0);
+    }
 }
 
 void ChatUi::statusKey(const char* key) {
@@ -400,6 +403,7 @@ void ChatUi::softAbortTurn(const char* key) {
     attach_pending_ = false;
     attach_deadline_ = 0;
     turn_deadline_ = 0;
+    stop_requested_ = false;
     restoreNewHistoryBackup();
     discardFreshSession();
     setTurnState(ChatTurnState::Idle);
@@ -437,6 +441,23 @@ void ChatUi::terminalFailure(const char* key, const char* detail, bool hard) {
 
 void ChatUi::cancelWait() {
     if (turn_state_ == ChatTurnState::Idle) return;
+    /* Waiting for /new confirmation: soft-abort so the /new backup is
+     * restored; /stop would cancel the agent but not undo the session swap. */
+    if (turn_state_ == ChatTurnState::NewWaitAck) {
+        softAbortTurn("chat_status_wait_cancelled");
+        return;
+    }
+    /* Real stop: send the gateway's priority /stop command, then grant a
+     * short grace window for the normal TURN_END / terminal MESSAGE to run
+     * its existing teardown. A send failure falls back to the local soft
+     * abort so the button never becomes a dead control. */
+    if (chat_client().send("/stop") == 0) {
+        stop_requested_ = true;
+        turn_deadline_ = GetTickCount64() + CHAT_STOP_GRACE_MS;
+        statusKey("chat_status_stopping");
+        setCanSend(canSendNow() ? 1 : 0);
+        return;
+    }
     softAbortTurn("chat_status_wait_cancelled");
 }
 
@@ -512,6 +533,7 @@ void ChatUi::onDisconnected() {
     attach_pending_ = false;
     attach_deadline_ = 0;
     turn_deadline_ = 0;
+    stop_requested_ = false;
     if (turn_state_ != ChatTurnState::Idle) {
         commitCanonical(NULL);   /* fixate a half-streamed reply */
         persistBinding(0);
@@ -528,7 +550,8 @@ void ChatUi::onDelta(const char* chunk) {
     if (turn_state_ == ChatTurnState::NormalWaitActivity)
         setTurnState(ChatTurnState::NormalActive);
     if (turn_state_ != ChatTurnState::NormalActive) return;
-    turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
+    if (!stop_requested_)
+        turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
     if (!chunk) return;
     if (!draft_.append(chunk, CHAT_HISTORY_MAX_MESSAGE_TEXT_BYTES))
         statusKey("chat_status_reply_too_long");
@@ -547,15 +570,32 @@ void ChatUi::onMessage(const char* detail) {
             setCanSend(canSendNow() ? 1 : 0);
         }
     } else if (turn_state_ == ChatTurnState::NormalWaitActivity) {
-        if (detail && !commitCanonical(detail))
-            statusKey("chat_status_reply_too_long");
-        setTurnState(ChatTurnState::Idle);
-        turn_deadline_ = 0;
-        persistBinding(1);
-        setCanSend(canSendNow() ? 1 : 0);
+        if (stop_requested_) {
+            /* /stop's router reply ("Stopped N task(s).") is the turn's real
+             * terminator — the gateway sends no turn_end afterwards. */
+            statusKey("chat_status_stopped");
+            onTurnEnd();   /* NormalWaitActivity branch: no draft, clean teardown */
+            return;
+        }
+        if (chat_protocol_has_text(detail)) {
+            if (!commitCanonical(detail))
+                statusKey("chat_status_reply_too_long");
+            setTurnState(ChatTurnState::Idle);
+            turn_deadline_ = 0;
+            persistBinding(1);
+            setCanSend(canSendNow() ? 1 : 0);
+        }
+        /* Empty tool-result / reasoning frame: keep the turn alive (flush only). */
     } else if (turn_state_ == ChatTurnState::NormalActive) {
+        if (stop_requested_) {
+            /* /stop's router reply ("Stopped N task(s).") is the turn's real
+             * terminator — the gateway sends no turn_end afterwards. */
+            statusKey("chat_status_stopped");
+            onTurnEnd();   /* NormalActive path: fixate draft + normal teardown */
+            return;
+        }
         turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* activity heartbeat */
-        if (detail && !commitCanonical(detail))
+        if (chat_protocol_has_text(detail) && !commitCanonical(detail))
             statusKey("chat_status_reply_too_long");
         saveIfDirty();
     }
@@ -567,9 +607,10 @@ void ChatUi::onStreamEnd(const char* detail) {
         setTurnState(ChatTurnState::NormalActive);
     if (turn_state_ != ChatTurnState::NormalActive) return;
     /* TURN_END (or a terminal MESSAGE) must follow shortly; keep the
-     * watchdog armed for that gap. */
-    turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
-    if (detail && !commitCanonical(detail))
+     * watchdog armed for that gap — but never extend a /stop grace. */
+    if (!stop_requested_)
+        turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
+    if (chat_protocol_has_text(detail) && !commitCanonical(detail))
         statusKey("chat_status_reply_too_long");
     /* Without canonical text the draft stays active and is fixated at
      * TURN_END / disconnect. */
@@ -578,9 +619,21 @@ void ChatUi::onStreamEnd(const char* detail) {
 }
 
 void ChatUi::onTurnEnd() {
+    if (turn_state_ == ChatTurnState::NormalWaitActivity) {
+        /* /stop (or a silent cancel) of a turn that produced no output: the
+         * gateway sends only turn_end, with no draft to fixate. */
+        stop_requested_ = false;
+        setTurnState(ChatTurnState::Idle);
+        turn_deadline_ = 0;
+        persistBinding(1);
+        setCanSend(canSendNow() ? 1 : 0);
+        flushMessagesUi();
+        return;
+    }
     if (turn_state_ != ChatTurnState::NormalActive) return;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate a stream without canonical text */
+    stop_requested_ = false;
     setTurnState(ChatTurnState::Idle);
     turn_deadline_ = 0;
     persistBinding(1);
@@ -594,7 +647,8 @@ void ChatUi::onError(const char* detail) {
 
 void ChatUi::onActivity() {
     if (turn_state_ == ChatTurnState::Idle) return;
-    turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* agent alive */
+    if (!stop_requested_)
+        turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;   /* agent alive */
     if (turn_state_ == ChatTurnState::NormalWaitActivity)
         statusKey("chat_status_agent_working");
 }
@@ -628,7 +682,7 @@ void ChatUi::onEvent(WPARAM kind, chat_event* event) {
 /* --- send ---------------------------------------------------------------------- */
 
 void ChatUi::onSend(int health_running) {
-    if (!page_ || turn_state_ != ChatTurnState::Idle) return;
+    if (!page_) return;
     if (canRetryNow()) {
         auto_connect_blocked_ = false;
         setCanSend(0);
@@ -665,6 +719,13 @@ void ChatUi::onSend(int health_running) {
         return;
     }
     int is_new = chat_history_is_new_command(text);
+    /* A fresh /new needs an idle turn; normal text is queued by the gateway. */
+    if (!chat_protocol_send_allowed(turn_state_ != ChatTurnState::Idle ? 1 : 0,
+                                    is_new ? 1 : 0)) {
+        statusKey("chat_status_wait_turn_end");
+        cJSON_Delete(json);
+        return;
+    }
     std::vector<ChatMsg> backup;
     if (is_new) backup = messages_;
     /* Allocate /new compensation before making the on-disk binding unsafe. */
@@ -681,9 +742,13 @@ void ChatUi::onSend(int health_running) {
         cJSON_Delete(json);
         return;
     }
-    turn_state_ = is_new ? ChatTurnState::NewWaitAck : ChatTurnState::NormalWaitActivity;
+    /* A live send starts/continues a real turn: clear any stop grace so the
+     * watchdog re-arms normally, and only transition state from Idle (a
+     * mid-turn send keeps the current state — the gateway queues the text). */
+    stop_requested_ = false;
+    if (turn_state_ == ChatTurnState::Idle)
+        setTurnState(is_new ? ChatTurnState::NewWaitAck : ChatTurnState::NormalWaitActivity);
     turn_deadline_ = GetTickCount64() + CHAT_TURN_TIMEOUT_MS;
-    setCanSend(0);
     if (is_new) {
         new_history_backup_ = std::move(backup);
         messages_.clear();
@@ -691,6 +756,12 @@ void ChatUi::onSend(int health_running) {
         revision_++;
         setDirty();
     } else {
+        /* Mid-turn send: fixate the in-flight streamed partial into its own
+         * bubble first, else serializeVisible renders the live draft AFTER
+         * this user bubble (draft is always the trailing element), putting the
+         * user message visually above the reply it followed. */
+        if (draft_.active)
+            commitCanonical(NULL);
         appendMsg("user", text);
     }
     ui_page_set_text(page_, "draft", L"");
@@ -789,6 +860,7 @@ void ChatUi::onGatewayStopped() {
     attach_pending_ = false;
     attach_deadline_ = 0;
     turn_deadline_ = 0;
+    stop_requested_ = false;
     if (draft_.active)
         commitCanonical(NULL);   /* fixate a half-streamed reply */
     restoreNewHistoryBackup();
@@ -815,18 +887,26 @@ static void on_send_click(UiWidget widget, void* userdata) {
     (void)widget;
     (void)userdata;
     ChatUi& ui = chat_ui();
-    if (ui.turnWaiting()) {
-        ui.cancelWait();   /* the send button doubles as "stop waiting" */
-        return;
-    }
     if (ui.canSendNow() || ui.canRetryNow())
         ui.onSend(ui.gatewayRunning() ? 1 : 0);
+}
+
+static void on_stop_click(UiWidget widget, void* userdata) {
+    (void)widget;
+    (void)userdata;
+    chat_ui().cancelWait();
 }
 
 void chat_ui_mount_send(UiPage page, UiWidget widget, void* userdata) {
     (void)page;
     (void)userdata;
     ui_widget_on_click(widget, on_send_click, NULL);
+}
+
+void chat_ui_mount_stop(UiPage page, UiWidget widget, void* userdata) {
+    (void)page;
+    (void)userdata;
+    ui_widget_on_click(widget, on_stop_click, NULL);
 }
 
 void chat_ui_mount_input(UiPage page, UiWidget widget, void* userdata) {

@@ -2365,6 +2365,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmdLine, int nShow) {
     ui_page_on_widget_mount(g_page, "btn_manage_credential", on_manage_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_clear_credential", on_clear_credential_mount, NULL);
     ui_page_on_widget_mount(g_page, "btn_send", chat_ui_mount_send, NULL);
+    ui_page_on_widget_mount(g_page, "btn_chat_stop", chat_ui_mount_stop, NULL);
     ui_page_on_widget_mount(g_page, "chat_scroll", chat_ui_mount_scroll, NULL);
     ui_page_on_widget_unmount(g_page, "chat_scroll", chat_ui_unmount_scroll, NULL);
     ui_page_on_widget_mount(g_page, "theme_light", on_setting_choice_mount, on_theme_light);

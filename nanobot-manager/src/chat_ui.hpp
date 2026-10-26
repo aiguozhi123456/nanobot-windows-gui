@@ -68,12 +68,12 @@ public:
     /* False after a terminal chat failure until an explicit user retry. */
     bool canAutoConnect() const { return !auto_connect_blocked_; }
 
-    /* True while a turn is in flight: the send button doubles as a
-     * "stop waiting" control. */
+    /* True while a turn is in flight: drives the dedicated stop button
+     * (cancelWait) and gates a mid-turn /new. */
     bool turnWaiting() const { return turn_state_ != ChatTurnState::Idle; }
-    /* User-initiated soft abort of the in-flight turn (see terminalFailure
-     * soft path): fixate any partial reply, keep the socket, re-enable
-     * sending. */
+    /* User-initiated stop of the in-flight turn: sends the gateway's
+     * priority /stop and grants a short grace for the normal teardown,
+     * falling back to the soft abort on send failure or during /new ack. */
     void cancelWait();
 
     /* Send-gate predicates + scroll attach/detach, used by the mount
@@ -171,6 +171,11 @@ private:
      * every DELTA/MESSAGE/STREAM_END frame, expired by tick(). Without it a
      * gateway that accepts a frame but never answers leaves canSend off. */
     ULONGLONG turn_deadline_ = 0;
+    /* Set while a user-requested /stop grace window is open: suppresses the
+     * DELTA/MESSAGE/ACTIVITY watchdog re-arm so the short CHAT_STOP_GRACE_MS
+     * deadline is what expires, giving the gateway's own TURN_END the chance
+     * to run its normal teardown first. */
+    bool stop_requested_ = false;
 
     bool auto_connect_blocked_ = false;
     UiWidget chat_scroll_ = 0;
@@ -179,6 +184,7 @@ private:
 
 /* Mount trampolines for ui_page_on_widget_mount registration in main.cpp. */
 void chat_ui_mount_send(UiPage page, UiWidget widget, void* userdata);
+void chat_ui_mount_stop(UiPage page, UiWidget widget, void* userdata);
 void chat_ui_mount_input(UiPage page, UiWidget widget, void* userdata);
 void chat_ui_mount_scroll(UiPage page, UiWidget widget, void* userdata);
 void chat_ui_unmount_scroll(UiPage page, UiWidget widget, void* userdata);

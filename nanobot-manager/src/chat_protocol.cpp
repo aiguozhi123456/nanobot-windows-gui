@@ -38,6 +38,19 @@ int chat_protocol_should_persist_unsafe(int fresh_pending, int resume_safe) {
     return !fresh_pending && !resume_safe;
 }
 
+int chat_protocol_send_allowed(int turn_active, int is_new) {
+    /* Normal text is always sendable: the gateway queues it into the active
+     * turn's _pending_queues. A fresh /new needs an idle turn. */
+    return !turn_active || !is_new;
+}
+
+int chat_protocol_has_text(const char* s) {
+    /* Non-empty payload only: gateway tool results and pure-reasoning
+     * stream_ends arrive as message text:"" / stream_end text:"", which must
+     * not be committed as (empty) canonical reply text. */
+    return s && s[0];
+}
+
 int chat_protocol_lifecycle_operational(int lifecycle_event_ready, int lifecycle_thread_ready,
     int shutting_down) {
     return lifecycle_event_ready && lifecycle_thread_ready && !shutting_down;

@@ -636,6 +636,41 @@ export default {
     color: var(--disabled-text);
   }
 
+  /* Secondary variant of btn-send: lower presence, only meaningful while a
+     turn is in flight (:enabled="turnWaiting"). Disabled it fades to a bare
+     label so it never competes with the primary send button. */
+  .btn-chat-stop {
+    height: 32px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.12);
+    cursor: pointer;
+    /* opacity is owned by the :opacity binding (hover fade) */
+    transition: opacity 120ms ease-out;
+  }
+
+  .btn-chat-stop:active {
+    background: rgba(255, 255, 255, 0.20);
+  }
+
+  .btn-chat-stop-label {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fg-2);
+  }
+
+  .btn-chat-stop:disabled {
+    background: transparent;
+    cursor: default;
+  }
+
+  .btn-chat-stop:disabled .btn-chat-stop-label {
+    color: var(--disabled-text);
+  }
+
   .settings-section-title {
     font-size: 12px;
     font-weight: 600;
@@ -940,10 +975,15 @@ export default {
               v-model="draft"
               :placeholder="$t('chat_placeholder')"
             />
-            <div id="btn_send" class="btn-send" focusable="true" :enabled="canSend || turnWaiting"
-                 :opacity="hover=='btn_send' && (canSend || turnWaiting) && page=='chat' ? 0.92 : 1"
+            <div id="btn_chat_stop" class="btn-chat-stop" focusable="true" :enabled="turnWaiting"
+                 :opacity="hover=='btn_chat_stop' && turnWaiting && page=='chat' ? 0.92 : 1"
+                 @mouseenter="hin('btn_chat_stop')" @mouseleave="hout('btn_chat_stop')">
+              <label class="btn-chat-stop-label">{{ $t('chat_cancel_wait') }}</label>
+            </div>
+            <div id="btn_send" class="btn-send" focusable="true" :enabled="canSend"
+                 :opacity="hover=='btn_send' && canSend && page=='chat' ? 0.92 : 1"
                  @mouseenter="hin('btn_send')" @mouseleave="hout('btn_send')">
-              <label class="btn-send-label">{{ $t(turnWaiting ? 'chat_cancel_wait' : 'chat_send') }}</label>
+              <label class="btn-send-label">{{ $t('chat_send') }}</label>
             </div>
           </div>
         </div>

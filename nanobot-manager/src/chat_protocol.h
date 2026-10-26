@@ -14,6 +14,8 @@ uint64_t chat_protocol_next_generation(uint64_t generation);
 int chat_protocol_retry_allowed(int auto_connect_blocked, int turn_idle, int healthy,
     int connected, int connecting, int attach_pending);
 int chat_protocol_should_persist_unsafe(int fresh_pending, int resume_safe);
+int chat_protocol_send_allowed(int turn_active, int is_new);
+int chat_protocol_has_text(const char* s);
 int chat_protocol_lifecycle_operational(int lifecycle_event_ready, int lifecycle_thread_ready,
     int shutting_down);
 

@@ -53,6 +53,21 @@ static void test_preattachment_failure_preserves_safe_binding(void) {
     TEST_CHECK(chat_protocol_should_persist_unsafe(0, 0));
 }
 
+static void test_send_allowed_policy(void) {
+    /* Idle turn: normal text and /new both allowed. */
+    TEST_CHECK(chat_protocol_send_allowed(0, 0));
+    TEST_CHECK(chat_protocol_send_allowed(0, 1));
+    /* Active turn: normal text is queued by the gateway (allowed), /new blocked. */
+    TEST_CHECK(chat_protocol_send_allowed(1, 0));
+    TEST_CHECK(!chat_protocol_send_allowed(1, 1));
+}
+
+static void test_has_text(void) {
+    TEST_CHECK(!chat_protocol_has_text(NULL));
+    TEST_CHECK(!chat_protocol_has_text(""));
+    TEST_CHECK(chat_protocol_has_text("x"));
+}
+
 static void test_lifecycle_operational_policy(void) {
     TEST_CHECK(chat_protocol_lifecycle_operational(1, 1, 0));
     TEST_CHECK(!chat_protocol_lifecycle_operational(0, 1, 0));
@@ -65,6 +80,8 @@ TEST_LIST = {
     { "generation_reservation", test_generation_reservation },
     { "retry_policy", test_retry_policy },
     { "preattachment_failure_preserves_safe_binding", test_preattachment_failure_preserves_safe_binding },
+    { "send_allowed_policy",         test_send_allowed_policy },
+    { "has_text",                    test_has_text },
     { "lifecycle_operational_policy", test_lifecycle_operational_policy },
     { NULL, NULL }
 };

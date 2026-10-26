@@ -160,7 +160,10 @@ static const status_i18n_entry g_status_i18n[] = {
     { "chat_status_attach_timeout",  "恢复会话超时",                    "Session restore timed out" },
     { "chat_status_turn_timeout",    "等待回复超时",                    "Timed out waiting for a reply" },
     { "chat_status_agent_working",   "正在执行任务…",                   "Working on it…" },
-    { "chat_cancel_wait",            "停止等待",                        "Stop waiting" },
+    { "chat_cancel_wait",            "停止",                           "Stop" },
+    { "chat_status_stopping",        "正在停止…",                      "Stopping…" },
+    { "chat_status_stopped",         "已停止",                         "Stopped" },
+    { "chat_status_wait_turn_end",   "当前任务结束前无法新建会话",      "Finish the current task before starting a new chat" },
     { "chat_status_wait_cancelled",  "已停止等待，回复若稍后到达将被忽略", "Stopped waiting; a late reply will be ignored" },
 };
 
